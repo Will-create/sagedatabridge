@@ -37,3 +37,4 @@ npm run tauri build
 - App password protection
 - Offline capable
 # sagedatabridge
+# sagedatabridge
