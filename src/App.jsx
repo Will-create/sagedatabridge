@@ -1,0 +1,625 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import packageJson from "../package.json";
+import {
+  connectDb,
+  getActiveSchemas,
+  getColumns,
+  getDatabases,
+  getTableData,
+  getTables,
+  listConnections,
+  saveConnection,
+  switchDatabase,
+} from "./hooks/useTauri";
+import { useT } from "./i18n";
+
+import Dashboard from "./components/Dashboard";
+import AboutPage from "./components/AboutPage";
+import DataGrid from "./components/DataGrid";
+import FilterBar from "./components/FilterBar";
+import LockScreen from "./components/LockScreen";
+import SettingsDrawer from "./components/SettingsDrawer";
+import Sidebar from "./components/Sidebar";
+import StatusBar from "./components/StatusBar";
+import TablePanel from "./components/TablePanel";
+import ThemeToggle from "./components/ThemeToggle";
+import Toast from "./components/Toast";
+import Toolbar from "./components/Toolbar";
+
+const ADMIN_MODE_KEY = "sdb_admin_mode";
+const SHOW_TABLE_PANEL_KEY = "sdb_show_table_panel";
+const SHOW_TOOLBAR_KEY = "sdb_show_toolbar";
+
+function readBooleanStorage(key, fallback) {
+  const value = localStorage.getItem(key);
+  if (value == null) return fallback;
+  return value === "true";
+}
+
+function connectionDisplayName(connection, database = connection?.database) {
+  const host = connection?.host?.trim() || "SQL Server";
+  return connection?.name?.trim() || (database ? `${host} / ${database}` : host);
+}
+
+function upsertConnection(currentConnections, savedConnection) {
+  const index = currentConnections.findIndex((connection) => connection.id === savedConnection.id);
+  if (index === -1) return [...currentConnections, savedConnection];
+
+  const nextConnections = [...currentConnections];
+  nextConnections[index] = savedConnection;
+  return nextConnections;
+}
+
+export default function App() {
+  const { t, lang } = useT();
+
+  const [unlocked, setUnlocked] = useState(false);
+
+  const [connections, setConnections] = useState([]);
+  const [statuses, setStatuses] = useState({});
+  const [activeSchemas, setActiveSchemas] = useState({});
+  const [activeConnId, setActiveConnId] = useState(null);
+  const [activeDatabase, setActiveDatabase] = useState("");
+  const [databases, setDatabases] = useState([]);
+  const [databasesLoading, setDatabasesLoading] = useState(false);
+
+  const [tables, setTables] = useState([]);
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [activeTable, setActiveTable] = useState(null);
+
+  const [columns, setColumns] = useState([]);
+  const [data, setData] = useState(null);
+  const [dataLoading, setDataLoading] = useState(false);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(100);
+  const [filters, setFilters] = useState([]);
+
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [tablePanelCollapsed, setTablePanelCollapsed] = useState(false);
+  const [mainView, setMainView] = useState("welcome");
+  const [aboutReturnView, setAboutReturnView] = useState("welcome");
+
+  const [adminMode, setAdminMode] = useState(() => readBooleanStorage(ADMIN_MODE_KEY, false));
+  const [showTablePanel, setShowTablePanel] = useState(() => readBooleanStorage(SHOW_TABLE_PANEL_KEY, true));
+  const [showToolbar, setShowToolbar] = useState(() => readBooleanStorage(SHOW_TOOLBAR_KEY, true));
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const [statusMsg, setStatusMsg] = useState({ message: "", type: "idle" });
+  const [elapsed, setElapsed] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const activeConnection = useMemo(
+    () => connections.find((connection) => connection.id === activeConnId) ?? null,
+    [connections, activeConnId],
+  );
+
+  const showStatus = (message, type = "idle", ms = null) => {
+    setStatusMsg({ message, type });
+    setElapsed(ms ?? null);
+  };
+
+  const showToast = (nextToast) => setToast(nextToast);
+
+  useEffect(() => {
+    localStorage.setItem(ADMIN_MODE_KEY, String(adminMode));
+  }, [adminMode]);
+
+  useEffect(() => {
+    localStorage.setItem(SHOW_TABLE_PANEL_KEY, String(showTablePanel));
+  }, [showTablePanel]);
+
+  useEffect(() => {
+    localStorage.setItem(SHOW_TOOLBAR_KEY, String(showToolbar));
+  }, [showToolbar]);
+
+  useEffect(() => {
+    if (!activeConnId) {
+      if (mainView !== "about") setMainView("welcome");
+      setActiveDatabase("");
+      setDatabases([]);
+    }
+  }, [activeConnId, mainView]);
+
+  useEffect(() => {
+    if (!adminMode) {
+      setTablePanelCollapsed(false);
+      if (activeConnId && activeDatabase && mainView !== "about") {
+        setMainView("dashboard");
+      }
+    }
+  }, [adminMode, activeConnId, activeDatabase, mainView]);
+
+  useEffect(() => {
+    if (unlocked) {
+      setAdminMode(false);
+    }
+  }, [unlocked]);
+
+  const loadConnections = useCallback(async () => {
+    try {
+      setConnections(await listConnections());
+    } catch (err) {
+      console.error("Failed to load connections", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (unlocked) loadConnections();
+  }, [unlocked, loadConnections]);
+
+  const loadTableData = useCallback(async (connId, table, pg, size, nextFilters) => {
+    if (!connId || !table) return;
+    setDataLoading(true);
+    const t0 = Date.now();
+    try {
+      showStatus(t("status_querying", `${table.schema}.${table.name}`), "idle");
+      const result = await getTableData(connId, table.schema, table.name, pg, size, nextFilters);
+      setData(result);
+      showStatus(t("status_rows_shown", result.total_count, result.rows.length), "success", Date.now() - t0);
+    } catch (err) {
+      showStatus(t("status_query_failed") + err, "error");
+      showToast({ type: "error", msg: String(err) });
+    } finally {
+      setDataLoading(false);
+    }
+  }, [t]);
+
+  const ensureTablesLoaded = useCallback(async (connId) => {
+    if (!connId) return [];
+    setTablesLoading(true);
+    try {
+      const nextTables = await getTables(connId);
+      setTables(nextTables);
+      return nextTables;
+    } finally {
+      setTablesLoading(false);
+    }
+  }, []);
+
+  const openLoadedDatabase = useCallback(async (connId, database, nextAdminMode = adminMode) => {
+    if (!connId || !database) return;
+
+    setActiveTable(null);
+    setColumns([]);
+    setData(null);
+    setFilters([]);
+    setPage(0);
+
+    try {
+      const nextTables = await ensureTablesLoaded(connId);
+      setActiveDatabase(database);
+      setTablePanelCollapsed(false);
+      setMainView(nextAdminMode ? "tables" : "dashboard");
+      showStatus(t("status_database_ready", database, nextTables.length), "success");
+      return true;
+    } catch (err) {
+      showStatus(t("status_database_failed") + err, "error");
+      showToast({ type: "error", msg: String(err) });
+      return false;
+    }
+  }, [adminMode, ensureTablesLoaded, t]);
+
+  const activateDatabase = useCallback(async (connId, database, nextAdminMode = adminMode) => {
+    if (!connId || !database) return;
+
+    showStatus(t("status_switching_database", database), "idle");
+
+    try {
+      await switchDatabase(connId, database);
+      return openLoadedDatabase(connId, database, nextAdminMode);
+    } catch (err) {
+      showStatus(t("status_database_failed") + err, "error");
+      showToast({ type: "error", msg: String(err) });
+      return false;
+    }
+  }, [adminMode, openLoadedDatabase, t]);
+
+  const handleSelectConn = useCallback(async (id, connectionOverride = null, forceReconnect = false) => {
+    if (!id) {
+      setActiveConnId(null);
+      setActiveDatabase("");
+      setTables([]);
+      setActiveTable(null);
+      setData(null);
+      setColumns([]);
+      setFilters([]);
+      return;
+    }
+
+    if (!forceReconnect && id === activeConnId && statuses[id] === "connected") {
+      setMainView(activeDatabase ? (adminMode ? "tables" : "dashboard") : "database-selection");
+      return;
+    }
+
+    const nextConnection = connectionOverride ?? connections.find((connection) => connection.id === id) ?? null;
+    setActiveConnId(id);
+    setActiveDatabase("");
+    setDatabases([]);
+    setTables([]);
+    setActiveTable(null);
+    setData(null);
+    setColumns([]);
+    setFilters([]);
+    setMainView("welcome");
+    showStatus(t("status_connecting"), "idle");
+    setStatuses((current) => ({ ...current, [id]: "connecting" }));
+
+    try {
+      await connectDb(id);
+      setStatuses((current) => ({ ...current, [id]: "connected" }));
+      getActiveSchemas().then(setActiveSchemas).catch(() => {});
+
+      const preferredDatabase = (nextConnection?.database || "").trim();
+      if (preferredDatabase) {
+        const opened = await openLoadedDatabase(id, preferredDatabase, adminMode);
+        if (opened) return;
+      }
+
+      setDatabasesLoading(true);
+      const nextDatabases = await getDatabases(id);
+      setDatabases(nextDatabases);
+      setMainView("database-selection");
+      showStatus(t("status_databases", nextDatabases.length), "success");
+
+    } catch (err) {
+      setStatuses((current) => ({ ...current, [id]: "error" }));
+      showStatus(t("status_conn_failed") + err, "error");
+      showToast({ type: "error", msg: String(err) });
+    } finally {
+      setDatabasesLoading(false);
+    }
+  }, [activeConnId, activeDatabase, adminMode, connections, openLoadedDatabase, statuses, t]);
+
+  const handleRefreshConnection = useCallback(async (id, connectionOverride = null) => {
+    await handleSelectConn(id, connectionOverride, true);
+  }, [handleSelectConn]);
+
+  const handleSelectDatabase = useCallback(async (database) => {
+    if (!activeConnId || !database) return;
+    if (database === activeDatabase) {
+      setMainView(adminMode ? "tables" : "dashboard");
+      return;
+    }
+
+    const activated = await activateDatabase(activeConnId, database, adminMode);
+    if (!activated) return;
+
+    if (!activeConnection) return;
+
+    try {
+      const saved = await saveConnection({
+        ...activeConnection,
+        name: connectionDisplayName(activeConnection, database),
+        database,
+      });
+      setConnections((current) => upsertConnection(current, saved));
+    } catch (error) {
+      showToast({ type: "error", msg: String(error) });
+    }
+  }, [activeConnId, activeConnection, activeDatabase, activateDatabase, adminMode]);
+
+  const handleSelectTable = useCallback(async (table) => {
+    setActiveTable(table);
+    setFilters([]);
+    setPage(0);
+    setData(null);
+    try {
+      setColumns(await getColumns(activeConnId, table.schema, table.name));
+    } catch {
+      setColumns([]);
+    }
+    await loadTableData(activeConnId, table, 0, pageSize, []);
+  }, [activeConnId, loadTableData, pageSize]);
+
+  const handleFiltersChange = useCallback((nextFilters) => {
+    setFilters(nextFilters);
+    setPage(0);
+    if (activeTable && activeConnId) {
+      loadTableData(activeConnId, activeTable, 0, pageSize, nextFilters);
+    }
+  }, [activeConnId, activeTable, loadTableData, pageSize]);
+
+  const handlePageChange = useCallback((nextPage) => {
+    setPage(nextPage);
+    loadTableData(activeConnId, activeTable, nextPage, pageSize, filters);
+  }, [activeConnId, activeTable, filters, loadTableData, pageSize]);
+
+  const handlePageSizeChange = useCallback((nextSize) => {
+    setPageSize(nextSize);
+    setPage(0);
+    loadTableData(activeConnId, activeTable, 0, nextSize, filters);
+  }, [activeConnId, activeTable, filters, loadTableData]);
+
+  const handleRefresh = useCallback(() => {
+    if (activeConnId && activeTable) {
+      loadTableData(activeConnId, activeTable, page, pageSize, filters);
+    }
+  }, [activeConnId, activeTable, filters, loadTableData, page, pageSize]);
+
+  const handleBackToTables = useCallback(async () => {
+    if (!activeConnId || !activeDatabase) return;
+    if (!tables.length) await ensureTablesLoaded(activeConnId);
+    setMainView("tables");
+  }, [activeConnId, activeDatabase, ensureTablesLoaded, tables.length]);
+
+  const handleAppUnlock = useCallback(() => {
+    setSettingsOpen(false);
+    setUnlocked(true);
+    setMainView((current) => (current === "about" ? current : "dashboard"));
+  }, []);
+
+  const handleLockNow = useCallback(() => {
+    setSettingsOpen(false);
+    setAdminMode(false);
+    setUnlocked(false);
+    setMainView((current) => (current === "about" ? "welcome" : current));
+  }, []);
+
+  const openAboutPage = useCallback(() => {
+    setAboutReturnView(mainView);
+    setSettingsOpen(false);
+    setMainView("about");
+  }, [mainView]);
+
+  const returnFromAbout = useCallback(() => {
+    if (!activeConnId) {
+      setMainView("welcome");
+      return;
+    }
+
+    if (!activeDatabase) {
+      setMainView("database-selection");
+      return;
+    }
+
+    if (aboutReturnView === "tables" && adminMode) {
+      setMainView("tables");
+      return;
+    }
+
+    setMainView("dashboard");
+  }, [aboutReturnView, activeConnId, activeDatabase, adminMode]);
+
+  useEffect(() => {
+    const handler = (event) => {
+      if (mainView !== "tables") return;
+      if (event.key === "F5" || ((event.ctrlKey || event.metaKey) && event.key === "r")) {
+        event.preventDefault();
+        if (activeTable) loadTableData(activeConnId, activeTable, page, pageSize, filters);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [activeConnId, activeTable, filters, loadTableData, mainView, page, pageSize]);
+
+  const handleConnectionSaved = useCallback(async (savedConnection, deletedId = null) => {
+    if (deletedId) {
+      setConnections((current) => current.filter((connection) => connection.id !== deletedId));
+      setStatuses((current) => {
+        const nextStatuses = { ...current };
+        delete nextStatuses[deletedId];
+        return nextStatuses;
+      });
+      return;
+    }
+
+    if (!savedConnection) {
+      await loadConnections();
+      return;
+    }
+
+    setConnections((current) => upsertConnection(current, savedConnection));
+    await handleSelectConn(savedConnection.id, savedConnection);
+  }, [handleSelectConn, loadConnections]);
+
+  if (!unlocked) {
+    return <LockScreen onUnlock={handleAppUnlock} />;
+  }
+
+  const showSidebarRail = sidebarCollapsed;
+  const showTableBrowser = mainView === "tables" && adminMode;
+  const showTableSidebar = showTableBrowser && showTablePanel && activeConnId && activeDatabase;
+  const showTableRail = showTableSidebar && tablePanelCollapsed;
+  const showTableChrome = showTableBrowser && showToolbar;
+
+  return (
+    <div className="app-shell">
+      <div className="app-body">
+        {showSidebarRail ? (
+          <div className="panel-rail">
+            <div className="panel-rail-group">
+              <button className="panel-rail-btn" onClick={() => setSidebarCollapsed(false)} title={t("panel_show_connections")}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <rect x="4" y="4" width="6" height="16" rx="1" />
+                  <path d="M14 8l4 4-4 4" />
+                </svg>
+              </button>
+            </div>
+            <div className="panel-rail-group">
+              <button className="panel-rail-btn" onClick={() => setSettingsOpen(true)} title={t("sidebar_settings")}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10.09 3H10a2 2 0 1 1 4 0h-.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01A1.65 1.65 0 0 0 21 10.09V10a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <Sidebar
+            connections={connections}
+            statuses={statuses}
+            activeSchemas={activeSchemas}
+            activeId={activeConnId}
+            activeDatabase={activeDatabase}
+            adminMode={adminMode}
+            onSelectConnection={handleSelectConn}
+            onRefreshConnection={handleRefreshConnection}
+            onConnectionSaved={handleConnectionSaved}
+            onCollapse={() => setSidebarCollapsed(true)}
+            onOpenDashboard={() => setMainView("dashboard")}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        )}
+
+        {showTableSidebar ? (
+          showTableRail ? (
+            <div className="panel-rail panel-rail-secondary">
+              <button className="panel-rail-btn" onClick={() => setTablePanelCollapsed(false)} title={t("panel_show_tables")}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <rect x="4" y="4" width="8" height="16" rx="1" />
+                  <path d="M16 8l4 4-4 4" />
+                </svg>
+              </button>
+            </div>
+          ) : (
+            <TablePanel
+              tables={tables}
+              loading={tablesLoading}
+              activeTable={activeTable}
+              onSelectTable={handleSelectTable}
+              onCollapse={() => setTablePanelCollapsed(true)}
+            />
+          )
+        ) : null}
+
+        <div className={`main-content ${mainView === "dashboard" ? "dashboard-main" : ""}`}>
+          {mainView === "about" ? (
+            <AboutPage onBack={returnFromAbout} onOpenSettings={() => setSettingsOpen(true)} />
+          ) : !activeConnId ? (
+            <WelcomeScreen />
+          ) : !activeDatabase ? (
+            <DatabaseSelectionScreen
+              loading={databasesLoading}
+              databases={databases}
+              connectionName={activeConnection?.name || activeConnection?.host || ""}
+              onSelectDatabase={handleSelectDatabase}
+            />
+          ) : mainView === "dashboard" ? (
+            <Dashboard
+              connId={activeConnId}
+              connectionName={activeConnection?.name || ""}
+              databaseName={activeDatabase}
+              t={t}
+              lang={lang}
+              adminMode={adminMode}
+              onBackToTables={handleBackToTables}
+              onOpenSettings={() => setSettingsOpen(true)}
+            />
+          ) : (
+            <>
+              {showTableChrome ? (
+                <>
+                  <Toolbar
+                    activeConn={activeConnId}
+                    activeTable={activeTable}
+                    filters={filters}
+                    tables={tables}
+                    columns={columns}
+                    totalCount={data?.total_count}
+                    loading={dataLoading}
+                    onRefresh={handleRefresh}
+                    onSelectTable={handleSelectTable}
+                    onToast={showToast}
+                    sidebarCollapsed={sidebarCollapsed}
+                    tablePanelCollapsed={tablePanelCollapsed}
+                    showTablePanel={showTablePanel}
+                    onToggleSidebar={() => setSidebarCollapsed((current) => !current)}
+                    onToggleTables={() => setTablePanelCollapsed((current) => !current)}
+                  />
+                  <FilterBar filters={filters} columns={columns} onFiltersChange={handleFiltersChange} />
+                </>
+              ) : null}
+              <DataGrid
+                data={data}
+                loading={dataLoading}
+                page={page}
+                pageSize={pageSize}
+                onPageChange={handlePageChange}
+                onPageSizeChange={handlePageSizeChange}
+              />
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="status-row">
+        <div style={{ flex: 1 }}>
+          <StatusBar message={statusMsg.message} type={statusMsg.type} elapsed={elapsed} />
+        </div>
+        <div className={`status-sidecar ${statusMsg.type === "error" ? "error" : statusMsg.type === "success" ? "success" : "idle"}`}>
+          <ThemeToggle />
+        </div>
+      </div>
+
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        adminMode={adminMode}
+        onAdminModeChange={(nextMode) => {
+          setAdminMode(nextMode);
+          if (!nextMode && activeConnId && activeDatabase) {
+            setMainView("dashboard");
+          }
+        }}
+        showTablePanel={showTablePanel}
+        onShowTablePanelChange={setShowTablePanel}
+        showToolbar={showToolbar}
+        onShowToolbarChange={setShowToolbar}
+        appVersion={packageJson.version}
+        onOpenAbout={openAboutPage}
+        onLockNow={handleLockNow}
+      />
+
+      <Toast toast={toast} onDismiss={() => setToast(null)} />
+    </div>
+  );
+}
+
+function WelcomeScreen() {
+  const { t } = useT();
+
+  return (
+    <div className="empty-state" style={{ gap: 16 }}>
+      <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
+        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+        <path d="M2 17l10 5 10-5" />
+        <path d="M2 12l10 5 10-5" />
+      </svg>
+      <div>
+        <h3 style={{ fontSize: 16, marginBottom: 6 }}>{t("welcome_title")}</h3>
+        <p style={{ whiteSpace: "pre-line" }}>{t("welcome_hint")}</p>
+      </div>
+    </div>
+  );
+}
+
+function DatabaseSelectionScreen({ loading, databases, connectionName, onSelectDatabase }) {
+  const { t } = useT();
+
+  return (
+    <div className="empty-state empty-state-wide" style={{ gap: 16 }}>
+      {loading ? <div className="spinner" /> : (
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.3">
+          <ellipse cx="12" cy="5" rx="9" ry="3" />
+          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+        </svg>
+      )}
+      <div>
+        <h3 style={{ fontSize: 16, marginBottom: 6 }}>{t("database_prompt_title")}</h3>
+        <p>{loading ? t("database_prompt_loading") : t("database_prompt_body", connectionName)}</p>
+      </div>
+      {!loading && !databases.length ? <div className="sidebar-empty-copy">{t("sidebar_no_databases")}</div> : null}
+      {!loading && databases.length ? (
+        <div className="database-selection-list">
+          {databases.map((database) => (
+            <button key={database} type="button" className="database-selection-item" onClick={() => onSelectDatabase(database)}>
+              <span className="database-selection-pill" />
+              <span>{database}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
