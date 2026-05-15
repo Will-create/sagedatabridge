@@ -66,9 +66,9 @@ fn main() {
             // Network scan
             network_scan::scan_network_for_sql_servers,
             // Analytics
-            analytics::get_grand_livre,
-            analytics::get_balance,
-            analytics::get_grand_livre_auxiliaire,
+            analytics::stream_grand_livre,
+            analytics::stream_balance,
+            analytics::stream_grand_livre_auxiliaire,
             analytics::get_dashboard_kpis,
         ])
         .run(tauri::generate_context!())

@@ -2158,6 +2158,770 @@ pub async fn get_grand_livre_auxiliaire(
     })
 }
 
+// ─── Streaming Analytics Commands ────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StreamTotalPayload {
+    total: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StreamGlChunkPayload {
+    rows: Vec<GrandLivreRow>,
+}
+
+#[derive(Serialize)]
+struct StreamBalanceChunkPayload {
+    rows: Vec<BalanceRow>,
+}
+
+#[derive(Serialize)]
+struct StreamAuxChunkPayload {
+    rows: Vec<AuxiliaireRow>,
+}
+
+#[derive(Serialize)]
+struct StreamCompletePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+const STREAM_CHUNK_SIZE: i64 = 2000;
+
+// ─── stream_grand_livre ───────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn stream_grand_livre(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    id: String,
+    date_from: String,
+    date_to: String,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let result = do_stream_grand_livre(&window, &state, &id, &date_from, &date_to, account_prefix).await;
+    if let Err(ref e) = result {
+        let _ = window.emit("gl_error", e.clone());
+    }
+    result
+}
+
+async fn do_stream_grand_livre(
+    window: &tauri::Window,
+    state: &AppState,
+    id: &str,
+    date_from: &str,
+    date_to: &str,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let config = state.resolve_connection_config(id)?;
+    let hint_schema = state.get_connection_schema(id);
+    let mut client = db::connect(&config).await?;
+    if is_sage1000_schema(hint_schema.as_ref()) {
+        stream_gl_sage1000(window, &mut client, date_from, date_to, account_prefix.as_deref()).await
+    } else {
+        stream_gl_generic(window, &mut client, hint_schema.as_ref(), date_from, date_to, account_prefix.as_deref()).await
+    }
+}
+
+async fn stream_gl_with_base_cte(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    base_cte: &str,
+    order_by: &str,
+    warning: Option<String>,
+) -> Result<(), String> {
+    let count_sql = format!(
+        "{} SELECT COUNT(*) AS total FROM base WHERE parsed_date IS NOT NULL",
+        base_cte
+    );
+    let count_data = db::execute_raw_query(client, &count_sql).await?;
+    let idx = column_index_map(&count_data);
+    let total = count_data.rows.first().map(|r| row_i64(r, &idx, "total")).unwrap_or(0);
+
+    let _ = window.emit("gl_total", StreamTotalPayload { total, warning: warning.clone() });
+
+    let mut running_balance: HashMap<String, Decimal> = HashMap::new();
+    let mut offset = 0i64;
+
+    loop {
+        let chunk_sql = format!(
+            "{}\nSELECT CONVERT(char(10), parsed_date, 103) AS [date], journal, account_no, account_label, ref_piece, lettrage, debit, credit\nFROM base\nWHERE parsed_date IS NOT NULL\nORDER BY {}\nOFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+            base_cte, order_by, offset, STREAM_CHUNK_SIZE
+        );
+        let data = db::execute_raw_query(client, &chunk_sql).await?;
+        let ix = column_index_map(&data);
+        let fetched = data.rows.len() as i64;
+
+        let rows: Vec<GrandLivreRow> = data.rows.iter().map(|row| {
+            let account_no = row_string(row, &ix, "account_no").unwrap_or_default();
+            let debit = row_decimal(row, &ix, "debit");
+            let credit = row_decimal(row, &ix, "credit");
+            let bal = running_balance.entry(account_no.clone()).or_insert(Decimal::ZERO);
+            *bal += debit - credit;
+            GrandLivreRow {
+                row_type: "entry".to_string(),
+                date: row_string(row, &ix, "date"),
+                journal: row_string(row, &ix, "journal"),
+                account_no,
+                account_label: row_string(row, &ix, "account_label").unwrap_or_default(),
+                ref_piece: row_string(row, &ix, "ref_piece"),
+                lettrage: row_string(row, &ix, "lettrage"),
+                debit,
+                credit,
+                solde_cumule: *bal,
+                total_debit: None,
+                total_credit: None,
+                solde: None,
+            }
+        }).collect();
+
+        let _ = window.emit("gl_chunk", StreamGlChunkPayload { rows });
+
+        if fetched < STREAM_CHUNK_SIZE {
+            break;
+        }
+        offset += fetched;
+    }
+
+    let _ = window.emit("gl_complete", StreamCompletePayload { warning });
+    Ok(())
+}
+
+async fn stream_gl_sage1000(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    date_from: &str,
+    date_to: &str,
+    account_prefix: Option<&str>,
+) -> Result<(), String> {
+    let Some(context) = resolve_sage1000_context(client).await? else {
+        let _ = window.emit("gl_total", StreamTotalPayload {
+            total: 0,
+            warning: Some("Sage 1000 tables TECRITURE / TCOMPTEGENERAL non détectées".to_string()),
+        });
+        let _ = window.emit("gl_complete", StreamCompletePayload { warning: None });
+        return Ok(());
+    };
+
+    let piece_join = context.pieces.as_ref().map(|t| format!(
+        "LEFT JOIN {} p ON {} = {}",
+        t.sql_name(), qualify("e", "oidpiece"), qualify("p", "oid")
+    )).unwrap_or_default();
+
+    let journal_expr = if context.pieces.is_some() {
+        text_or_empty(&qualify("p", "numero"), 64)
+    } else {
+        "CAST('' AS NVARCHAR(64))".to_string()
+    };
+    let ref_piece_expr = if context.pieces.is_some() {
+        text_or_empty(&qualify("p", "numero"), 128)
+    } else {
+        "CAST('' AS NVARCHAR(128))".to_string()
+    };
+    let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
+    let account_label_expr = format!(
+        "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+        qualify("cg", "Caption"), qualify("e", "reference")
+    );
+    let lettrage_expr = text_or_empty(&qualify("e", "CodeLettrageExterne"), 64);
+    let debit_expr = decimal_or_zero(&qualify("e", "debit"));
+    let credit_expr = decimal_or_zero(&qualify("e", "credit"));
+    let account_filter_sql = account_prefix
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!(" AND {} LIKE {}", account_no_expr, sql_literal(&format!("{}%", p.trim()))))
+        .unwrap_or_default();
+
+    let base_cte = format!(
+        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {piece_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_no_filter} <> '' {account_filter_sql})",
+        date_col = qualify("e", "eDate"),
+        journal_expr = journal_expr,
+        account_no_expr = account_no_expr,
+        account_label_expr = account_label_expr,
+        ref_piece_expr = ref_piece_expr,
+        lettrage_expr = lettrage_expr,
+        debit_expr = debit_expr,
+        credit_expr = credit_expr,
+        entry_number_col = qualify("e", "numero"),
+        entries_table = context.entries.sql_name(),
+        accounts_table = context.accounts.sql_name(),
+        entry_account_fk = qualify("e", "oidcompteGeneral"),
+        account_pk = qualify("cg", "oid"),
+        piece_join = piece_join,
+        date_from = sql_literal(date_from),
+        date_to = sql_literal(date_to),
+        account_no_filter = account_no_expr,
+        account_filter_sql = account_filter_sql
+    );
+
+    stream_gl_with_base_cte(window, client, &base_cte, "account_no, parsed_date, entry_number", None).await
+}
+
+async fn stream_gl_generic(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    hint_schema: Option<&crate::sage_compat::SageSchema>,
+    date_from: &str,
+    date_to: &str,
+    account_prefix: Option<&str>,
+) -> Result<(), String> {
+    let (entry_context, mut warnings) = resolve_entry_context_smart(client, hint_schema).await?;
+
+    let Some(entry_context) = entry_context else {
+        let _ = window.emit("gl_total", StreamTotalPayload {
+            total: 0,
+            warning: Some(join_warnings(warnings).unwrap_or_default()),
+        });
+        let _ = window.emit("gl_complete", StreamCompletePayload { warning: None });
+        return Ok(());
+    };
+
+    let account_lookup = if let Some(schema) = hint_schema {
+        if !schema.edition.is_generic() {
+            schema_lookup_context(client, &schema.table_comptes, &schema.col_compte_num, &schema.col_compte_lib, &schema.col_compte_type).await?
+                .or(resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?)
+        } else {
+            resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+        }
+    } else {
+        resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+    };
+
+    if account_lookup.is_none() && entry_context.account_label_col.is_none() {
+        warnings.push("Libellés de compte non détectés".to_string());
+    }
+
+    let parsed_date_expr = format!("TRY_CAST({} AS DATE)", qualify("e", &entry_context.date_col));
+    let journal_expr = entry_context.journal_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 64))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+    let account_no_expr = text_or_empty(&qualify("e", &entry_context.account_col), 64);
+    let ref_piece_expr = entry_context.ref_piece_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 128))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(128))".to_string());
+    let lettrage_expr = entry_context.lettrage_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 64))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+    let account_label_expr = match (&account_lookup, &entry_context.account_label_col) {
+        (Some(lu), Some(el)) => format!(
+            "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+            qualify("a", &lu.label_col), qualify("e", el)
+        ),
+        (Some(lu), None) => text_or_empty(&qualify("a", &lu.label_col), 255),
+        (None, Some(el)) => text_or_empty(&qualify("e", el), 255),
+        (None, None) => "CAST('' AS NVARCHAR(255))".to_string(),
+    };
+    let account_join = account_lookup.as_ref().map(|lu| format!(
+        "LEFT JOIN {} a ON {} = {}",
+        lu.table.sql_name(), qualify("a", &lu.code_col), qualify("e", &entry_context.account_col)
+    )).unwrap_or_default();
+    let account_filter_sql = account_prefix
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!(" AND {} LIKE {}", account_no_expr, sql_literal(&format!("{}%", p.trim()))))
+        .unwrap_or_default();
+
+    let base_cte = format!(
+        "WITH base AS (SELECT parsed_date = {parsed_date_expr}, journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr} FROM {entries_table} e {account_join} WHERE {parsed_date_expr} BETWEEN {date_from} AND {date_to} AND {account_no_filter} <> '' {account_filter_sql})",
+        parsed_date_expr = parsed_date_expr,
+        journal_expr = journal_expr,
+        account_no_expr = account_no_expr,
+        account_label_expr = account_label_expr,
+        ref_piece_expr = ref_piece_expr,
+        lettrage_expr = lettrage_expr,
+        debit_expr = entry_context.debit_expr,
+        credit_expr = entry_context.credit_expr,
+        entries_table = entry_context.table.sql_name(),
+        account_join = account_join,
+        date_from = sql_literal(date_from),
+        date_to = sql_literal(date_to),
+        account_no_filter = account_no_expr,
+        account_filter_sql = account_filter_sql
+    );
+
+    stream_gl_with_base_cte(
+        window, client, &base_cte,
+        "account_no, parsed_date, journal, ref_piece, lettrage",
+        join_warnings(warnings)
+    ).await
+}
+
+// ─── stream_balance ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn stream_balance(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    id: String,
+    date_from: String,
+    date_to: String,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let result = do_stream_balance(&window, &state, &id, &date_from, &date_to, account_prefix).await;
+    if let Err(ref e) = result {
+        let _ = window.emit("balance_error", e.clone());
+    }
+    result
+}
+
+async fn do_stream_balance(
+    window: &tauri::Window,
+    state: &AppState,
+    id: &str,
+    date_from: &str,
+    date_to: &str,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let config = state.resolve_connection_config(id)?;
+    let hint_schema = state.get_connection_schema(id);
+    let mut client = db::connect(&config).await?;
+
+    // Balance is an aggregated query (one row per account) — run it fully, then chunk-emit
+    let result = if is_sage1000_schema(hint_schema.as_ref()) {
+        get_balance_sage1000(&mut client, date_from, date_to, account_prefix.as_deref()).await?
+    } else {
+        // Build inline via the existing get_balance logic reused here
+        let (entry_context, mut warnings) = resolve_entry_context_smart(&mut client, hint_schema.as_ref()).await?;
+        let Some(entry_context) = entry_context else {
+            let _ = window.emit("balance_total", StreamTotalPayload { total: 0, warning: join_warnings(warnings) });
+            let _ = window.emit("balance_complete", StreamCompletePayload { warning: None });
+            return Ok(());
+        };
+
+        let account_lookup = if let Some(ref schema) = hint_schema {
+            if !schema.edition.is_generic() {
+                schema_lookup_context(&mut client, &schema.table_comptes, &schema.col_compte_num, &schema.col_compte_lib, &schema.col_compte_type).await?
+                    .or(resolve_lookup_context(&mut client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?)
+            } else {
+                resolve_lookup_context(&mut client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+            }
+        } else {
+            resolve_lookup_context(&mut client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+        };
+
+        if entry_context.journal_col.is_none() {
+            warnings.push("Journal non détecté; solde d'ouverture calculé sur les dates antérieures uniquement".to_string());
+        }
+
+        let parsed_date_expr = format!("TRY_CAST({} AS DATE)", qualify("e", &entry_context.date_col));
+        let journal_expr = entry_context.journal_col.as_ref()
+            .map(|c| text_or_empty(&qualify("e", c), 64))
+            .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+        let account_no_expr = text_or_empty(&qualify("e", &entry_context.account_col), 64);
+        let account_label_expr = match (&account_lookup, &entry_context.account_label_col) {
+            (Some(lu), Some(el)) => format!(
+                "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+                qualify("a", &lu.label_col), qualify("e", el)
+            ),
+            (Some(lu), None) => text_or_empty(&qualify("a", &lu.label_col), 255),
+            (None, Some(el)) => text_or_empty(&qualify("e", el), 255),
+            (None, None) => "CAST('' AS NVARCHAR(255))".to_string(),
+        };
+        let account_join = account_lookup.as_ref().map(|lu| format!(
+            "LEFT JOIN {} a ON {} = {}",
+            lu.table.sql_name(), qualify("a", &lu.code_col), qualify("e", &entry_context.account_col)
+        )).unwrap_or_default();
+        let account_filter_sql = account_prefix.as_ref()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| format!(" AND {} LIKE {}", account_no_expr, sql_literal(&format!("{}%", p.trim()))))
+            .unwrap_or_default();
+        let opening_condition = if entry_context.journal_col.is_some() {
+            format!("(journal IN ('RAN', 'AN', 'OUV') OR parsed_date < {})", sql_literal(date_from))
+        } else {
+            format!("parsed_date < {}", sql_literal(date_from))
+        };
+        let cutoff_condition = if entry_context.journal_col.is_some() {
+            format!("(parsed_date <= {} OR journal IN ('RAN', 'AN', 'OUV'))", sql_literal(date_to))
+        } else {
+            format!("parsed_date <= {}", sql_literal(date_to))
+        };
+
+        let sql = format!(
+            r#"WITH base AS (SELECT parsed_date = {parsed_date_expr}, journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, debit = {debit_expr}, credit = {credit_expr} FROM {entries_table} e {account_join} WHERE 1=1 {account_filter_sql_base}),
+aggregated AS (SELECT account_no, MAX(account_label) AS account_label, SUM(CASE WHEN {opening_condition} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_debit_raw, SUM(CASE WHEN {opening_condition} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_credit_raw, SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_debit, SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_credit FROM base WHERE account_no <> '' AND parsed_date IS NOT NULL AND {cutoff_condition} GROUP BY account_no)
+SELECT account_no, account_label, CASE WHEN (open_debit_raw-open_credit_raw)>=0 THEN (open_debit_raw-open_credit_raw) ELSE CAST(0 AS DECIMAL(38,6)) END AS ouverture_debit, CASE WHEN (open_debit_raw-open_credit_raw)<0 THEN ABS(open_debit_raw-open_credit_raw) ELSE CAST(0 AS DECIMAL(38,6)) END AS ouverture_credit, mvt_debit, mvt_credit, CASE WHEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit))>=0 THEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit)) ELSE CAST(0 AS DECIMAL(38,6)) END AS cloture_debit, CASE WHEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit))<0 THEN ABS((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit)) ELSE CAST(0 AS DECIMAL(38,6)) END AS cloture_credit FROM aggregated ORDER BY account_no"#,
+            parsed_date_expr = parsed_date_expr,
+            journal_expr = journal_expr,
+            account_no_expr = account_no_expr,
+            account_label_expr = account_label_expr,
+            debit_expr = entry_context.debit_expr,
+            credit_expr = entry_context.credit_expr,
+            entries_table = entry_context.table.sql_name(),
+            account_join = account_join,
+            account_filter_sql_base = format!("{}", account_filter_sql),
+            opening_condition = opening_condition,
+            date_from = sql_literal(date_from),
+            date_to = sql_literal(date_to),
+            cutoff_condition = cutoff_condition
+        );
+
+        let data = db::execute_raw_query(&mut client, &sql).await?;
+        let ix = column_index_map(&data);
+        let rows = data.rows.iter().map(|row| BalanceRow {
+            account_no: row_string(row, &ix, "account_no").unwrap_or_default(),
+            account_label: row_string(row, &ix, "account_label").unwrap_or_default(),
+            ouverture_debit: row_decimal(row, &ix, "ouverture_debit"),
+            ouverture_credit: row_decimal(row, &ix, "ouverture_credit"),
+            mvt_debit: row_decimal(row, &ix, "mvt_debit"),
+            mvt_credit: row_decimal(row, &ix, "mvt_credit"),
+            cloture_debit: row_decimal(row, &ix, "cloture_debit"),
+            cloture_credit: row_decimal(row, &ix, "cloture_credit"),
+        }).collect();
+        DashboardResponse { data: rows, warning: join_warnings(warnings) }
+    };
+
+    let all_rows = result.data;
+    let total = all_rows.len() as i64;
+    let _ = window.emit("balance_total", StreamTotalPayload { total, warning: result.warning.clone() });
+
+    let mut offset = 0usize;
+    while offset < all_rows.len() {
+        let end = (offset + STREAM_CHUNK_SIZE as usize).min(all_rows.len());
+        let chunk = all_rows[offset..end].to_vec();
+        let _ = window.emit("balance_chunk", StreamBalanceChunkPayload { rows: chunk });
+        offset = end;
+    }
+
+    let _ = window.emit("balance_complete", StreamCompletePayload { warning: result.warning });
+    Ok(())
+}
+
+// ─── stream_grand_livre_auxiliaire ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn stream_grand_livre_auxiliaire(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    id: String,
+    date_from: String,
+    date_to: String,
+    tiers_type: String,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let result = do_stream_aux(&window, &state, &id, &date_from, &date_to, &tiers_type, account_prefix).await;
+    if let Err(ref e) = result {
+        let _ = window.emit("aux_error", e.clone());
+    }
+    result
+}
+
+async fn do_stream_aux(
+    window: &tauri::Window,
+    state: &AppState,
+    id: &str,
+    date_from: &str,
+    date_to: &str,
+    tiers_type: &str,
+    account_prefix: Option<String>,
+) -> Result<(), String> {
+    let normalized_type = tiers_type.trim().to_ascii_lowercase();
+    let is_fournisseurs = normalized_type == "fournisseurs";
+    if !is_fournisseurs && normalized_type != "clients" {
+        return Err("tiers_type must be 'fournisseurs' or 'clients'".to_string());
+    }
+
+    let config = state.resolve_connection_config(id)?;
+    let hint_schema = state.get_connection_schema(id);
+    let mut client = db::connect(&config).await?;
+
+    if is_sage1000_schema(hint_schema.as_ref()) {
+        stream_aux_sage1000(window, &mut client, date_from, date_to, &normalized_type, account_prefix.as_deref()).await
+    } else {
+        stream_aux_generic(window, &mut client, hint_schema.as_ref(), date_from, date_to, is_fournisseurs, account_prefix.as_deref()).await
+    }
+}
+
+async fn stream_aux_with_base_cte(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    base_cte: &str,
+    order_by: &str,
+    warning: Option<String>,
+) -> Result<(), String> {
+    let count_sql = format!(
+        "{} SELECT COUNT(*) AS total FROM base WHERE parsed_date IS NOT NULL",
+        base_cte
+    );
+    let count_data = db::execute_raw_query(client, &count_sql).await?;
+    let idx = column_index_map(&count_data);
+    let total = count_data.rows.first().map(|r| row_i64(r, &idx, "total")).unwrap_or(0);
+
+    let _ = window.emit("aux_total", StreamTotalPayload { total, warning: warning.clone() });
+
+    let mut running_balance: HashMap<String, Decimal> = HashMap::new();
+    let mut offset = 0i64;
+
+    loop {
+        let chunk_sql = format!(
+            "{}\nSELECT account_no, account_label, tiers_code, tiers_name, CONVERT(char(10), parsed_date, 103) AS [date], journal, description, ref_piece, lettrage, debit, credit\nFROM base\nWHERE parsed_date IS NOT NULL\nORDER BY {}\nOFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+            base_cte, order_by, offset, STREAM_CHUNK_SIZE
+        );
+        let data = db::execute_raw_query(client, &chunk_sql).await?;
+        let ix = column_index_map(&data);
+        let fetched = data.rows.len() as i64;
+
+        let rows: Vec<AuxiliaireRow> = data.rows.iter().map(|row| {
+            let tiers_code = row_string(row, &ix, "tiers_code").unwrap_or_default();
+            let debit = row_decimal(row, &ix, "debit");
+            let credit = row_decimal(row, &ix, "credit");
+            let bal = running_balance.entry(tiers_code.clone()).or_insert(Decimal::ZERO);
+            *bal += debit - credit;
+            AuxiliaireRow {
+                account_no: row_string(row, &ix, "account_no").unwrap_or_default(),
+                account_label: row_string(row, &ix, "account_label").unwrap_or_default(),
+                tiers_code,
+                tiers_name: row_string(row, &ix, "tiers_name").unwrap_or_default(),
+                date: row_string(row, &ix, "date"),
+                journal: row_string(row, &ix, "journal"),
+                description: row_string(row, &ix, "description"),
+                ref_piece: row_string(row, &ix, "ref_piece"),
+                lettrage: row_string(row, &ix, "lettrage"),
+                debit,
+                credit,
+                running_balance: *bal,
+                is_total_row: false,
+            }
+        }).collect();
+
+        let _ = window.emit("aux_chunk", StreamAuxChunkPayload { rows });
+
+        if fetched < STREAM_CHUNK_SIZE {
+            break;
+        }
+        offset += fetched;
+    }
+
+    let _ = window.emit("aux_complete", StreamCompletePayload { warning });
+    Ok(())
+}
+
+async fn stream_aux_sage1000(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    date_from: &str,
+    date_to: &str,
+    normalized_type: &str,
+    account_prefix: Option<&str>,
+) -> Result<(), String> {
+    let is_fournisseurs = normalized_type == "fournisseurs";
+    let Some(context) = resolve_sage1000_context(client).await? else {
+        let _ = window.emit("aux_total", StreamTotalPayload {
+            total: 0,
+            warning: Some("Sage 1000 tables non détectées".to_string()),
+        });
+        let _ = window.emit("aux_complete", StreamCompletePayload { warning: None });
+        return Ok(());
+    };
+
+    let piece_join = context.pieces.as_ref().map(|t| format!(
+        "LEFT JOIN {} p ON {} = {}",
+        t.sql_name(), qualify("e", "oidpiece"), qualify("p", "oid")
+    )).unwrap_or_default();
+
+    let tiers_join = context.tiers.as_ref().map(|t| {
+        let role_join = context.role_tiers.as_ref().map(|rt| format!(
+            "LEFT JOIN {} rt ON {} = {}",
+            rt.sql_name(), qualify("rt", "oidTiers"), qualify("t", "oid")
+        )).unwrap_or_default();
+        format!(
+            "LEFT JOIN {} t ON {} = {} {}",
+            t.sql_name(), qualify("t", "oid"), qualify("e", "oidTiers"), role_join
+        )
+    }).unwrap_or_default();
+
+    let journal_expr = if context.pieces.is_some() {
+        text_or_empty(&qualify("p", "numero"), 64)
+    } else {
+        "CAST('' AS NVARCHAR(64))".to_string()
+    };
+    let ref_piece_expr = if context.pieces.is_some() {
+        text_or_empty(&qualify("p", "numero"), 128)
+    } else {
+        "CAST('' AS NVARCHAR(128))".to_string()
+    };
+    let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
+    let account_label_expr = format!(
+        "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+        qualify("cg", "Caption"), qualify("e", "reference")
+    );
+    let tiers_code_expr = context.tiers.as_ref().map(|_| text_or_empty(&qualify("t", "code"), 64))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+    let tiers_name_expr = context.tiers.as_ref().map(|_| text_or_empty(&qualify("t", "intitule"), 255))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(255))".to_string());
+    let lettrage_expr = text_or_empty(&qualify("e", "CodeLettrageExterne"), 64);
+    let debit_expr = decimal_or_zero(&qualify("e", "debit"));
+    let credit_expr = decimal_or_zero(&qualify("e", "credit"));
+    let account_filter = if is_fournisseurs {
+        format!("({} LIKE '40%' OR {} LIKE '401%')", account_no_expr, account_no_expr)
+    } else {
+        format!("({} LIKE '41%' OR {} LIKE '411%')", account_no_expr, account_no_expr)
+    };
+    let prefix_filter = account_prefix
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!(" AND {} LIKE {}", account_no_expr, sql_literal(&format!("{}%", p.trim()))))
+        .unwrap_or_default();
+
+    let base_cte = format!(
+        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), account_no = {account_no_expr}, account_label = {account_label_expr}, tiers_code = {tiers_code_expr}, tiers_name = {tiers_name_expr}, journal = {journal_expr}, description = CAST('' AS NVARCHAR(255)), ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {piece_join} {tiers_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_filter} AND {tiers_code_filter} <> '' {prefix_filter})",
+        date_col = qualify("e", "eDate"),
+        account_no_expr = account_no_expr,
+        account_label_expr = account_label_expr,
+        tiers_code_expr = tiers_code_expr,
+        tiers_name_expr = tiers_name_expr,
+        journal_expr = journal_expr,
+        ref_piece_expr = ref_piece_expr,
+        lettrage_expr = lettrage_expr,
+        debit_expr = debit_expr,
+        credit_expr = credit_expr,
+        entry_number_col = qualify("e", "numero"),
+        entries_table = context.entries.sql_name(),
+        accounts_table = context.accounts.sql_name(),
+        entry_account_fk = qualify("e", "oidcompteGeneral"),
+        account_pk = qualify("cg", "oid"),
+        piece_join = piece_join,
+        tiers_join = tiers_join,
+        date_from = sql_literal(date_from),
+        date_to = sql_literal(date_to),
+        account_filter = account_filter,
+        tiers_code_filter = tiers_code_expr,
+        prefix_filter = prefix_filter
+    );
+
+    stream_aux_with_base_cte(window, client, &base_cte, "account_no, tiers_code, parsed_date, entry_number", None).await
+}
+
+async fn stream_aux_generic(
+    window: &tauri::Window,
+    client: &mut db::DbClient,
+    hint_schema: Option<&crate::sage_compat::SageSchema>,
+    date_from: &str,
+    date_to: &str,
+    is_fournisseurs: bool,
+    account_prefix: Option<&str>,
+) -> Result<(), String> {
+    let (entry_context, mut warnings) = resolve_entry_context_smart(client, hint_schema).await?;
+
+    let Some(entry_context) = entry_context else {
+        let _ = window.emit("aux_total", StreamTotalPayload { total: 0, warning: join_warnings(warnings) });
+        let _ = window.emit("aux_complete", StreamCompletePayload { warning: None });
+        return Ok(());
+    };
+
+    let Some(tiers_code_col) = entry_context.tiers_code_col.clone() else {
+        warnings.push("Colonne code tiers non détectée".to_string());
+        let _ = window.emit("aux_total", StreamTotalPayload { total: 0, warning: join_warnings(warnings) });
+        let _ = window.emit("aux_complete", StreamCompletePayload { warning: None });
+        return Ok(());
+    };
+
+    let account_lookup = if let Some(schema) = hint_schema {
+        if !schema.edition.is_generic() {
+            schema_lookup_context(client, &schema.table_comptes, &schema.col_compte_num, &schema.col_compte_lib, &schema.col_compte_type).await?
+                .or(resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?)
+        } else {
+            resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+        }
+    } else {
+        resolve_lookup_context(client, ACCOUNT_TABLE_CANDIDATES, &["CG_Num", "CT_Num", "COMPTE", "ACCOUNT_NO"], &["CG_Intitule", "CT_Intitule", "LIBELLE_COMPTE", "ACCOUNT_LABEL", "ACCOUNT_NAME"], &[]).await?
+    };
+    let tiers_lookup = if let Some(schema) = hint_schema {
+        if !schema.edition.is_generic() {
+            schema_lookup_context(client, &schema.table_tiers, &schema.col_tiers_code, &schema.col_tiers_nom, &schema.col_tiers_type).await?
+                .or(resolve_lookup_context(client, TIERS_TABLE_CANDIDATES, &["CT_Num", "TIERS_CODE", "CODE_TIERS", "ACCOUNT_NO", "CUSTOMER_NO", "SUPPLIER_NO"], &["CT_Intitule", "TIERS_NAME", "LIBELLE", "NAME", "ACCOUNT_NAME", "CUSTOMER_NAME", "SUPPLIER_NAME"], &["CT_Type", "TIERS_TYPE", "ACCOUNT_TYPE", "TYPE_TIERS"]).await?)
+        } else {
+            resolve_lookup_context(client, TIERS_TABLE_CANDIDATES, &["CT_Num", "TIERS_CODE", "CODE_TIERS", "ACCOUNT_NO", "CUSTOMER_NO", "SUPPLIER_NO"], &["CT_Intitule", "TIERS_NAME", "LIBELLE", "NAME", "ACCOUNT_NAME", "CUSTOMER_NAME", "SUPPLIER_NAME"], &["CT_Type", "TIERS_TYPE", "ACCOUNT_TYPE", "TYPE_TIERS"]).await?
+        }
+    } else {
+        resolve_lookup_context(client, TIERS_TABLE_CANDIDATES, &["CT_Num", "TIERS_CODE", "CODE_TIERS", "ACCOUNT_NO", "CUSTOMER_NO", "SUPPLIER_NO"], &["CT_Intitule", "TIERS_NAME", "LIBELLE", "NAME", "ACCOUNT_NAME", "CUSTOMER_NAME", "SUPPLIER_NAME"], &["CT_Type", "TIERS_TYPE", "ACCOUNT_TYPE", "TYPE_TIERS"]).await?
+    };
+
+    if tiers_lookup.is_none() {
+        warnings.push("Table tiers non détectée; noms tiers seront vides".to_string());
+    }
+
+    let parsed_date_expr = format!("TRY_CAST({} AS DATE)", qualify("e", &entry_context.date_col));
+    let journal_expr = entry_context.journal_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 64))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+    let account_no_expr = text_or_empty(&qualify("e", &entry_context.account_col), 64);
+    let ref_piece_expr = entry_context.ref_piece_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 128))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(128))".to_string());
+    let lettrage_expr = entry_context.lettrage_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 64))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(64))".to_string());
+    let description_expr = entry_context.description_col.as_ref()
+        .map(|c| text_or_empty(&qualify("e", c), 255))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(255))".to_string());
+    let account_label_expr = match (&account_lookup, &entry_context.account_label_col) {
+        (Some(lu), Some(el)) => format!(
+            "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+            qualify("a", &lu.label_col), qualify("e", el)
+        ),
+        (Some(lu), None) => text_or_empty(&qualify("a", &lu.label_col), 255),
+        (None, Some(el)) => text_or_empty(&qualify("e", el), 255),
+        (None, None) => "CAST('' AS NVARCHAR(255))".to_string(),
+    };
+    let tiers_code_expr = text_or_empty(&qualify("e", &tiers_code_col), 64);
+    let tiers_name_expr = tiers_lookup.as_ref()
+        .map(|lu| text_or_empty(&qualify("t", &lu.label_col), 255))
+        .unwrap_or_else(|| "CAST('' AS NVARCHAR(255))".to_string());
+    let account_join = account_lookup.as_ref().map(|lu| format!(
+        "LEFT JOIN {} a ON {} = {}",
+        lu.table.sql_name(), qualify("a", &lu.code_col), qualify("e", &entry_context.account_col)
+    )).unwrap_or_default();
+    let tiers_join = tiers_lookup.as_ref().map(|lu| format!(
+        "LEFT JOIN {} t ON {} = {}",
+        lu.table.sql_name(), qualify("t", &lu.code_col), qualify("e", &tiers_code_col)
+    )).unwrap_or_default();
+    let default_account_filter = if is_fournisseurs {
+        format!("({} LIKE '40%' OR {} LIKE '401%')", account_no_expr, account_no_expr)
+    } else {
+        format!("({} LIKE '41%' OR {} LIKE '411%')", account_no_expr, account_no_expr)
+    };
+    let type_filter = tiers_lookup.as_ref().and_then(|lu| lu.type_col.as_ref()).map(|tc| {
+        let tv = if is_fournisseurs { 1 } else { 0 };
+        format!("COALESCE(TRY_CAST({} AS INT), -1) = {}", qualify("t", tc), tv)
+    });
+    let kind_filter = type_filter
+        .map(|tf| format!("({} OR {})", tf, default_account_filter))
+        .unwrap_or(default_account_filter);
+    let prefix_filter = account_prefix
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!(" AND {} LIKE {}", account_no_expr, sql_literal(&format!("{}%", p.trim()))))
+        .unwrap_or_default();
+
+    let base_cte = format!(
+        "WITH base AS (SELECT parsed_date = {parsed_date_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, tiers_code = {tiers_code_expr}, tiers_name = {tiers_name_expr}, journal = {journal_expr}, description = {description_expr}, ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr} FROM {entries_table} e {account_join} {tiers_join} WHERE {parsed_date_expr} BETWEEN {date_from} AND {date_to} AND {kind_filter} AND {tiers_code_filter} <> '' {prefix_filter})",
+        parsed_date_expr = parsed_date_expr,
+        account_no_expr = account_no_expr,
+        account_label_expr = account_label_expr,
+        tiers_code_expr = tiers_code_expr,
+        tiers_name_expr = tiers_name_expr,
+        journal_expr = journal_expr,
+        description_expr = description_expr,
+        ref_piece_expr = ref_piece_expr,
+        lettrage_expr = lettrage_expr,
+        debit_expr = entry_context.debit_expr,
+        credit_expr = entry_context.credit_expr,
+        entries_table = entry_context.table.sql_name(),
+        account_join = account_join,
+        tiers_join = tiers_join,
+        date_from = sql_literal(date_from),
+        date_to = sql_literal(date_to),
+        kind_filter = kind_filter,
+        tiers_code_filter = tiers_code_expr,
+        prefix_filter = prefix_filter
+    );
+
+    stream_aux_with_base_cte(
+        window, client, &base_cte,
+        "account_no, tiers_code, parsed_date, journal, ref_piece, description",
+        join_warnings(warnings)
+    ).await
+}
+
 #[tauri::command]
 pub async fn get_dashboard_kpis(
     state: State<'_, AppState>,

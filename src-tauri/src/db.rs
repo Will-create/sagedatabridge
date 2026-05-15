@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use tiberius::{AuthMethod, Client, ColumnType, Config, SqlBrowser};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use std::sync::Arc;
 
 #[cfg(windows)]
 use odbc_api::{
@@ -14,10 +15,10 @@ use odbc_api::{
 
 use crate::state::{ColumnInfo, ConnectionConfig, Filter, RelationshipInfo, TableData, TableInfo};
 
-type TdsClient = Client<Compat<TcpStream>>;
+pub type TdsClient = Client<Compat<TcpStream>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DbBackend {
+pub enum DbBackend {
     Tiberius,
     #[cfg(windows)]
     Odbc,
@@ -25,8 +26,29 @@ enum DbBackend {
 
 #[derive(Debug, Clone)]
 pub struct DbClient {
-    config: ConnectionConfig,
-    backend: DbBackend,
+    pub config: ConnectionConfig,
+    pub backend: DbBackend,
+}
+
+/// A cached database connection entry (held in AppState.client_cache)
+pub struct CachedClient {
+    pub client: tokio::sync::Mutex<DbClient>,
+    pub connected_at: std::time::Instant,
+}
+
+impl DbClient {
+    /// Lightweight ping: creates a temp TDS connection to verify server is reachable.
+    pub async fn ping(&self) -> bool {
+        match self.backend {
+            #[cfg(windows)]
+            DbBackend::Odbc => query_odbc(&self.config, "SELECT 1").is_ok(),
+            DbBackend::Tiberius => {
+                let Ok(mut tds) = connect_tds(&self.config).await else { return false; };
+                let Ok(stream) = tds.simple_query("SELECT 1").await else { return false; };
+                stream.into_results().await.is_ok()
+            }
+        }
+    }
 }
 
 /// Build a tiberius Config from our ConnectionConfig
@@ -86,16 +108,24 @@ fn build_config(conn: &ConnectionConfig) -> Result<Config, String> {
 async fn connect_tds(conn: &ConnectionConfig) -> Result<TdsClient, String> {
     let config = build_config(conn)?;
 
-    let tcp = TcpStream::connect_named(&config)
-        .await
-        .map_err(|e| format!("TCP connection failed: {}", e))?;
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect_named(&config),
+    )
+    .await
+    .map_err(|_| "Connexion timeout après 10 secondes — vérifiez le réseau".to_string())?
+    .map_err(|e| format!("Connexion TCP échouée: {}", e))?;
 
     tcp.set_nodelay(true)
         .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
 
-    let client = Client::connect(config, tcp.compat_write())
-        .await
-        .map_err(|e| format!("SQL Server login failed: {}", e))?;
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Client::connect(config, tcp.compat_write()),
+    )
+    .await
+    .map_err(|_| "Timeout d'authentification SQL Server".to_string())?
+    .map_err(|e| format!("SQL Server login failed: {}", e))?;
 
     Ok(client)
 }
@@ -1477,4 +1507,39 @@ fn execute_raw_query_odbc(conn: &ConnectionConfig, sql: &str) -> Result<TableDat
         page: 0,
         page_size: total as u32,
     })
+}
+
+/// Open a raw TDS connection for streaming operations (one connection shared across all chunks)
+pub async fn open_tds_connection(conn: &ConnectionConfig) -> Result<TdsClient, String> {
+    connect_tds(conn).await
+}
+
+/// Execute a raw SQL query on an EXISTING TDS connection (used for streaming chunks)
+pub async fn run_tds_query(tds: &mut TdsClient, sql: &str) -> Result<TableData, String> {
+    execute_raw_query_tds(tds, sql).await
+}
+
+/// Get or create a cached DbClient for a connection (avoids re-probing backend on every command)
+pub async fn get_or_connect(
+    state: &crate::state::AppState,
+    id: &str,
+) -> Result<std::sync::Arc<CachedClient>, String> {
+    let cached_opt = {
+        let cache = state.client_cache.lock().map_err(|e| e.to_string())?;
+        cache.get(id).cloned()
+    };
+    if let Some(cached) = cached_opt {
+        return Ok(cached);
+    }
+    let conn_config = state.resolve_connection_config(id)?;
+    let new_client = connect(&conn_config).await?;
+    let new_cached = std::sync::Arc::new(CachedClient {
+        client: tokio::sync::Mutex::new(new_client),
+        connected_at: std::time::Instant::now(),
+    });
+    {
+        let mut cache = state.client_cache.lock().map_err(|e| e.to_string())?;
+        cache.insert(id.to_string(), new_cached.clone());
+    }
+    Ok(new_cached)
 }

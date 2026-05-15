@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 fn default_sage_edition() -> String {
     "auto".to_string()
@@ -186,6 +186,7 @@ pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub active_connections: Mutex<HashMap<String, ActiveConnection>>,
     pub active_schemas: Mutex<HashMap<String, crate::sage_compat::SageSchema>>,
+    pub client_cache: Mutex<HashMap<String, Arc<crate::db::CachedClient>>>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
 }
@@ -212,6 +213,7 @@ impl AppState {
             config: Mutex::new(config),
             active_connections: Mutex::new(HashMap::new()),
             active_schemas: Mutex::new(HashMap::new()),
+            client_cache: Mutex::new(HashMap::new()),
             data_dir,
             config_path,
         }

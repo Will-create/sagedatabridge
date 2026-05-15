@@ -509,6 +509,9 @@ pub async fn connect_db(state: State<'_, AppState>, id: String) -> Result<String
                 schemas.insert(id.clone(), schema);
             }
 
+            // Warm up the client cache for this connection
+            let _ = db::get_or_connect(&state, &id).await;
+
             Ok(msg)
         }
         Err(e) => {
