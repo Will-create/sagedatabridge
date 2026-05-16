@@ -77,6 +77,8 @@ export default function SettingsDrawer({
   appVersion,
   onOpenAbout,
   onLockNow,
+  activeConnectionId,
+  onOpenInvoiceAppearance,
 }) {
   const { lang, setLang, t } = useT();
   const [activeTab, setActiveTab] = useState("general");
@@ -356,6 +358,19 @@ export default function SettingsDrawer({
                 <span>{t("settings_version")}</span>
                 <strong>v{appVersion}</strong>
               </div>
+
+              <button
+                type="button"
+                className="settings-link-card"
+                onClick={onOpenInvoiceAppearance}
+                disabled={!activeConnectionId}
+              >
+                <div className="settings-secret-copy">
+                  <strong>{t("invoice_template_appearance")}</strong>
+                  <span>{activeConnectionId ? t("invoice_template_settings_hint") : t("invoice_template_connection_required")}</span>
+                </div>
+                <span className="settings-link-arrow">›</span>
+              </button>
             </div>
           ) : null}
 
@@ -479,6 +494,7 @@ export default function SettingsDrawer({
           ) : null}
         </div>
       </aside>
+
     </div>
   );
 }

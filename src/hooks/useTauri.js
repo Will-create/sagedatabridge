@@ -189,3 +189,99 @@ export const exportToExcel = async (id, schema, table, filters, selectedColumns)
 
   return filePath;
 };
+
+// ─── Invoicing ───────────────────────────────────────────────────────────────
+
+export const listInvoices = (id, {
+  dateFrom = null,
+  dateTo = null,
+  nature = null,
+  statut = null,
+  tiersId = null,
+  search = null,
+} = {}) => invoke("list_invoices", {
+  id,
+  dateFrom,
+  dateTo,
+  nature,
+  statut,
+  tiersId,
+  search,
+});
+
+export const getInvoice = (id, pieceId) => invoke("get_invoice", { id, pieceId });
+export const createInvoice = (id, invoice) => invoke("create_invoice", { id, invoice });
+export const updateInvoice = (id, invoice) => invoke("update_invoice", { id, invoice });
+
+export const updateStatut = (id, pieceId, newStatut, updatedBy = "") => invoke("update_statut", {
+  id,
+  pieceId,
+  newStatut,
+  updatedBy,
+});
+
+export const deleteInvoice = (id, pieceId) => invoke("delete_invoice", { id, pieceId });
+export const comptabiliserInvoice = (id, pieceId) => invoke("comptabiliser_invoice", { id, pieceId });
+
+export const listTiers = (id, typeTiers = "all", search = null) => invoke("list_tiers", {
+  id,
+  typeTiers,
+  search,
+});
+const normalizeTiersPayload = (tiers = {}) => ({
+  id: tiers.id ?? "",
+  code: tiers.code ?? "",
+  nom: tiers.nom ?? "",
+  adresse: tiers.adresse ?? "",
+  cp: tiers.cp ?? "",
+  ville: tiers.ville ?? "",
+  pays: tiers.pays ?? "",
+  siret: tiers.siret ?? "",
+  email: tiers.email ?? "",
+  telephone: tiers.telephone ?? "",
+  tva_intra: tiers.tva_intra ?? "",
+  type_tiers: tiers.type_tiers || "client",
+  encours: Number(tiers.encours) || 0,
+  nb_factures: Number(tiers.nb_factures) || 0,
+  is_local: Boolean(tiers.is_local),
+});
+
+export const createTiers = (id, tiers) => invoke("create_tiers", {
+  id,
+  tiers: normalizeTiersPayload(tiers),
+});
+export const updateTiers = (id, tiers) => invoke("update_tiers", {
+  id,
+  tiers: normalizeTiersPayload(tiers),
+});
+export const deleteTiers = (id, tiersId) => invoke("delete_tiers", { id, tiersId });
+
+export const listArticles = (id, search = null) => invoke("list_articles", { id, search });
+export const createArticle = (id, article) => invoke("create_article", { id, article });
+export const updateArticle = (id, article) => invoke("update_article", { id, article });
+export const deleteArticle = (id, articleId) => invoke("delete_article", { id, articleId });
+
+export const renderInvoiceHtml = (invoice, templateId = "") => invoke("render_invoice_html", {
+  invoice,
+  templateId,
+});
+
+export const renderInvoiceHtmlPreview = (invoice, template) => invoke("render_invoice_html_preview", {
+  invoice,
+  template,
+});
+
+export const exportInvoicePdf = (invoice, templateId, filePath) => invoke("export_invoice_pdf", {
+  invoice,
+  templateId,
+  filePath,
+});
+
+export const saveInvoiceTemplate = (connectionId, template) => invoke("save_invoice_template", {
+  connectionId,
+  template,
+});
+
+export const getInvoiceTemplates = (connectionId = null) => invoke("get_invoice_templates", {
+  connectionId,
+});

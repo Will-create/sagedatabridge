@@ -2,7 +2,6 @@ use serde_json::{json, Value};
 use tiberius::{AuthMethod, Client, ColumnType, Config, SqlBrowser};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use std::sync::Arc;
 
 #[cfg(windows)]
 use odbc_api::{
@@ -372,7 +371,11 @@ fn odbc_cell_to_json(value: Option<&str>, column: &ColumnInfo) -> Value {
 async fn probe_connection(conn: &ConnectionConfig) -> Result<(DbBackend, String), String> {
     #[cfg(windows)]
     {
-        match test_connection_odbc(conn) {
+        let conn_clone = conn.clone();
+        let odbc_result = tokio::task::spawn_blocking(move || test_connection_odbc(&conn_clone))
+            .await
+            .map_err(|e| e.to_string())?;
+        match odbc_result {
             Ok(message) => return Ok((DbBackend::Odbc, message)),
             Err(odbc_error) => match test_connection_tds(conn).await {
                 Ok(message) => Ok((DbBackend::Tiberius, message)),
@@ -409,7 +412,12 @@ pub async fn test_connection(conn: &ConnectionConfig) -> Result<String, String> 
 pub async fn get_databases(client: &mut DbClient) -> Result<Vec<String>, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => get_databases_odbc(&client.config),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            tokio::task::spawn_blocking(move || get_databases_odbc(&config))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             get_databases_tds(&mut tds).await
@@ -463,7 +471,12 @@ fn get_databases_odbc(conn: &ConnectionConfig) -> Result<Vec<String>, String> {
 pub async fn get_tables(client: &mut DbClient) -> Result<Vec<TableInfo>, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => get_tables_odbc(&client.config),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            tokio::task::spawn_blocking(move || get_tables_odbc(&config))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             get_tables_tds(&mut tds).await
@@ -562,7 +575,14 @@ pub async fn get_columns(
 ) -> Result<Vec<ColumnInfo>, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => get_columns_odbc(&client.config, schema, table),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            let schema = schema.to_string();
+            let table = table.to_string();
+            tokio::task::spawn_blocking(move || get_columns_odbc(&config, &schema, &table))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             get_columns_tds(&mut tds, schema, table).await
@@ -712,7 +732,12 @@ fn get_columns_odbc(
 pub async fn get_relationships(client: &mut DbClient) -> Result<Vec<RelationshipInfo>, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => get_relationships_odbc(&client.config),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            tokio::task::spawn_blocking(move || get_relationships_odbc(&config))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             get_relationships_tds(&mut tds).await
@@ -1000,15 +1025,18 @@ pub async fn get_table_data(
 ) -> Result<TableData, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => get_table_data_odbc(
-            &client.config,
-            schema,
-            table,
-            page,
-            page_size,
-            filters,
-            columns,
-        ),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            let schema = schema.to_string();
+            let table = table.to_string();
+            let filters = filters.to_vec();
+            let columns = columns.to_vec();
+            tokio::task::spawn_blocking(move || {
+                get_table_data_odbc(&config, &schema, &table, page, page_size, &filters, &columns)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             get_table_data_tds(&mut tds, schema, table, page, page_size, filters, columns).await
@@ -1155,7 +1183,18 @@ pub async fn export_csv(
 ) -> Result<String, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => export_csv_odbc(&client.config, schema, table, filters, selected_columns),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            let schema = schema.to_string();
+            let table = table.to_string();
+            let filters = filters.to_vec();
+            let selected_columns = selected_columns.to_vec();
+            tokio::task::spawn_blocking(move || {
+                export_csv_odbc(&config, &schema, &table, &filters, &selected_columns)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             export_csv_tds(&mut tds, schema, table, filters, selected_columns).await
@@ -1310,7 +1349,18 @@ pub async fn export_json(
 ) -> Result<String, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => export_json_odbc(&client.config, schema, table, filters, selected_columns),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            let schema = schema.to_string();
+            let table = table.to_string();
+            let filters = filters.to_vec();
+            let selected_columns = selected_columns.to_vec();
+            tokio::task::spawn_blocking(move || {
+                export_json_odbc(&config, &schema, &table, &filters, &selected_columns)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             export_json_tds(&mut tds, schema, table, filters, selected_columns).await
@@ -1414,7 +1464,13 @@ fn export_json_odbc(
 pub async fn execute_raw_query(client: &mut DbClient, sql: &str) -> Result<TableData, String> {
     match client.backend {
         #[cfg(windows)]
-        DbBackend::Odbc => execute_raw_query_odbc(&client.config, sql),
+        DbBackend::Odbc => {
+            let config = client.config.clone();
+            let sql = sql.to_string();
+            tokio::task::spawn_blocking(move || execute_raw_query_odbc(&config, &sql))
+                .await
+                .map_err(|e| e.to_string())?
+        }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
             execute_raw_query_tds(&mut tds, sql).await

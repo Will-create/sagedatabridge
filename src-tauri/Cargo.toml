@@ -15,7 +15,7 @@ tauri-build = { version = "1", features = [] }
 
 [dependencies]
 tauri = { version = "1", features = [ "fs-all", "dialog-all",
-  "path-all"
+  "path-all", "shell-open"
 ] }
 
 serde = { version = "1", features = ["derive"] }
@@ -54,6 +54,9 @@ hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 odbc-api = { version = "17.0.0", default-features = false, features = ["odbc_version_3_80"] }
+
+[profile.dev]
+opt-level = 1
 
 [features]
 # Used by `tauri build` when the frontend is loaded from the bundled filesystem.

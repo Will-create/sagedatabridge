@@ -61,9 +61,6 @@ async fn scan_udp_broadcast() -> Vec<SqlServerInstance> {
                     }
                 }
                 
-                // If hostname is used in response, prefer it, but many return IP in addr
-                let final_host = if host.is_empty() { addr.ip().to_string() } else { host };
-
                 instances.push(SqlServerInstance {
                     host: addr.ip().to_string(), // Use IP for reliability in connection
                     instance_name,

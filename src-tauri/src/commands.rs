@@ -491,26 +491,13 @@ pub async fn connect_db(state: State<'_, AppState>, id: String) -> Result<String
                 "sage1000" => SageSchema::for_edition(&SageEdition::Sage1000),
                 "sagex3" => SageSchema::for_edition(&SageEdition::SageX3),
                 "custom" => custom_schema.unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic)),
-                _ => {
-                    // "auto" — run detection silently, ignore errors
-                    if let Ok(mut client) = db::connect(&conn_config).await {
-                        detect_sage_schema(&mut client)
-                            .await
-                            .map(|result| result.schema)
-                            .unwrap_or_else(|_| SageSchema::for_edition(&SageEdition::Generic))
-                    } else {
-                        SageSchema::for_edition(&SageEdition::Generic)
-                    }
-                }
+                _ => SageSchema::for_edition(&SageEdition::Generic),
             };
 
             {
                 let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
                 schemas.insert(id.clone(), schema);
             }
-
-            // Warm up the client cache for this connection
-            let _ = db::get_or_connect(&state, &id).await;
 
             Ok(msg)
         }
@@ -565,16 +552,10 @@ pub async fn switch_database(
         );
     }
 
-    let switch_result = async {
-        db::test_connection(&next_config).await?;
-        let mut client = db::connect(&next_config).await?;
-        let _ = db::get_tables(&mut client).await?;
-        Ok::<(), String>(())
-    }
-    .await;
+    let switch_result = db::test_connection(&next_config).await;
 
     match switch_result {
-        Ok(()) => {
+        Ok(_) => {
             let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
             active.insert(
                 connection_id,

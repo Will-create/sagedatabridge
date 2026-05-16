@@ -61,11 +61,13 @@ export default function Sidebar({
   activeId,
   activeDatabase,
   adminMode,
+  invoicingOpen,
   onSelectConnection,
   onRefreshConnection,
   onConnectionSaved,
   onCollapse,
   onOpenDashboard,
+  onOpenInvoicing,
   onOpenSettings,
 }) {
   const { t } = useT();
@@ -168,6 +170,19 @@ export default function Sidebar({
                 <path d="M7 14l3-3 3 2 4-6" />
               </svg>
               {t("sidebar_dashboard")}
+            </button>
+          ) : null}
+
+          {activeId && activeDatabase ? (
+            <button
+              className={`sidebar-dashboard-btn ${invoicingOpen ? "active" : ""}`}
+              onClick={onOpenInvoicing}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M6 3h9l3 3v15H6z" />
+                <path d="M9 9h6M9 13h6M9 17h4" />
+              </svg>
+              {t("sidebar_invoicing")}
             </button>
           ) : null}
 

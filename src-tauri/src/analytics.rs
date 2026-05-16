@@ -252,6 +252,7 @@ fn value_as_i64(value: Option<&Value>) -> i64 {
     }
 }
 
+#[allow(dead_code)]
 fn value_as_bool(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Bool(flag)) => *flag,
@@ -292,6 +293,7 @@ fn row_i64(row: &[Value], indexes: &HashMap<String, usize>, name: &str) -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn row_bool(row: &[Value], indexes: &HashMap<String, usize>, name: &str) -> bool {
     indexes
         .get(&name.to_ascii_lowercase())
@@ -2160,29 +2162,29 @@ pub async fn get_grand_livre_auxiliaire(
 
 // ─── Streaming Analytics Commands ────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StreamTotalPayload {
     total: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StreamGlChunkPayload {
     rows: Vec<GrandLivreRow>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StreamBalanceChunkPayload {
     rows: Vec<BalanceRow>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StreamAuxChunkPayload {
     rows: Vec<AuxiliaireRow>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StreamCompletePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,

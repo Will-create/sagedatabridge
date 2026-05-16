@@ -4,7 +4,10 @@
 mod analytics;
 mod commands;
 mod db;
+mod invoice_commands;
+mod invoice_compat;
 mod network_scan;
+mod pdf_engine;
 mod sage_compat;
 mod state;
 
@@ -66,10 +69,34 @@ fn main() {
             // Network scan
             network_scan::scan_network_for_sql_servers,
             // Analytics
+            analytics::get_grand_livre,
+            analytics::get_balance,
+            analytics::get_grand_livre_auxiliaire,
             analytics::stream_grand_livre,
             analytics::stream_balance,
             analytics::stream_grand_livre_auxiliaire,
             analytics::get_dashboard_kpis,
+            // Invoicing
+            invoice_commands::list_invoices,
+            invoice_commands::get_invoice,
+            invoice_commands::create_invoice,
+            invoice_commands::update_invoice,
+            invoice_commands::update_statut,
+            invoice_commands::delete_invoice,
+            invoice_commands::comptabiliser_invoice,
+            invoice_commands::list_tiers,
+            invoice_commands::create_tiers,
+            invoice_commands::update_tiers,
+            invoice_commands::delete_tiers,
+            invoice_commands::list_articles,
+            invoice_commands::create_article,
+            invoice_commands::update_article,
+            invoice_commands::delete_article,
+            pdf_engine::render_invoice_html,
+            pdf_engine::render_invoice_html_preview,
+            pdf_engine::export_invoice_pdf,
+            pdf_engine::save_invoice_template,
+            pdf_engine::get_invoice_templates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

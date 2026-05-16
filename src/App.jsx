@@ -17,6 +17,8 @@ import Dashboard from "./components/Dashboard";
 import AboutPage from "./components/AboutPage";
 import DataGrid from "./components/DataGrid";
 import FilterBar from "./components/FilterBar";
+import Invoicing from "./components/Invoicing";
+import TemplateDesigner from "./components/Invoicing/TemplateDesigner";
 import LockScreen from "./components/LockScreen";
 import SettingsDrawer from "./components/SettingsDrawer";
 import Sidebar from "./components/Sidebar";
@@ -78,11 +80,13 @@ export default function App() {
   const [tablePanelCollapsed, setTablePanelCollapsed] = useState(false);
   const [mainView, setMainView] = useState("welcome");
   const [aboutReturnView, setAboutReturnView] = useState("welcome");
+  const [invoicingOpen, setInvoicingOpen] = useState(false);
 
   const [adminMode, setAdminMode] = useState(() => readBooleanStorage(ADMIN_MODE_KEY, false));
   const [showTablePanel, setShowTablePanel] = useState(() => readBooleanStorage(SHOW_TABLE_PANEL_KEY, true));
   const [showToolbar, setShowToolbar] = useState(() => readBooleanStorage(SHOW_TOOLBAR_KEY, true));
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [templateDesignerOpen, setTemplateDesignerOpen] = useState(false);
 
   const [statusMsg, setStatusMsg] = useState({ message: "", type: "idle" });
   const [elapsed, setElapsed] = useState(null);
@@ -93,12 +97,12 @@ export default function App() {
     [connections, activeConnId],
   );
 
-  const showStatus = (message, type = "idle", ms = null) => {
+  const showStatus = useCallback((message, type = "idle", ms = null) => {
     setStatusMsg({ message, type });
     setElapsed(ms ?? null);
-  };
+  }, []);
 
-  const showToast = (nextToast) => setToast(nextToast);
+  const showToast = useCallback((nextToast) => setToast(nextToast), []);
 
   useEffect(() => {
     localStorage.setItem(ADMIN_MODE_KEY, String(adminMode));
@@ -114,11 +118,12 @@ export default function App() {
 
   useEffect(() => {
     if (!activeConnId) {
-      if (mainView !== "about") setMainView("welcome");
-      setActiveDatabase("");
-      setDatabases([]);
+      setMainView((current) => (current === "about" ? current : "welcome"));
+      setActiveDatabase((current) => (current ? "" : current));
+      setDatabases((current) => (current.length ? [] : current));
+      setInvoicingOpen((current) => (current ? false : current));
     }
-  }, [activeConnId, mainView]);
+  }, [activeConnId]);
 
   useEffect(() => {
     if (!adminMode) {
@@ -223,6 +228,7 @@ export default function App() {
       setData(null);
       setColumns([]);
       setFilters([]);
+      setInvoicingOpen(false);
       return;
     }
 
@@ -241,6 +247,7 @@ export default function App() {
     setColumns([]);
     setFilters([]);
     setMainView("welcome");
+    setInvoicingOpen(false);
     showStatus(t("status_connecting"), "idle");
     setStatuses((current) => ({ ...current, [id]: "connecting" }));
 
@@ -250,11 +257,6 @@ export default function App() {
       getActiveSchemas().then(setActiveSchemas).catch(() => {});
 
       const preferredDatabase = (nextConnection?.database || "").trim();
-      if (preferredDatabase) {
-        const opened = await openLoadedDatabase(id, preferredDatabase, adminMode);
-        if (opened) return;
-      }
-
       setDatabasesLoading(true);
       const nextDatabases = await getDatabases(id);
       setDatabases(nextDatabases);
@@ -350,9 +352,11 @@ export default function App() {
 
   const handleLockNow = useCallback(() => {
     setSettingsOpen(false);
+    setTemplateDesignerOpen(false);
     setAdminMode(false);
     setUnlocked(false);
     setMainView((current) => (current === "about" ? "welcome" : current));
+    setInvoicingOpen(false);
   }, []);
 
   const openAboutPage = useCallback(() => {
@@ -418,7 +422,7 @@ export default function App() {
 
   const showSidebarRail = sidebarCollapsed;
   const showTableBrowser = mainView === "tables" && adminMode;
-  const showTableSidebar = showTableBrowser && showTablePanel && activeConnId && activeDatabase;
+  const showTableSidebar = showTableBrowser && !invoicingOpen && showTablePanel && activeConnId && activeDatabase;
   const showTableRail = showTableSidebar && tablePanelCollapsed;
   const showTableChrome = showTableBrowser && showToolbar;
 
@@ -457,7 +461,9 @@ export default function App() {
             onConnectionSaved={handleConnectionSaved}
             onCollapse={() => setSidebarCollapsed(true)}
             onOpenDashboard={() => setMainView("dashboard")}
+            onOpenInvoicing={() => setInvoicingOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}
+            invoicingOpen={invoicingOpen}
           />
         )}
 
@@ -485,6 +491,13 @@ export default function App() {
         <div className={`main-content ${mainView === "dashboard" ? "dashboard-main" : ""}`}>
           {mainView === "about" ? (
             <AboutPage onBack={returnFromAbout} onOpenSettings={() => setSettingsOpen(true)} />
+          ) : invoicingOpen && activeConnId && activeDatabase ? (
+            <Invoicing
+              connId={activeConnId}
+              schema={activeSchemas[activeConnId] ?? null}
+              onBack={() => setInvoicingOpen(false)}
+              onOpenTemplateDesigner={() => setTemplateDesignerOpen(true)}
+            />
           ) : !activeConnId ? (
             <WelcomeScreen />
           ) : !activeDatabase ? (
@@ -551,24 +564,36 @@ export default function App() {
         </div>
       </div>
 
-      <SettingsDrawer
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        adminMode={adminMode}
-        onAdminModeChange={(nextMode) => {
-          setAdminMode(nextMode);
-          if (!nextMode && activeConnId && activeDatabase) {
-            setMainView("dashboard");
-          }
-        }}
-        showTablePanel={showTablePanel}
-        onShowTablePanelChange={setShowTablePanel}
-        showToolbar={showToolbar}
-        onShowToolbarChange={setShowToolbar}
-        appVersion={packageJson.version}
-        onOpenAbout={openAboutPage}
-        onLockNow={handleLockNow}
-      />
+      {settingsOpen ? (
+        <SettingsDrawer
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          adminMode={adminMode}
+          onAdminModeChange={(nextMode) => {
+            setAdminMode(nextMode);
+            if (!nextMode && activeConnId && activeDatabase) {
+              setMainView("dashboard");
+            }
+          }}
+          showTablePanel={showTablePanel}
+          onShowTablePanelChange={setShowTablePanel}
+          showToolbar={showToolbar}
+          onShowToolbarChange={setShowToolbar}
+          appVersion={packageJson.version}
+          onOpenAbout={openAboutPage}
+          onLockNow={handleLockNow}
+          activeConnectionId={activeConnId}
+          onOpenInvoiceAppearance={() => setTemplateDesignerOpen(true)}
+        />
+      ) : null}
+
+      {templateDesignerOpen ? (
+        <TemplateDesigner
+          open={templateDesignerOpen}
+          connectionId={activeConnId}
+          onClose={() => setTemplateDesignerOpen(false)}
+        />
+      ) : null}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>

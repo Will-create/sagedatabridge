@@ -7,6 +7,10 @@ fn default_sage_edition() -> String {
     "auto".to_string()
 }
 
+fn default_active_template_id() -> String {
+    "builtin-modern".to_string()
+}
+
 /// A saved database connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -46,6 +50,55 @@ impl Default for ConnectionConfig {
             custom_schema: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceTemplate {
+    pub id: String,
+    #[serde(default)]
+    pub connection_id: String,
+    pub name: String,
+    pub primary_color: String,
+    pub secondary_color: String,
+    pub font_family: String,
+    #[serde(default = "default_font_size_px")]
+    pub font_size_px: u8,
+    pub show_logo: bool,
+    #[serde(default)]
+    pub logo_base64: String,
+    #[serde(default)]
+    pub company_name: String,
+    #[serde(default)]
+    pub company_address: String,
+    #[serde(default)]
+    pub company_siret: String,
+    #[serde(default)]
+    pub company_tva: String,
+    #[serde(default)]
+    pub company_phone: String,
+    #[serde(default)]
+    pub company_email: String,
+    #[serde(default)]
+    pub company_website: String,
+    #[serde(default)]
+    pub footer_text: String,
+    #[serde(default)]
+    pub legal_mentions: String,
+    #[serde(default)]
+    pub show_bank_details: bool,
+    #[serde(default)]
+    pub bank_iban: String,
+    #[serde(default)]
+    pub bank_bic: String,
+    #[serde(default)]
+    pub conditions_paiement: String,
+    #[serde(default)]
+    pub mention_tva: String,
+    pub layout: String,
+}
+
+fn default_font_size_px() -> u8 {
+    10
 }
 
 /// Info about a database table
@@ -163,6 +216,10 @@ pub struct AppConfig {
     pub saved_queries: Vec<SavedQuery>,
     pub query_history: Vec<QueryHistoryEntry>,
     pub input_history: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub invoice_templates: Vec<InvoiceTemplate>,
+    #[serde(default = "default_active_template_id")]
+    pub active_template_id: String,
 }
 
 /// Connection status
