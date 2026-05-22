@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { deleteConnection, disconnectDb } from "../hooks/useTauri";
+import { deleteConnection, disconnectDb, getDatabases } from "../hooks/useTauri";
 import { useT } from "../i18n";
 import ConnectionModal from "./ConnectionModal";
 
@@ -64,19 +64,25 @@ export default function Sidebar({
   invoicingOpen,
   onSelectConnection,
   onRefreshConnection,
+  onDuplicateWithDatabase,
   onConnectionSaved,
   onCollapse,
   onOpenDashboard,
   onOpenInvoicing,
   onOpenSettings,
+  disabled,
 }) {
   const { t } = useT();
   const [showModal, setShowModal] = useState(false);
   const [editingConn, setEditingConn] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
+  const [dbSubmenu, setDbSubmenu] = useState(null); // { connection, databases, loading }
 
   useEffect(() => {
-    const handler = () => setContextMenu(null);
+    const handler = () => {
+      setContextMenu(null);
+      setDbSubmenu(null);
+    };
     window.addEventListener("click", handler);
     return () => window.removeEventListener("click", handler);
   }, []);
@@ -105,6 +111,20 @@ export default function Sidebar({
   const handleContextMenu = (event, connection) => {
     event.preventDefault();
     setContextMenu({ x: event.clientX, y: event.clientY, connection });
+    setDbSubmenu(null);
+  };
+
+  const handleOpenDatabases = async (connection) => {
+    if (dbSubmenu?.connection?.id === connection.id) return;
+    
+    setDbSubmenu({ connection, databases: [], loading: true });
+    try {
+      const dbs = await getDatabases(connection.id);
+      setDbSubmenu({ connection, databases: dbs, loading: false });
+    } catch (err) {
+      setDbSubmenu(null);
+      console.error("Failed to load databases for context menu", err);
+    }
   };
 
   const getStatus = (id) => statuses[id] || "disconnected";

@@ -1,16 +1,12 @@
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use tiberius::{AuthMethod, Client, ColumnType, Config, SqlBrowser};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 #[cfg(windows)]
-use odbc_api::{
-    buffers::TextRowSet,
-    environment,
-    ConnectionOptions,
-    Cursor,
-    ResultSetMetadata,
-};
+use odbc_api::{buffers::TextRowSet, environment, ConnectionOptions, Cursor, ResultSetMetadata};
 
 use crate::state::{ColumnInfo, ConnectionConfig, Filter, RelationshipInfo, TableData, TableInfo};
 
@@ -35,6 +31,178 @@ pub struct CachedClient {
     pub connected_at: std::time::Instant,
 }
 
+pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+pub const DASHBOARD_QUERY_TIMEOUT_SECS: u64 = 35;
+pub const SEARCH_QUERY_TIMEOUT_SECS: u64 = 15;
+const SLOW_QUERY_THRESHOLD_MS: u128 = 2_500;
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionContext {
+    pub endpoint: String,
+    pub query_name: String,
+    pub connection_id: String,
+    pub database: String,
+    pub table: String,
+    pub timeout_secs: Option<u64>,
+}
+
+impl QueryExecutionContext {
+    pub fn new(endpoint: impl Into<String>, query_name: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            query_name: query_name.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_connection_id(mut self, connection_id: impl Into<String>) -> Self {
+        self.connection_id = connection_id.into();
+        self
+    }
+
+    pub fn with_database(mut self, database: impl Into<String>) -> Self {
+        self.database = database.into();
+        self
+    }
+
+    pub fn with_table(mut self, table: impl Into<String>) -> Self {
+        self.table = table.into();
+        self
+    }
+
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs.max(1));
+        self
+    }
+
+    fn resolved_timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS).max(1))
+    }
+}
+
+fn shorten_sql(sql: &str, limit: usize) -> String {
+    let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= limit {
+        collapsed
+    } else {
+        format!("{}…", &collapsed[..limit])
+    }
+}
+
+fn log_query_result(
+    client: &DbClient,
+    context: &QueryExecutionContext,
+    sql: &str,
+    duration: Duration,
+    row_count: Option<i64>,
+    error: Option<&str>,
+) {
+    let database = if context.database.trim().is_empty() {
+        client.config.database.clone()
+    } else {
+        context.database.clone()
+    };
+    let endpoint = if context.endpoint.trim().is_empty() {
+        "sql"
+    } else {
+        context.endpoint.as_str()
+    };
+    let query_name = if context.query_name.trim().is_empty() {
+        "raw_query"
+    } else {
+        context.query_name.as_str()
+    };
+    let connection_id = if context.connection_id.trim().is_empty() {
+        "-"
+    } else {
+        context.connection_id.as_str()
+    };
+    let table = if context.table.trim().is_empty() {
+        "-"
+    } else {
+        context.table.as_str()
+    };
+
+    if let Some(message) = error {
+        eprintln!(
+            "[sql] status=error endpoint={} query={} connection_id={} database={} table={} duration_ms={} error={} sql=\"{}\"",
+            endpoint,
+            query_name,
+            connection_id,
+            database,
+            table,
+            duration.as_millis(),
+            message,
+            shorten_sql(sql, 900),
+        );
+        return;
+    }
+
+    eprintln!(
+        "[sql] status=ok endpoint={} query={} connection_id={} database={} table={} duration_ms={} rows={}",
+        endpoint,
+        query_name,
+        connection_id,
+        database,
+        table,
+        duration.as_millis(),
+        row_count.unwrap_or(0),
+    );
+
+    if duration.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
+        eprintln!(
+            "[sql-slow] endpoint={} query={} connection_id={} database={} table={} duration_ms={} sql=\"{}\"",
+            endpoint,
+            query_name,
+            connection_id,
+            database,
+            table,
+            duration.as_millis(),
+            shorten_sql(sql, 900),
+        );
+    }
+}
+
+async fn run_blocking_with_timeout<T, F>(
+    timeout: Duration,
+    timeout_label: &str,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let join = tokio::task::spawn_blocking(task);
+    let result = tokio::time::timeout(timeout, join)
+        .await
+        .map_err(|_| format!("{} timed out after {} seconds", timeout_label, timeout.as_secs()))?;
+
+    result.map_err(|e| e.to_string())?
+}
+
+async fn query_first_result_tds(
+    client: &mut TdsClient,
+    sql: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<Vec<tiberius::Row>, String> {
+    let stream = tokio::time::timeout(timeout, client.simple_query(sql))
+        .await
+        .map_err(|_| format!("{} timed out after {} seconds", label, timeout.as_secs()))?
+        .map_err(|e| format!("{} failed: {}", label, e))?;
+
+    tokio::time::timeout(timeout, stream.into_first_result())
+        .await
+        .map_err(|_| {
+            format!(
+                "{} result read timed out after {} seconds",
+                label,
+                timeout.as_secs()
+            )
+        })?
+        .map_err(|e| format!("{} result read failed: {}", label, e))
+}
+
 impl DbClient {
     /// Lightweight ping: creates a temp TDS connection to verify server is reachable.
     pub async fn ping(&self) -> bool {
@@ -42,8 +210,12 @@ impl DbClient {
             #[cfg(windows)]
             DbBackend::Odbc => query_odbc(&self.config, "SELECT 1").is_ok(),
             DbBackend::Tiberius => {
-                let Ok(mut tds) = connect_tds(&self.config).await else { return false; };
-                let Ok(stream) = tds.simple_query("SELECT 1").await else { return false; };
+                let Ok(mut tds) = connect_tds(&self.config).await else {
+                    return false;
+                };
+                let Ok(stream) = tds.simple_query("SELECT 1").await else {
+                    return false;
+                };
                 stream.into_results().await.is_ok()
             }
         }
@@ -220,7 +392,8 @@ fn odbc_server(conn: &ConnectionConfig) -> String {
         return raw_host.to_string();
     }
 
-    let host = if raw_host.is_empty() || raw_host == "." || raw_host.eq_ignore_ascii_case("(local)") {
+    let host = if raw_host.is_empty() || raw_host == "." || raw_host.eq_ignore_ascii_case("(local)")
+    {
         "localhost"
     } else {
         raw_host
@@ -269,10 +442,7 @@ fn open_odbc_connection(conn: &ConnectionConfig) -> Result<odbc_api::Connection<
         }
     }
 
-    Err(format!(
-        "ODBC connection failed: {}",
-        errors.join(" | ")
-    ))
+    Err(format!("ODBC connection failed: {}", errors.join(" | ")))
 }
 
 #[cfg(windows)]
@@ -310,9 +480,7 @@ fn query_odbc(conn: &ConnectionConfig, sql: &str) -> Result<OdbcQueryResult, Str
         for row_index in 0..batch.num_rows() {
             let mut row = Vec::with_capacity(batch.num_cols());
             for col_index in 0..batch.num_cols() {
-                let value = batch
-                    .at(col_index, row_index)
-                    .map(decode_odbc_text);
+                let value = batch.at(col_index, row_index).map(decode_odbc_text);
                 row.push(value);
             }
             rows.push(row);
@@ -324,7 +492,10 @@ fn query_odbc(conn: &ConnectionConfig, sql: &str) -> Result<OdbcQueryResult, Str
 
 #[cfg(windows)]
 fn test_connection_odbc(conn: &ConnectionConfig) -> Result<String, String> {
-    let result = query_odbc(conn, "SELECT @@VERSION AS version, @@SERVERNAME AS server_name")?;
+    let result = query_odbc(
+        conn,
+        "SELECT @@VERSION AS version, @@SERVERNAME AS server_name",
+    )?;
 
     if let Some(row) = result.rows.first() {
         let version = row.get(0).and_then(|v| v.as_deref()).unwrap_or("unknown");
@@ -380,8 +551,8 @@ async fn probe_connection(conn: &ConnectionConfig) -> Result<(DbBackend, String)
             Err(odbc_error) => match test_connection_tds(conn).await {
                 Ok(message) => Ok((DbBackend::Tiberius, message)),
                 Err(tds_error) => Err(format!(
-                "Windows-native driver failed: {}; TCP driver failed: {}",
-                odbc_error, tds_error
+                    "Windows-native driver failed: {}; TCP driver failed: {}",
+                    odbc_error, tds_error
                 )),
             },
         }
@@ -410,22 +581,24 @@ pub async fn test_connection(conn: &ConnectionConfig) -> Result<String, String> 
 }
 
 pub async fn get_databases(client: &mut DbClient) -> Result<Vec<String>, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
-            tokio::task::spawn_blocking(move || get_databases_odbc(&config))
-                .await
-                .map_err(|e| e.to_string())?
+            run_blocking_with_timeout(timeout, "Listing databases", move || {
+                get_databases_odbc(&config)
+            })
+            .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_databases_tds(&mut tds).await
+            get_databases_tds(&mut tds, timeout).await
         }
     }
 }
 
-async fn get_databases_tds(client: &mut TdsClient) -> Result<Vec<String>, String> {
+async fn get_databases_tds(client: &mut TdsClient, timeout: Duration) -> Result<Vec<String>, String> {
     let sql = r#"
         SELECT name
         FROM sys.databases
@@ -433,15 +606,7 @@ async fn get_databases_tds(client: &mut TdsClient) -> Result<Vec<String>, String
         ORDER BY name
     "#;
 
-    let stream = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("Failed to list databases: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read database list: {}", e))?;
+    let rows = query_first_result_tds(client, sql, timeout, "Listing databases").await?;
 
     Ok(rows
         .iter()
@@ -469,22 +634,24 @@ fn get_databases_odbc(conn: &ConnectionConfig) -> Result<Vec<String>, String> {
 
 /// Get all user tables in the database
 pub async fn get_tables(client: &mut DbClient) -> Result<Vec<TableInfo>, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
-            tokio::task::spawn_blocking(move || get_tables_odbc(&config))
-                .await
-                .map_err(|e| e.to_string())?
+            run_blocking_with_timeout(timeout, "Listing tables", move || {
+                get_tables_odbc(&config)
+            })
+            .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_tables_tds(&mut tds).await
+            get_tables_tds(&mut tds, timeout).await
         }
     }
 }
 
-async fn get_tables_tds(client: &mut TdsClient) -> Result<Vec<TableInfo>, String> {
+async fn get_tables_tds(client: &mut TdsClient, timeout: Duration) -> Result<Vec<TableInfo>, String> {
     let sql = r#"
         SELECT
             s.name AS schema_name,
@@ -499,15 +666,7 @@ async fn get_tables_tds(client: &mut TdsClient) -> Result<Vec<TableInfo>, String
         ORDER BY s.name, t.name
     "#;
 
-    let stream = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("Failed to list tables: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read table list: {}", e))?;
+    let rows = query_first_result_tds(client, sql, timeout, "Listing tables").await?;
 
     let tables = rows
         .iter()
@@ -550,7 +709,10 @@ fn get_tables_odbc(conn: &ConnectionConfig) -> Result<Vec<TableInfo>, String> {
         .rows
         .into_iter()
         .map(|row| {
-            let schema = row.get(0).and_then(|v| v.clone()).unwrap_or_else(|| "dbo".to_string());
+            let schema = row
+                .get(0)
+                .and_then(|v| v.clone())
+                .unwrap_or_else(|| "dbo".to_string());
             let name = row.get(1).and_then(|v| v.clone()).unwrap_or_default();
             let row_count = row
                 .get(2)
@@ -573,19 +735,21 @@ pub async fn get_columns(
     schema: &str,
     table: &str,
 ) -> Result<Vec<ColumnInfo>, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
             let schema = schema.to_string();
             let table = table.to_string();
-            tokio::task::spawn_blocking(move || get_columns_odbc(&config, &schema, &table))
-                .await
-                .map_err(|e| e.to_string())?
+            run_blocking_with_timeout(timeout, "Loading column metadata", move || {
+                get_columns_odbc(&config, &schema, &table)
+            })
+            .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_columns_tds(&mut tds, schema, table).await
+            get_columns_tds(&mut tds, schema, table, timeout).await
         }
     }
 }
@@ -594,6 +758,7 @@ async fn get_columns_tds(
     client: &mut TdsClient,
     schema: &str,
     table: &str,
+    timeout: Duration,
 ) -> Result<Vec<ColumnInfo>, String> {
     let sql = format!(
         r#"
@@ -624,15 +789,7 @@ async fn get_columns_tds(
         table.replace("'", "''")
     );
 
-    let stream = client
-        .simple_query(&sql)
-        .await
-        .map_err(|e| format!("Failed to get columns: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read column info: {}", e))?;
+    let rows = query_first_result_tds(client, &sql, timeout, "Loading column metadata").await?;
 
     let columns = rows
         .iter()
@@ -705,8 +862,14 @@ fn get_columns_odbc(
         .map(|row| ColumnInfo {
             name: row.get(0).and_then(|v| v.clone()).unwrap_or_default(),
             data_type: row.get(1).and_then(|v| v.clone()).unwrap_or_default(),
-            is_nullable: matches!(row.get(2).and_then(|v| v.as_deref()), Some("1") | Some("true") | Some("TRUE")),
-            is_primary_key: matches!(row.get(3).and_then(|v| v.as_deref()), Some("1") | Some("true") | Some("TRUE")),
+            is_nullable: matches!(
+                row.get(2).and_then(|v| v.as_deref()),
+                Some("1") | Some("true") | Some("TRUE")
+            ),
+            is_primary_key: matches!(
+                row.get(3).and_then(|v| v.as_deref()),
+                Some("1") | Some("true") | Some("TRUE")
+            ),
             ordinal: row
                 .get(4)
                 .and_then(|v| v.as_deref())
@@ -730,22 +893,27 @@ fn get_columns_odbc(
 
 /// Get foreign-key relationships for the current database
 pub async fn get_relationships(client: &mut DbClient) -> Result<Vec<RelationshipInfo>, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
-            tokio::task::spawn_blocking(move || get_relationships_odbc(&config))
-                .await
-                .map_err(|e| e.to_string())?
+            run_blocking_with_timeout(timeout, "Loading relationships", move || {
+                get_relationships_odbc(&config)
+            })
+            .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_relationships_tds(&mut tds).await
+            get_relationships_tds(&mut tds, timeout).await
         }
     }
 }
 
-async fn get_relationships_tds(client: &mut TdsClient) -> Result<Vec<RelationshipInfo>, String> {
+async fn get_relationships_tds(
+    client: &mut TdsClient,
+    timeout: Duration,
+) -> Result<Vec<RelationshipInfo>, String> {
     let sql = r#"
         SELECT
             fk.name AS constraint_name,
@@ -780,15 +948,7 @@ async fn get_relationships_tds(client: &mut TdsClient) -> Result<Vec<Relationshi
             fkc.constraint_column_id
     "#;
 
-    let stream = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("Failed to read relationships: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read relationship data: {}", e))?;
+    let rows = query_first_result_tds(client, sql, timeout, "Loading relationships").await?;
 
     Ok(rows
         .iter()
@@ -848,10 +1008,16 @@ fn get_relationships_odbc(conn: &ConnectionConfig) -> Result<Vec<RelationshipInf
         .into_iter()
         .map(|row| RelationshipInfo {
             constraint_name: row.get(0).and_then(|v| v.clone()).unwrap_or_default(),
-            source_schema: row.get(1).and_then(|v| v.clone()).unwrap_or_else(|| "dbo".to_string()),
+            source_schema: row
+                .get(1)
+                .and_then(|v| v.clone())
+                .unwrap_or_else(|| "dbo".to_string()),
             source_table: row.get(2).and_then(|v| v.clone()).unwrap_or_default(),
             source_column: row.get(3).and_then(|v| v.clone()).unwrap_or_default(),
-            target_schema: row.get(4).and_then(|v| v.clone()).unwrap_or_else(|| "dbo".to_string()),
+            target_schema: row
+                .get(4)
+                .and_then(|v| v.clone())
+                .unwrap_or_else(|| "dbo".to_string()),
             target_table: row.get(5).and_then(|v| v.clone()).unwrap_or_default(),
             target_column: row.get(6).and_then(|v| v.clone()).unwrap_or_default(),
             ordinal: row
@@ -1023,6 +1189,7 @@ pub async fn get_table_data(
     filters: &[Filter],
     columns: &[ColumnInfo],
 ) -> Result<TableData, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
@@ -1031,15 +1198,16 @@ pub async fn get_table_data(
             let table = table.to_string();
             let filters = filters.to_vec();
             let columns = columns.to_vec();
-            tokio::task::spawn_blocking(move || {
-                get_table_data_odbc(&config, &schema, &table, page, page_size, &filters, &columns)
+            run_blocking_with_timeout(timeout, "Loading table data", move || {
+                get_table_data_odbc(
+                    &config, &schema, &table, page, page_size, &filters, &columns,
+                )
             })
             .await
-            .map_err(|e| e.to_string())?
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_table_data_tds(&mut tds, schema, table, page, page_size, filters, columns).await
+            get_table_data_tds(&mut tds, schema, table, page, page_size, filters, columns, timeout).await
         }
     }
 }
@@ -1052,22 +1220,20 @@ async fn get_table_data_tds(
     page_size: u32,
     filters: &[Filter],
     columns: &[ColumnInfo],
+    timeout: Duration,
 ) -> Result<TableData, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
     let offset = page * page_size;
 
     let count_sql = format!("SELECT COUNT_BIG(*) FROM {} {}", full_table, where_clause);
 
-    let count_stream = client
-        .simple_query(&count_sql)
-        .await
-        .map_err(|e| format!("Count query failed: {}", e))?;
-
-    let count_rows = count_stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read count: {}", e))?;
+    let count_rows = query_first_result_tds(client, &count_sql, timeout, "Counting table rows")
+        .await?;
 
     let total_count: i64 = count_rows.first().and_then(|r| r.get(0)).unwrap_or(0);
 
@@ -1083,19 +1249,15 @@ async fn get_table_data_tds(
         full_table, where_clause, offset, page_size
     );
 
-    let data_stream = client
-        .simple_query(&data_sql)
-        .await
-        .map_err(|e| format!("Data query failed: {}", e))?;
-
-    let rows = data_stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read data: {}", e))?;
+    let rows = query_first_result_tds(client, &data_sql, timeout, "Loading table rows").await?;
 
     let row_data: Vec<Vec<Value>> = rows
         .iter()
-        .map(|row| (0..row.columns().len()).map(|i| cell_to_json_tds(row, i)).collect())
+        .map(|row| {
+            (0..row.columns().len())
+                .map(|i| cell_to_json_tds(row, i))
+                .collect()
+        })
         .collect();
 
     Ok(TableData {
@@ -1117,7 +1279,11 @@ fn get_table_data_odbc(
     filters: &[Filter],
     columns: &[ColumnInfo],
 ) -> Result<TableData, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
     let offset = page * page_size;
 
@@ -1154,10 +1320,7 @@ fn get_table_data_odbc(
                     if let Some(column) = columns.get(idx) {
                         odbc_cell_to_json(value.as_deref(), column)
                     } else {
-                        value
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null)
+                        value.clone().map(Value::String).unwrap_or(Value::Null)
                     }
                 })
                 .collect()
@@ -1181,6 +1344,7 @@ pub async fn export_csv(
     filters: &[Filter],
     selected_columns: &[String],
 ) -> Result<String, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
@@ -1189,15 +1353,14 @@ pub async fn export_csv(
             let table = table.to_string();
             let filters = filters.to_vec();
             let selected_columns = selected_columns.to_vec();
-            tokio::task::spawn_blocking(move || {
+            run_blocking_with_timeout(timeout, "Exporting CSV", move || {
                 export_csv_odbc(&config, &schema, &table, &filters, &selected_columns)
             })
             .await
-            .map_err(|e| e.to_string())?
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            export_csv_tds(&mut tds, schema, table, filters, selected_columns).await
+            export_csv_tds(&mut tds, schema, table, filters, selected_columns, timeout).await
         }
     }
 }
@@ -1208,8 +1371,13 @@ async fn export_csv_tds(
     table: &str,
     filters: &[Filter],
     selected_columns: &[String],
+    timeout: Duration,
 ) -> Result<String, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
 
     let col_select = if selected_columns.is_empty() {
@@ -1224,15 +1392,7 @@ async fn export_csv_tds(
 
     let sql = format!("SELECT {} FROM {} {}", col_select, full_table, where_clause);
 
-    let stream = client
-        .simple_query(&sql)
-        .await
-        .map_err(|e| format!("Export query failed: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read export data: {}", e))?;
+    let rows = query_first_result_tds(client, &sql, timeout, "Exporting CSV").await?;
 
     let mut csv = String::new();
 
@@ -1287,7 +1447,11 @@ fn export_csv_odbc(
     filters: &[Filter],
     selected_columns: &[String],
 ) -> Result<String, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
 
     let col_select = if selected_columns.is_empty() {
@@ -1347,6 +1511,7 @@ pub async fn export_json(
     filters: &[Filter],
     selected_columns: &[String],
 ) -> Result<String, String> {
+    let timeout = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
     match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
@@ -1355,15 +1520,14 @@ pub async fn export_json(
             let table = table.to_string();
             let filters = filters.to_vec();
             let selected_columns = selected_columns.to_vec();
-            tokio::task::spawn_blocking(move || {
+            run_blocking_with_timeout(timeout, "Exporting JSON", move || {
                 export_json_odbc(&config, &schema, &table, &filters, &selected_columns)
             })
             .await
-            .map_err(|e| e.to_string())?
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            export_json_tds(&mut tds, schema, table, filters, selected_columns).await
+            export_json_tds(&mut tds, schema, table, filters, selected_columns, timeout).await
         }
     }
 }
@@ -1374,8 +1538,13 @@ async fn export_json_tds(
     table: &str,
     filters: &[Filter],
     selected_columns: &[String],
+    timeout: Duration,
 ) -> Result<String, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
 
     let col_select = if selected_columns.is_empty() {
@@ -1390,15 +1559,7 @@ async fn export_json_tds(
 
     let sql = format!("SELECT {} FROM {} {}", col_select, full_table, where_clause);
 
-    let stream = client
-        .simple_query(&sql)
-        .await
-        .map_err(|e| format!("Export query failed: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read export data: {}", e))?;
+    let rows = query_first_result_tds(client, &sql, timeout, "Exporting JSON").await?;
 
     let mut records: Vec<serde_json::Map<String, Value>> = Vec::new();
 
@@ -1421,7 +1582,11 @@ fn export_json_odbc(
     filters: &[Filter],
     selected_columns: &[String],
 ) -> Result<String, String> {
-    let full_table = format!("[{}].[{}]", schema.replace(']', "]]"), table.replace(']', "]]"));
+    let full_table = format!(
+        "[{}].[{}]",
+        schema.replace(']', "]]"),
+        table.replace(']', "]]")
+    );
     let where_clause = build_where_clause(filters);
 
     let col_select = if selected_columns.is_empty() {
@@ -1444,7 +1609,9 @@ fn export_json_odbc(
     for row in rows {
         let mut record = serde_json::Map::new();
         for (idx, name) in columns.iter().enumerate() {
-            let meta = column_meta.iter().find(|column| column.name.eq_ignore_ascii_case(name));
+            let meta = column_meta
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(name));
             let value = row.get(idx).and_then(|value| value.as_deref());
             let json_value = match meta {
                 Some(column) => odbc_cell_to_json(value, column),
@@ -1462,32 +1629,55 @@ fn export_json_odbc(
 
 /// Execute a raw SQL query and return results
 pub async fn execute_raw_query(client: &mut DbClient, sql: &str) -> Result<TableData, String> {
-    match client.backend {
+    execute_logged_query(client, sql, QueryExecutionContext::default()).await
+}
+
+pub async fn execute_logged_query(
+    client: &mut DbClient,
+    sql: &str,
+    context: QueryExecutionContext,
+) -> Result<TableData, String> {
+    let timeout = context.resolved_timeout();
+    let started = Instant::now();
+
+    let result = match client.backend {
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
-            let sql = sql.to_string();
-            tokio::task::spawn_blocking(move || execute_raw_query_odbc(&config, &sql))
-                .await
-                .map_err(|e| e.to_string())?
+            let sql_owned = sql.to_string();
+            run_blocking_with_timeout(timeout, "Executing SQL query", move || {
+                execute_raw_query_odbc(&config, &sql_owned)
+            })
+            .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            execute_raw_query_tds(&mut tds, sql).await
+            execute_raw_query_tds(&mut tds, sql, timeout).await
         }
+    };
+
+    let duration = started.elapsed();
+    match &result {
+        Ok(data) => log_query_result(
+            client,
+            &context,
+            sql,
+            duration,
+            Some(data.total_count),
+            None,
+        ),
+        Err(error) => log_query_result(client, &context, sql, duration, None, Some(error)),
     }
+
+    result
 }
 
-async fn execute_raw_query_tds(client: &mut TdsClient, sql: &str) -> Result<TableData, String> {
-    let stream = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("Query failed: {}", e))?;
-
-    let rows = stream
-        .into_first_result()
-        .await
-        .map_err(|e| format!("Failed to read results: {}", e))?;
+async fn execute_raw_query_tds(
+    client: &mut TdsClient,
+    sql: &str,
+    timeout: Duration,
+) -> Result<TableData, String> {
+    let rows = query_first_result_tds(client, sql, timeout, "Executing SQL query").await?;
 
     let columns: Vec<ColumnInfo> = if let Some(first) = rows.first() {
         first
@@ -1511,7 +1701,11 @@ async fn execute_raw_query_tds(client: &mut TdsClient, sql: &str) -> Result<Tabl
 
     let row_data: Vec<Vec<Value>> = rows
         .iter()
-        .map(|row| (0..row.columns().len()).map(|i| cell_to_json_tds(row, i)).collect())
+        .map(|row| {
+            (0..row.columns().len())
+                .map(|i| cell_to_json_tds(row, i))
+                .collect()
+        })
         .collect();
 
     let total = row_data.len() as i64;
@@ -1572,7 +1766,12 @@ pub async fn open_tds_connection(conn: &ConnectionConfig) -> Result<TdsClient, S
 
 /// Execute a raw SQL query on an EXISTING TDS connection (used for streaming chunks)
 pub async fn run_tds_query(tds: &mut TdsClient, sql: &str) -> Result<TableData, String> {
-    execute_raw_query_tds(tds, sql).await
+    execute_raw_query_tds(
+        tds,
+        sql,
+        Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
+    )
+    .await
 }
 
 /// Get or create a cached DbClient for a connection (avoids re-probing backend on every command)
@@ -1598,4 +1797,13 @@ pub async fn get_or_connect(
         cache.insert(id.to_string(), new_cached.clone());
     }
     Ok(new_cached)
+}
+
+pub async fn get_cached_client_snapshot(
+    state: &crate::state::AppState,
+    id: &str,
+) -> Result<DbClient, String> {
+    let cached = get_or_connect(state, id).await?;
+    let client = cached.client.lock().await.clone();
+    Ok(client)
 }

@@ -1,6 +1,6 @@
 import {
+  useCallback,
   startTransition,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -37,9 +37,9 @@ import {
   exportInvoicePdf,
   getInvoice,
   getInvoiceTemplates,
-  listArticles,
   listInvoices,
-  listTiers,
+  searchArticles,
+  searchTiers,
   renderInvoiceHtml,
   updateArticle,
   updateInvoice,
@@ -238,17 +238,32 @@ function matchesSearch(haystack, needle) {
   return `${haystack || ""}`.toLowerCase().includes((needle || "").toLowerCase());
 }
 
+function useDebouncedValue(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const timeoutId = globalThis.setTimeout(() => setDebounced(value), delay);
+    return () => globalThis.clearTimeout(timeoutId);
+  }, [delay, value]);
+
+  return debounced;
+}
+
 function SearchSelect({
   placeholder,
   value,
   displayValue,
-  options,
   onSelect,
+  searchFn,
+  emptyLabel,
   renderOption,
-  getSearchText = (option) => `${option.code || option.id || ""} ${option.nom || option.libelle || ""}`,
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState(displayValue || "");
+  const [options, setOptions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const debouncedQuery = useDebouncedValue(query, 300);
 
   useEffect(() => {
     if (!open) setQuery(displayValue || "");
@@ -261,27 +276,65 @@ function SearchSelect({
     return () => window.removeEventListener("click", handle);
   }, [open]);
 
-  const filtered = useMemo(() => {
-    if (!query.trim()) return options.slice(0, 12);
-    return options
-      .filter((option) => matchesSearch(getSearchText(option), query))
-      .slice(0, 12);
-  }, [getSearchText, options, query]);
+  useEffect(() => {
+    if (!open) return undefined;
+
+    let cancelled = false;
+
+    if (debouncedQuery.trim().length < 2) {
+      setOptions([]);
+      setLoading(false);
+      return undefined;
+    }
+
+    setLoading(true);
+    setError("");
+
+    console.debug("[SearchSelect] Searching for:", debouncedQuery);
+
+    searchFn(debouncedQuery)
+      .then((items) => {
+        if (cancelled) return;
+        console.debug("[SearchSelect] Found items:", items?.length || 0);
+        setOptions(items.slice(0, 12));
+      })
+      .catch((nextError) => {
+        if (cancelled) return;
+        console.error("[SearchSelect] Error:", nextError);
+        setOptions([]);
+        setError(String(nextError));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedQuery, open, searchFn]);
 
   return (
     <div className="invoice-search-select" onClick={(event) => event.stopPropagation()}>
       <input
         value={query}
         placeholder={placeholder}
-        onFocus={() => setOpen(true)}
+        onFocus={() => {
+          if (query === displayValue) setQuery("");
+          setOpen(true);
+        }}
         onChange={(event) => {
           setQuery(event.target.value);
           setOpen(true);
         }}
       />
-      {open && filtered.length ? (
+      {open ? (
         <div className="invoice-search-select-menu">
-          {filtered.map((option) => (
+          {loading ? <div className="invoice-search-select-empty">Loading…</div> : null}
+          {!loading && error ? <div className="invoice-search-select-empty">{error}</div> : null}
+          {!loading && !error && !options.length && debouncedQuery.trim().length >= 2 ? (
+            <div className="invoice-search-select-empty">{emptyLabel}</div>
+          ) : null}
+          {!loading && !error ? options.map((option) => (
             <button
               key={option.id || option.code}
               type="button"
@@ -294,7 +347,7 @@ function SearchSelect({
             >
               {renderOption(option)}
             </button>
-          ))}
+          )) : null}
         </div>
       ) : null}
     </div>
@@ -394,7 +447,7 @@ function DetailRow({ label, value, mono = false }) {
   );
 }
 
-function TiersPanel({ tier, invoices, loading }) {
+function TiersPanel({ tier, invoices, loading, error }) {
   const { t } = useT();
 
   const totals = useMemo(() => {
@@ -446,9 +499,11 @@ function TiersPanel({ tier, invoices, loading }) {
           </div>
           <div className="invoice-directory-panel-list">
             <div className="invoice-directory-panel-title">{t("invoice_related_documents")}</div>
-            {loading ? <div className="spinner" /> : invoices.map((invoice) => (
+            {loading ? <div className="spinner" /> : null}
+            {!loading && error ? <div className="invoice-form-error">{error}</div> : null}
+            {!loading && !error ? invoices.map((invoice) => (
               <InvoiceCard key={invoice.id} invoice={invoice} active={false} onClick={() => {}} />
-            ))}
+            )) : null}
           </div>
         </>
       )}
@@ -686,9 +741,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [activeTab, setActiveTab] = useState("factures");
   const [documents, setDocuments] = useState([]);
   const [documentsLoading, setDocumentsLoading] = useState(false);
+  const [documentsError, setDocumentsError] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
   const [mode, setMode] = useState("view");
   const [editorInvoice, setEditorInvoice] = useState(null);
   const [search, setSearch] = useState("");
@@ -702,25 +759,50 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [previewLoading, setPreviewLoading] = useState(false);
   const [tiers, setTiers] = useState([]);
   const [tiersLoading, setTiersLoading] = useState(false);
+  const [tiersError, setTiersError] = useState("");
   const [selectedTier, setSelectedTier] = useState(null);
   const [selectedTierInvoices, setSelectedTierInvoices] = useState([]);
   const [tierDocsLoading, setTierDocsLoading] = useState(false);
+  const [tierDocsError, setTierDocsError] = useState("");
   const [tierSearch, setTierSearch] = useState("");
   const [articles, setArticles] = useState([]);
   const [articlesLoading, setArticlesLoading] = useState(false);
+  const [articlesError, setArticlesError] = useState("");
   const [selectedArticle, setSelectedArticle] = useState(null);
   const [articleSearch, setArticleSearch] = useState("");
   const [tiersModal, setTiersModal] = useState(null); // null | { initial }
   const [articleModal, setArticleModal] = useState(null); // null | { initial }
 
-  const deferredSearch = useDeferredValue(search);
-  const deferredTierSearch = useDeferredValue(tierSearch);
-  const deferredArticleSearch = useDeferredValue(articleSearch);
+  const debouncedSearch = useDebouncedValue(search, 300);
+  const debouncedTierSearch = useDebouncedValue(tierSearch, 300);
+  const debouncedArticleSearch = useDebouncedValue(articleSearch, 300);
   const documentTab = DOCUMENT_TABS.find((tab) => tab.id === activeTab) ?? null;
   const directoryTab = DIRECTORY_TABS.find((tab) => tab.id === activeTab) ?? null;
+  const directoryTierType = directoryTab?.type ?? "all";
+
+  const loadDirectoryTiers = useCallback(
+    async (query = "") => searchTiers(connId, query, directoryTierType, { limit: 60 }),
+    [connId, directoryTierType],
+  );
+  const loadDirectoryArticles = useCallback(
+    async (query = "") => searchArticles(connId, query, { limit: 60 }),
+    [connId],
+  );
+  const loadEditorTiers = useCallback(
+    async (query = "") => searchTiers(connId, query, "all", { limit: 20 }),
+    [connId],
+  );
+  const loadEditorArticles = useCallback(
+    async (query = "") => searchArticles(connId, query, { limit: 20 }),
+    [connId],
+  );
 
   useEffect(() => {
     if (!connId) return;
+    console.debug("[invoice] active connection", {
+      connectionId: connId,
+      schemaEdition: schema?.edition || null,
+    });
     getInvoiceTemplates(connId)
       .then((items) => {
         setTemplates(items);
@@ -732,62 +814,99 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       });
   }, [connId]);
 
-  const refreshTiers = () => {
-    if (!connId) return;
+  const refreshTiers = useCallback(() => {
+    if (!connId) return Promise.resolve([]);
     setTiersLoading(true);
-    listTiers(connId, "all", null)
-      .then(setTiers)
-      .catch(() => {})
+    setTiersError("");
+    return loadDirectoryTiers(debouncedTierSearch)
+      .then((items) => {
+        setTiers(items);
+        return items;
+      })
+      .catch((error) => {
+        setTiers([]);
+        setTiersError(String(error));
+        return [];
+      })
       .finally(() => setTiersLoading(false));
-  };
+  }, [connId, debouncedTierSearch, loadDirectoryTiers]);
 
-  const refreshArticles = () => {
-    if (!connId) return;
+  const refreshArticles = useCallback(() => {
+    if (!connId) return Promise.resolve([]);
     setArticlesLoading(true);
-    listArticles(connId, null)
-      .then(setArticles)
-      .catch(() => {})
+    setArticlesError("");
+    return loadDirectoryArticles(debouncedArticleSearch)
+      .then((items) => {
+        setArticles(items);
+        return items;
+      })
+      .catch((error) => {
+        setArticles([]);
+        setArticlesError(String(error));
+        return [];
+      })
       .finally(() => setArticlesLoading(false));
-  };
+  }, [connId, debouncedArticleSearch, loadDirectoryArticles]);
 
   useEffect(() => {
-    if (!connId) return;
-
+    if (!connId || !directoryTab?.type) return undefined;
     let cancelled = false;
-    setTiersLoading(true);
-    setArticlesLoading(true);
 
-    listTiers(connId, "all", null)
-      .then((items) => {
-        if (!cancelled) setTiers(items);
-      })
-      .finally(() => {
-        if (!cancelled) setTiersLoading(false);
-      });
-
-    listArticles(connId, null)
-      .then((items) => {
-        if (!cancelled) setArticles(items);
-      })
-      .finally(() => {
-        if (!cancelled) setArticlesLoading(false);
-      });
+    if (directoryTab.type === "articles") {
+      setArticlesLoading(true);
+      setArticlesError("");
+      loadDirectoryArticles(debouncedArticleSearch)
+        .then((items) => {
+          if (!cancelled) setArticles(items);
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setArticles([]);
+          setArticlesError(String(error));
+        })
+        .finally(() => {
+          if (!cancelled) setArticlesLoading(false);
+        });
+    } else {
+      setTiersLoading(true);
+      setTiersError("");
+      loadDirectoryTiers(debouncedTierSearch)
+        .then((items) => {
+          if (!cancelled) setTiers(items);
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setTiers([]);
+          setTiersError(String(error));
+        })
+        .finally(() => {
+          if (!cancelled) setTiersLoading(false);
+        });
+    }
 
     return () => {
       cancelled = true;
     };
-  }, [connId]);
+  }, [
+    connId,
+    debouncedArticleSearch,
+    debouncedTierSearch,
+    directoryTab?.type,
+    loadDirectoryArticles,
+    loadDirectoryTiers,
+  ]);
 
   useEffect(() => {
     if (!connId || !documentTab) return;
     let cancelled = false;
     setDocumentsLoading(true);
+    setDocumentsError("");
     listInvoices(connId, {
       nature: documentTab.nature,
       statut: statutFilter || null,
       dateFrom: dateFrom || null,
       dateTo: dateTo || null,
-      search: deferredSearch || null,
+      search: debouncedSearch || null,
     })
       .then((items) => {
         if (cancelled) return;
@@ -799,8 +918,10 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           setSelectedInvoice(null);
         }
       })
-      .catch(() => {
-        if (!cancelled) setDocuments([]);
+      .catch((error) => {
+        if (cancelled) return;
+        setDocuments([]);
+        setDocumentsError(String(error));
       })
       .finally(() => {
         if (!cancelled) setDocumentsLoading(false);
@@ -808,15 +929,19 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     return () => {
       cancelled = true;
     };
-  }, [connId, dateFrom, dateTo, deferredSearch, documentTab, mode, selectedId, statutFilter]);
+  }, [connId, dateFrom, dateTo, debouncedSearch, documentTab, mode, selectedId, statutFilter]);
 
   useEffect(() => {
     if (!connId || !selectedId || !documentTab || mode === "edit") return;
     let cancelled = false;
     setDetailLoading(true);
+    setDetailError("");
     getInvoice(connId, selectedId)
       .then((invoice) => {
         if (!cancelled) setSelectedInvoice(invoice);
+      })
+      .catch((error) => {
+        if (!cancelled) setDetailError(String(error));
       })
       .finally(() => {
         if (!cancelled) setDetailLoading(false);
@@ -830,9 +955,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     if (!connId || !selectedTier?.id) return;
     let cancelled = false;
     setTierDocsLoading(true);
+    setTierDocsError("");
     listInvoices(connId, { tiersId: selectedTier.id })
       .then((items) => {
         if (!cancelled) setSelectedTierInvoices(items);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setSelectedTierInvoices([]);
+        setTierDocsError(String(error));
       })
       .finally(() => {
         if (!cancelled) setTierDocsLoading(false);
@@ -841,24 +972,6 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       cancelled = true;
     };
   }, [connId, selectedTier]);
-
-  const filteredTiers = useMemo(() => {
-    const base = directoryTab?.type === "clients"
-      ? tiers.filter((tier) => tier.type_tiers !== "fournisseur")
-      : directoryTab?.type === "fournisseurs"
-        ? tiers.filter((tier) => tier.type_tiers !== "client")
-        : tiers;
-
-    if (!deferredTierSearch.trim()) return base;
-    return base.filter((tier) => matchesSearch(`${tier.code} ${tier.nom} ${tier.ville}`, deferredTierSearch));
-  }, [deferredTierSearch, directoryTab?.type, tiers]);
-
-  const filteredArticles = useMemo(() => {
-    if (!deferredArticleSearch.trim()) return articles;
-    return articles.filter((article) =>
-      matchesSearch(`${article.code} ${article.libelle} ${article.reference}`, deferredArticleSearch)
-    );
-  }, [articles, deferredArticleSearch]);
 
   const selectedTemplate = useMemo(
     () => templates.find((template) => template.id === templateId) ?? null,
@@ -903,7 +1016,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         statut: statutFilter || null,
         dateFrom: dateFrom || null,
         dateTo: dateTo || null,
-        search: deferredSearch || null,
+        search: debouncedSearch || null,
       }).then(setDocuments);
       if (openPreviewAfter) {
         await openPreview(saved);
@@ -922,7 +1035,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       statut: statutFilter || null,
       dateFrom: dateFrom || null,
       dateTo: dateTo || null,
-      search: deferredSearch || null,
+      search: debouncedSearch || null,
     });
     setDocuments(items);
   };
@@ -1009,6 +1122,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       );
     }
 
+    if (detailError) {
+      return (
+        <div className="empty-state">
+          <FileText size={30} />
+          <p>{detailError}</p>
+        </div>
+      );
+    }
+
     if (mode === "edit" && editorInvoice) {
       const breakdown = getTvaBreakdown(editorInvoice);
 
@@ -1065,7 +1187,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   placeholder={t("invoice_tiers_placeholder")}
                   value={editorInvoice.tiers_id}
                   displayValue={[editorInvoice.tiers_code, editorInvoice.tiers_nom, editorInvoice.tiers_ville].filter(Boolean).join(" · ")}
-                  options={tiers}
+                  searchFn={loadEditorTiers}
+                  emptyLabel={t("invoice_no_client_found")}
                   onSelect={(tier) => {
                     updateEditor({
                       tiers_id: tier.id,
@@ -1086,7 +1209,6 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                       <span>{tier.nom} · {tier.ville}</span>
                     </div>
                   )}
-                  getSearchText={(tier) => `${tier.code} ${tier.nom} ${tier.ville} ${tier.siret}`}
                 />
               </div>
               <label className="span-2">
@@ -1158,7 +1280,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                           placeholder={t("invoice_article_placeholder")}
                           value={line.article_id}
                           displayValue={[line.article_code, line.libelle].filter(Boolean).join(" · ")}
-                          options={articles}
+                          searchFn={loadEditorArticles}
+                          emptyLabel={t("invoice_no_article_found")}
                           onSelect={(article) => {
                             updateLine(index, {
                               article_id: article.id,
@@ -1175,7 +1298,6 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                               <span>{article.libelle}</span>
                             </div>
                           )}
-                          getSearchText={(article) => `${article.code} ${article.libelle} ${article.reference}`}
                         />
                       </td>
                       <td><input value={line.libelle} onChange={(event) => updateLine(index, { libelle: event.target.value })} /></td>
@@ -1490,6 +1612,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   <div className="spinner" />
                   <p>{t("invoice_loading_list")}</p>
                 </div>
+              ) : documentsError ? (
+                <div className="empty-state">
+                  <FileText size={28} />
+                  <p>{documentsError}</p>
+                </div>
               ) : documents.length ? documents.map((invoice) => (
                 <InvoiceCard
                   key={invoice.id}
@@ -1540,7 +1667,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
               {t("invoice_new_article")}
             </button>
             <div className="invoice-directory-items">
-              {articlesLoading ? <div className="spinner" /> : filteredArticles.map((article) => (
+              {articlesLoading ? <div className="spinner" /> : null}
+              {!articlesLoading && articlesError ? <div className="invoice-form-error">{articlesError}</div> : null}
+              {!articlesLoading && !articlesError && !articles.length ? (
+                <div className="empty-state">
+                  <Package2 size={24} />
+                  <p>{t("invoice_no_article_found")}</p>
+                </div>
+              ) : null}
+              {!articlesLoading && !articlesError ? articles.map((article) => (
                 <div key={article.id} className={`invoice-directory-item-wrap ${selectedArticle?.id === article.id ? "active" : ""}`}>
                   <button
                     type="button"
@@ -1567,7 +1702,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     </div>
                   )}
                 </div>
-              ))}
+              )) : null}
             </div>
           </section>
           <ArticlesPanel article={selectedArticle} />
@@ -1588,7 +1723,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
               {activeTab === "clients" ? t("invoice_new_client") : t("invoice_new_supplier")}
             </button>
             <div className="invoice-directory-items">
-              {tiersLoading ? <div className="spinner" /> : filteredTiers.map((tier) => (
+              {tiersLoading ? <div className="spinner" /> : null}
+              {!tiersLoading && tiersError ? <div className="invoice-form-error">{tiersError}</div> : null}
+              {!tiersLoading && !tiersError && !tiers.length ? (
+                <div className="empty-state">
+                  <Users size={24} />
+                  <p>{activeTab === "fournisseurs" ? t("invoice_no_supplier_found") : t("invoice_no_client_found")}</p>
+                </div>
+              ) : null}
+              {!tiersLoading && !tiersError ? tiers.map((tier) => (
                 <div key={tier.id} className={`invoice-directory-item-wrap ${selectedTier?.id === tier.id ? "active" : ""}`}>
                   <button
                     type="button"
@@ -1615,10 +1758,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     </div>
                   )}
                 </div>
-              ))}
+              )) : null}
             </div>
           </section>
-          <TiersPanel tier={selectedTier} invoices={selectedTierInvoices} loading={tierDocsLoading} />
+          <TiersPanel
+            tier={selectedTier}
+            invoices={selectedTierInvoices}
+            loading={tierDocsLoading}
+            error={tierDocsError}
+          />
         </div>
       )}
 

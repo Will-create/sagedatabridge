@@ -16,11 +16,17 @@ use crate::state::{
 const MAX_QUERY_HISTORY: usize = 100;
 const MAX_FIELD_HISTORY: usize = 10;
 
-fn load_connection_config(state: &State<'_, AppState>, id: &str) -> Result<ConnectionConfig, String> {
-    state.resolve_connection_config(id)
+fn load_connection_config(
+    state: &State<'_, AppState>,
+    id: &str,
+) -> Result<ConnectionConfig, String> {
+    state.get_active_connection(id)
 }
 
-fn append_query_history(state: &State<'_, AppState>, entry: QueryHistoryEntry) -> Result<(), String> {
+fn append_query_history(
+    state: &State<'_, AppState>,
+    entry: QueryHistoryEntry,
+) -> Result<(), String> {
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     config.query_history.insert(0, entry);
     config.query_history.truncate(MAX_QUERY_HISTORY);
@@ -144,13 +150,21 @@ pub fn remove_admin_password(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn get_field_history(state: State<AppState>, field: String) -> Result<Vec<String>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let history = config.input_history.get(&field).cloned().unwrap_or_default();
+    let history = config
+        .input_history
+        .get(&field)
+        .cloned()
+        .unwrap_or_default();
     Ok(history.into_iter().take(MAX_FIELD_HISTORY).collect())
 }
 
 /// Save a value to the input history for a field key
 #[tauri::command]
-pub fn save_field_history(state: State<AppState>, field: String, value: String) -> Result<(), String> {
+pub fn save_field_history(
+    state: State<AppState>,
+    field: String,
+    value: String,
+) -> Result<(), String> {
     let trimmed = value.trim().to_string();
     if trimmed.is_empty() {
         return Ok(());
@@ -208,7 +222,10 @@ pub fn save_connection(
 ) -> Result<ConnectionConfig, String> {
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
 
-    let existing = config.connections.iter_mut().find(|c| c.id == connection.id);
+    let existing = config
+        .connections
+        .iter_mut()
+        .find(|c| c.id == connection.id);
 
     if let Some(existing) = existing {
         // Update — preserve password if masked
@@ -224,10 +241,27 @@ pub fn save_connection(
         state.save_config()?;
 
         // Persist history for tracked fields
-        let _ = save_field_history(state.clone(), "conn_host".to_string(), connection.host.clone());
-        let _ = save_field_history(state.clone(), "conn_instance".to_string(), connection.instance_name.clone());
-        let _ = save_field_history(state.clone(), "conn_database".to_string(), connection.database.clone());
-        let _ = save_field_history(state.clone(), "conn_username".to_string(), connection.username.clone());
+        let _ = save_field_history(
+            state.clone(),
+            "conn_host".to_string(),
+            connection.host.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_instance".to_string(),
+            connection.instance_name.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_database".to_string(),
+            connection.database.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_username".to_string(),
+            connection.username.clone(),
+        );
+        state.invalidate_client_cache(&updated.id)?;
 
         Ok(updated)
     } else {
@@ -239,10 +273,27 @@ pub fn save_connection(
         state.save_config()?;
 
         // Persist history for tracked fields
-        let _ = save_field_history(state.clone(), "conn_host".to_string(), new_conn.host.clone());
-        let _ = save_field_history(state.clone(), "conn_instance".to_string(), new_conn.instance_name.clone());
-        let _ = save_field_history(state.clone(), "conn_database".to_string(), new_conn.database.clone());
-        let _ = save_field_history(state.clone(), "conn_username".to_string(), new_conn.username.clone());
+        let _ = save_field_history(
+            state.clone(),
+            "conn_host".to_string(),
+            new_conn.host.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_instance".to_string(),
+            new_conn.instance_name.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_database".to_string(),
+            new_conn.database.clone(),
+        );
+        let _ = save_field_history(
+            state.clone(),
+            "conn_username".to_string(),
+            new_conn.username.clone(),
+        );
+        state.invalidate_client_cache(&new_conn.id)?;
 
         Ok(new_conn)
     }
@@ -264,6 +315,8 @@ pub fn delete_connection(state: State<AppState>, id: String) -> Result<(), Strin
 
     let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
     schemas.remove(&id);
+    drop(schemas);
+    state.invalidate_client_cache(&id)?;
 
     state.save_config()
 }
@@ -346,12 +399,20 @@ async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult
         });
     }
 
-    let sage1000_candidates = ["TECRITURE", "TCOMPTEGENERAL", "TTIERS", "TROLETIERS", "TPIECE"];
+    let sage1000_candidates = [
+        "TECRITURE",
+        "TCOMPTEGENERAL",
+        "TTIERS",
+        "TROLETIERS",
+        "TPIECE",
+    ];
     let found1000 = probe_tables(client, &sage1000_candidates).await?;
     if found1000.len() >= 4 {
         let mut confidence = 95;
         let mut evidence = found1000;
-        if evidence.iter().any(|name| name.eq_ignore_ascii_case("TECRITURE"))
+        if evidence
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("TECRITURE"))
             && probe_column(client, "TECRITURE", "eDate").await?
         {
             confidence = 99;
@@ -377,7 +438,11 @@ async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult
     })
 }
 
-fn store_schema_for_connection(state: &State<'_, AppState>, id: &str, schema: SageSchema) -> Result<(), String> {
+fn store_schema_for_connection(
+    state: &State<'_, AppState>,
+    id: &str,
+    schema: SageSchema,
+) -> Result<(), String> {
     let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
     schemas.insert(id.to_string(), schema);
     Ok(())
@@ -403,12 +468,24 @@ pub async fn test_mapping(
     };
 
     let mut select_parts = Vec::new();
-    if !schema.col_date.is_empty() { select_parts.push(format!("{} AS [Date]", wrap(&schema.col_date))); }
-    if !schema.col_journal.is_empty() { select_parts.push(format!("{} AS [Journal]", wrap(&schema.col_journal))); }
-    if !schema.col_compte.is_empty() { select_parts.push(format!("{} AS [Compte]", wrap(&schema.col_compte))); }
-    if !schema.col_libelle.is_empty() { select_parts.push(format!("{} AS [Libelle]", wrap(&schema.col_libelle))); }
-    if !schema.col_debit.is_empty() { select_parts.push(format!("{} AS [Debit]", wrap(&schema.col_debit))); }
-    if !schema.col_credit.is_empty() { select_parts.push(format!("{} AS [Credit]", wrap(&schema.col_credit))); }
+    if !schema.col_date.is_empty() {
+        select_parts.push(format!("{} AS [Date]", wrap(&schema.col_date)));
+    }
+    if !schema.col_journal.is_empty() {
+        select_parts.push(format!("{} AS [Journal]", wrap(&schema.col_journal)));
+    }
+    if !schema.col_compte.is_empty() {
+        select_parts.push(format!("{} AS [Compte]", wrap(&schema.col_compte)));
+    }
+    if !schema.col_libelle.is_empty() {
+        select_parts.push(format!("{} AS [Libelle]", wrap(&schema.col_libelle)));
+    }
+    if !schema.col_debit.is_empty() {
+        select_parts.push(format!("{} AS [Debit]", wrap(&schema.col_debit)));
+    }
+    if !schema.col_credit.is_empty() {
+        select_parts.push(format!("{} AS [Credit]", wrap(&schema.col_credit)));
+    }
 
     let select_clause = if select_parts.is_empty() {
         "*".to_string()
@@ -490,7 +567,9 @@ pub async fn connect_db(state: State<'_, AppState>, id: String) -> Result<String
                 "sage100" => SageSchema::for_edition(&SageEdition::Sage100),
                 "sage1000" => SageSchema::for_edition(&SageEdition::Sage1000),
                 "sagex3" => SageSchema::for_edition(&SageEdition::SageX3),
-                "custom" => custom_schema.unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic)),
+                "custom" => {
+                    custom_schema.unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic))
+                }
                 _ => SageSchema::for_edition(&SageEdition::Generic),
             };
 
@@ -551,6 +630,7 @@ pub async fn switch_database(
             },
         );
     }
+    state.invalidate_client_cache(&connection_id)?;
 
     let switch_result = db::test_connection(&next_config).await;
 
@@ -590,7 +670,8 @@ pub async fn switch_database(
 pub fn disconnect_db(state: State<AppState>, id: String) -> Result<(), String> {
     let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
     active.remove(&id);
-    Ok(())
+    drop(active);
+    state.invalidate_client_cache(&id)
 }
 
 /// Get connection status map
@@ -668,7 +749,16 @@ pub async fn get_table_data(
 
     let mut client = db::connect(&conn_config).await?;
     let columns = db::get_columns(&mut client, &schema, &table).await?;
-    db::get_table_data(&mut client, &schema, &table, page, page_size, &filters, &columns).await
+    db::get_table_data(
+        &mut client,
+        &schema,
+        &table,
+        page,
+        page_size,
+        &filters,
+        &columns,
+    )
+    .await
 }
 
 /// Execute a raw SQL query
@@ -865,16 +955,8 @@ pub async fn export_sql(
 
     let mut client = db::connect(&conn_config).await?;
     let columns = db::get_columns(&mut client, &schema, &table).await?;
-    let data = db::get_table_data(
-        &mut client,
-        &schema,
-        &table,
-        0,
-        50_000,
-        &filters,
-        &columns,
-    )
-    .await?;
+    let data =
+        db::get_table_data(&mut client, &schema, &table, 0, 50_000, &filters, &columns).await?;
 
     let full_table = format!("[{}].[{}]", schema, table);
     let col_names: Vec<String> = data
@@ -895,7 +977,13 @@ pub async fn export_sql(
             .iter()
             .map(|v| match v {
                 Value::Null => "NULL".to_string(),
-                Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+                Value::Bool(b) => {
+                    if *b {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    }
+                }
                 Value::Number(n) => n.to_string(),
                 Value::String(s) => format!("N'{}'", s.replace("'", "''")),
                 _ => format!("N'{}'", v.to_string().replace("'", "''")),

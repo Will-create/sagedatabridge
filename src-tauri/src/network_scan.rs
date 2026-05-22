@@ -22,7 +22,7 @@ async fn scan_udp_broadcast() -> Vec<SqlServerInstance> {
         Ok(s) => s,
         Err(_) => return instances,
     };
-    
+
     if let Err(_) = socket.set_broadcast(true) {
         return instances;
     }
@@ -43,24 +43,24 @@ async fn scan_udp_broadcast() -> Vec<SqlServerInstance> {
                 let response = String::from_utf8_lossy(&buf[..len]);
                 // Format: ServerName;NAME;InstanceName;INST;IsClustered;No;Version;15.0.2000.5;tcp;1433;;
                 let parts: Vec<&str> = response.split(';').collect();
-                let mut host = addr.ip().to_string();
                 let mut instance_name = String::new();
                 let mut port = 1433;
                 let mut version = String::new();
 
                 for i in (0..parts.len()).step_by(2) {
-                    if i + 1 >= parts.len() { break; }
+                    if i + 1 >= parts.len() {
+                        break;
+                    }
                     let key = parts[i].to_lowercase();
-                    let val = parts[i+1];
+                    let val = parts[i + 1];
                     match key.as_str() {
-                        "servername" => host = val.to_string(),
                         "instancename" => instance_name = val.to_string(),
                         "tcp" => port = val.parse().unwrap_or(1433),
                         "version" => version = val.to_string(),
                         _ => {}
                     }
                 }
-                
+
                 instances.push(SqlServerInstance {
                     host: addr.ip().to_string(), // Use IP for reliability in connection
                     instance_name,
@@ -99,10 +99,12 @@ async fn scan_tcp_probe() -> Vec<SqlServerInstance> {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
 
     for i in 1..255 {
-        if i == octets[3] { continue; } // Skip self
+        if i == octets[3] {
+            continue;
+        } // Skip self
         let target_ip = Ipv4Addr::new(octets[0], octets[1], octets[2], i);
         let sem = semaphore.clone();
-        
+
         join_set.spawn(async move {
             let _permit = sem.acquire().await.ok();
             let addr = SocketAddr::new(IpAddr::V4(target_ip), 1433);
@@ -134,18 +136,18 @@ pub async fn scan_network_for_sql_servers() -> Result<Vec<SqlServerInstance>, St
         // Run both methods in parallel
         let udp_task = scan_udp_broadcast();
         let tcp_task = scan_tcp_probe();
-        
+
         let (udp_results, tcp_results) = tokio::join!(udp_task, tcp_task);
-        
+
         let mut combined = udp_results;
         let seen_ips: HashSet<String> = combined.iter().map(|inst| inst.host.clone()).collect();
-        
+
         for tcp_inst in tcp_results {
             if !seen_ips.contains(&tcp_inst.host) {
                 combined.push(tcp_inst);
             }
         }
-        
+
         combined.sort_by(|a, b| a.host.cmp(&b.host));
         combined
     };

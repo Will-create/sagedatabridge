@@ -64,6 +64,7 @@ export default function App() {
   const [activeDatabase, setActiveDatabase] = useState("");
   const [databases, setDatabases] = useState([]);
   const [databasesLoading, setDatabasesLoading] = useState(false);
+  const [globalLoading, setGlobalLoading] = useState(false);
 
   const [tables, setTables] = useState([]);
   const [tablesLoading, setTablesLoading] = useState(false);
@@ -300,6 +301,41 @@ export default function App() {
     }
   }, [activeConnId, activeConnection, activeDatabase, activateDatabase, adminMode]);
 
+  const handleDuplicateWithDatabase = useCallback(async (baseConnection, database) => {
+    if (!baseConnection || !database) return;
+    
+    setGlobalLoading(true);
+    showStatus(t("status_switching_database", database), "idle");
+
+    try {
+      // 1. Create new connection object
+      const newConn = {
+        ...baseConnection,
+        id: undefined, // Let backend generate new ID or we'll get it from save
+        name: connectionDisplayName(baseConnection, database),
+        database,
+      };
+
+      // 2. Save it
+      const saved = await saveConnection(newConn);
+      setConnections((current) => upsertConnection(current, saved));
+
+      // 3. Connect and activate
+      await connectDb(saved.id);
+      setStatuses((current) => ({ ...current, [saved.id]: "connected" }));
+      
+      const activated = await activateDatabase(saved.id, database, adminMode);
+      if (activated) {
+        setActiveConnId(saved.id);
+      }
+    } catch (err) {
+      showStatus(t("status_database_failed") + err, "error");
+      showToast({ type: "error", msg: String(err) });
+    } finally {
+      setGlobalLoading(false);
+    }
+  }, [adminMode, activateDatabase, showStatus, showToast, t]);
+
   const handleSelectTable = useCallback(async (table) => {
     setActiveTable(table);
     setFilters([]);
@@ -430,9 +466,9 @@ export default function App() {
     <div className="app-shell">
       <div className="app-body">
         {showSidebarRail ? (
-          <div className="panel-rail">
+          <div className={`panel-rail ${globalLoading ? "disabled" : ""}`}>
             <div className="panel-rail-group">
-              <button className="panel-rail-btn" onClick={() => setSidebarCollapsed(false)} title={t("panel_show_connections")}>
+              <button className="panel-rail-btn" onClick={() => setSidebarCollapsed(false)} title={t("panel_show_connections")} disabled={globalLoading}>
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <rect x="4" y="4" width="6" height="16" rx="1" />
                   <path d="M14 8l4 4-4 4" />
@@ -440,7 +476,7 @@ export default function App() {
               </button>
             </div>
             <div className="panel-rail-group">
-              <button className="panel-rail-btn" onClick={() => setSettingsOpen(true)} title={t("sidebar_settings")}>
+              <button className="panel-rail-btn" onClick={() => setSettingsOpen(true)} title={t("sidebar_settings")} disabled={globalLoading}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <circle cx="12" cy="12" r="3" />
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10.09 3H10a2 2 0 1 1 4 0h-.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01A1.65 1.65 0 0 0 21 10.09V10a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
@@ -458,12 +494,14 @@ export default function App() {
             adminMode={adminMode}
             onSelectConnection={handleSelectConn}
             onRefreshConnection={handleRefreshConnection}
+            onDuplicateWithDatabase={handleDuplicateWithDatabase}
             onConnectionSaved={handleConnectionSaved}
             onCollapse={() => setSidebarCollapsed(true)}
             onOpenDashboard={() => setMainView("dashboard")}
             onOpenInvoicing={() => setInvoicingOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}
             invoicingOpen={invoicingOpen}
+            disabled={globalLoading}
           />
         )}
 

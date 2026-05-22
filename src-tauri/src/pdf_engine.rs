@@ -120,7 +120,10 @@ fn builtin_templates() -> Vec<InvoiceTemplate> {
     ]
 }
 
-fn merge_templates(configured: &[InvoiceTemplate], connection_id: Option<&str>) -> Vec<InvoiceTemplate> {
+fn merge_templates(
+    configured: &[InvoiceTemplate],
+    connection_id: Option<&str>,
+) -> Vec<InvoiceTemplate> {
     let mut templates = builtin_templates();
     templates.extend(
         configured
@@ -169,11 +172,7 @@ fn format_currency_fr(value: f64) -> String {
     let abs = rounded.abs();
     let major = abs.trunc() as i64;
     let minor = ((abs - major as f64) * 100.0).round() as i64;
-    let reversed = major
-        .to_string()
-        .chars()
-        .rev()
-        .collect::<Vec<_>>();
+    let reversed = major.to_string().chars().rev().collect::<Vec<_>>();
     let grouped = reversed
         .chunks(3)
         .map(|chunk| chunk.iter().collect::<String>())
@@ -326,7 +325,10 @@ fn tiers_cp_ville(invoice: &InvoiceHeader) -> String {
     }
 }
 
-fn common_replacements(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> Vec<(&'static str, String)> {
+fn common_replacements(
+    invoice: &InvoiceHeader,
+    template: &InvoiceTemplate,
+) -> Vec<(&'static str, String)> {
     let conditions = if invoice.conditions.trim().is_empty() {
         template.conditions_paiement.clone()
     } else {
@@ -344,13 +346,19 @@ fn common_replacements(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> V
         ("__COMPANY_TVA__", escape_html(&template.company_tva)),
         ("__COMPANY_PHONE__", escape_html(&template.company_phone)),
         ("__COMPANY_EMAIL__", escape_html(&template.company_email)),
-        ("__COMPANY_WEBSITE__", escape_html(&template.company_website)),
+        (
+            "__COMPANY_WEBSITE__",
+            escape_html(&template.company_website),
+        ),
         ("__COMPANY_BLOCK__", company_block(template)),
         ("__COMPANY_LOGO_HTML__", logo_html(template)),
         ("__INVOICE_NUMERO__", escape_html(&invoice.numero)),
         ("__INVOICE_DATE__", escape_html(&invoice.date)),
         ("__INVOICE_ECHEANCE__", escape_html(&invoice.date_echeance)),
-        ("__INVOICE_NATURE__", invoice_title(&invoice.nature).to_string()),
+        (
+            "__INVOICE_NATURE__",
+            invoice_title(&invoice.nature).to_string(),
+        ),
         ("__TIERS_NOM__", escape_html(&invoice.tiers_nom)),
         ("__TIERS_ADRESSE__", nl2br(&invoice.tiers_adresse)),
         ("__TIERS_CP_VILLE__", escape_html(&tiers_cp_ville(invoice))),
@@ -607,7 +615,10 @@ fn render_modern(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String 
 </body>
 </html>
 "#;
-    apply_replacements(template_html.to_string(), common_replacements(invoice, template))
+    apply_replacements(
+        template_html.to_string(),
+        common_replacements(invoice, template),
+    )
 }
 
 fn render_classic(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String {
@@ -768,7 +779,10 @@ fn render_classic(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String
 </body>
 </html>
 "#;
-    apply_replacements(template_html.to_string(), common_replacements(invoice, template))
+    apply_replacements(
+        template_html.to_string(),
+        common_replacements(invoice, template),
+    )
 }
 
 fn render_minimal(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String {
@@ -917,7 +931,10 @@ fn render_minimal(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String
 </body>
 </html>
 "#;
-    apply_replacements(template_html.to_string(), common_replacements(invoice, template))
+    apply_replacements(
+        template_html.to_string(),
+        common_replacements(invoice, template),
+    )
 }
 
 fn render_corporate(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> String {
@@ -1129,7 +1146,10 @@ fn render_corporate(invoice: &InvoiceHeader, template: &InvoiceTemplate) -> Stri
 </body>
 </html>
 "#;
-    apply_replacements(template_html.to_string(), common_replacements(invoice, template))
+    apply_replacements(
+        template_html.to_string(),
+        common_replacements(invoice, template),
+    )
 }
 
 pub(crate) fn render_invoice_html_with_template(
@@ -1194,7 +1214,12 @@ pub fn save_invoice_template(
         .iter()
         .filter(|existing| existing.connection_id == connection_id && existing.id != template.id)
         .count();
-    if !config.invoice_templates.iter().any(|existing| existing.id == template.id) && template_count >= 5 {
+    if !config
+        .invoice_templates
+        .iter()
+        .any(|existing| existing.id == template.id)
+        && template_count >= 5
+    {
         return Err("Only 5 saved invoice templates are allowed per connection".to_string());
     }
 
@@ -1234,6 +1259,7 @@ pub fn export_invoice_pdf(
 
     let target = temp_path.to_string_lossy().to_string();
     let shell_scope = app.shell_scope();
-    tauri::api::shell::open(&shell_scope, target.clone(), None).map_err(|error| error.to_string())?;
+    tauri::api::shell::open(&shell_scope, target.clone(), None)
+        .map_err(|error| error.to_string())?;
     Ok(target)
 }

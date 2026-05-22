@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,12 @@ use uuid::Uuid;
 use crate::db;
 use crate::invoice_compat::InvoiceSchema;
 use crate::sage_compat::{SageEdition, SageSchema};
-use crate::state::{AppState, ColumnInfo, ConnectionConfig, TableInfo};
+use crate::state::{AppState, ColumnInfo, ConnectionConfig};
+
+use crate::sage_entity_service::{
+    self, ArticleSummary, ResolvedTable, TiersSummary,
+    qualify, sql_string, sql_opt_string, round2, parse_f64, parse_i32, parse_i64, parse_bool, parse_string, br
+};
 
 const STATUS_TABLE: &str = "SDB_PIECE_STATUS";
 const STATUS_HISTORY_TABLE: &str = "SDB_PIECE_STATUS_HISTORY";
@@ -82,40 +87,6 @@ pub struct InvoiceHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TiersSummary {
-    pub id: String,
-    pub code: String,
-    pub nom: String,
-    pub adresse: String,
-    pub cp: String,
-    pub ville: String,
-    pub pays: String,
-    pub siret: String,
-    pub email: String,
-    pub telephone: String,
-    pub tva_intra: String,
-    pub type_tiers: String,
-    #[serde(default)]
-    pub encours: f64,
-    #[serde(default)]
-    pub nb_factures: i64,
-    #[serde(default)]
-    pub is_local: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ArticleSummary {
-    pub id: String,
-    pub code: String,
-    pub libelle: String,
-    pub prix_ht: f64,
-    pub taux_tva: f64,
-    pub unite: String,
-    pub reference: String,
-    pub en_activite: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatutUpdateResult {
     pub piece_id: String,
     pub statut: String,
@@ -128,27 +99,6 @@ pub struct ComptabilisationResult {
     pub piece_id: String,
     pub entry_ids: Vec<String>,
     pub statut: String,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedTable {
-    schema: String,
-    name: String,
-    columns: HashMap<String, ColumnInfo>,
-}
-
-impl ResolvedTable {
-    fn quoted_name(&self) -> String {
-        format!(
-            "[{}].[{}]",
-            self.schema.replace(']', "]]"),
-            self.name.replace(']', "]]")
-        )
-    }
-
-    fn column(&self, name: &str) -> Option<&ColumnInfo> {
-        self.columns.get(&name.to_ascii_lowercase())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -206,82 +156,15 @@ struct ResolvedInvoiceSchema {
     role_tiers_account: Option<String>,
 }
 
-fn load_connection_config(state: &State<'_, AppState>, id: &str) -> Result<ConnectionConfig, String> {
+fn load_connection_config(
+    state: &State<'_, AppState>,
+    id: &str,
+) -> Result<ConnectionConfig, String> {
     state.resolve_connection_config(id)
 }
 
-fn br(value: &str) -> String {
-    format!("[{}]", value.replace(']', "]]"))
-}
-
-fn qualify(alias: &str, column: &str) -> String {
-    format!("{}.[{}]", alias, column.replace(']', "]]"))
-}
-
-fn sql_string(value: &str) -> String {
-    format!("N'{}'", value.replace('\'', "''"))
-}
-
-fn sql_opt_string(value: &str) -> String {
-    if value.trim().is_empty() {
-        "NULL".to_string()
-    } else {
-        sql_string(value.trim())
-    }
-}
-
-fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
-}
-
-fn parse_f64(value: Option<&Value>) -> f64 {
-    match value {
-        Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
-        Some(Value::String(text)) => text.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(flag)) => {
-            if *flag {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn parse_i32(value: Option<&Value>) -> i32 {
-    round2(parse_f64(value)) as i32
-}
-
-fn parse_i64(value: Option<&Value>) -> i64 {
-    round2(parse_f64(value)) as i64
-}
-
-fn parse_bool(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Bool(flag)) => *flag,
-        Some(Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
-        Some(Value::String(text)) => matches!(
-            text.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "oui"
-        ),
-        _ => false,
-    }
-}
-
-fn parse_string(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.trim().to_string(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Bool(flag)) => {
-            if *flag {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            }
-        }
-        _ => String::new(),
-    }
+async fn get_active_client(state: &AppState, id: &str) -> Result<db::DbClient, String> {
+    db::get_cached_client_snapshot(state, id).await
 }
 
 fn is_numeric_type(data_type: &str) -> bool {
@@ -309,7 +192,12 @@ fn cast_text_to_column(text_expr: &str, column: &ColumnInfo) -> String {
         format!("TRY_CAST({} AS TINYINT)", text_expr)
     } else if dt.contains("int") {
         format!("TRY_CAST({} AS INT)", text_expr)
-    } else if dt.contains("decimal") || dt.contains("numeric") || dt.contains("money") || dt.contains("float") || dt.contains("real") {
+    } else if dt.contains("decimal")
+        || dt.contains("numeric")
+        || dt.contains("money")
+        || dt.contains("float")
+        || dt.contains("real")
+    {
         format!("TRY_CAST({} AS DECIMAL(38, 6))", text_expr)
     } else if dt.contains("bit") {
         format!("TRY_CAST({} AS BIT)", text_expr)
@@ -326,12 +214,16 @@ fn sql_value_for_column(column: &ColumnInfo, value: &str) -> String {
     }
 
     let dt = column.data_type.to_ascii_lowercase();
-    if is_guid_type(&dt) || (!is_numeric_type(&dt) && !dt.contains("date") && !dt.contains("time")) {
+    if is_guid_type(&dt) || (!is_numeric_type(&dt) && !dt.contains("date") && !dt.contains("time"))
+    {
         sql_string(value.trim())
     } else if dt.contains("date") || dt.contains("time") {
         sql_string(value.trim())
     } else if dt.contains("bit") {
-        if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "oui") {
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "oui"
+        ) {
             "1".to_string()
         } else {
             "0".to_string()
@@ -424,7 +316,10 @@ fn is_editable_status(value: &str) -> bool {
 
 fn validate_transition(current: &str, next: &str) -> bool {
     match normalize_status(current).as_str() {
-        "Brouillon" => matches!(normalize_status(next).as_str(), "Proforma" | "Facture" | "Bon_Commande"),
+        "Brouillon" => matches!(
+            normalize_status(next).as_str(),
+            "Proforma" | "Facture" | "Bon_Commande"
+        ),
         "Proforma" => normalize_status(next) == "Facture",
         "Facture" => matches!(normalize_status(next).as_str(), "Avoir" | "Comptabilise"),
         "Comptabilise" => false,
@@ -457,8 +352,14 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
         if line.id.trim().is_empty() {
             line.id = format!("line-{}", Uuid::new_v4());
         }
-        line.ordre = if line.ordre <= 0 { (index + 1) as i32 } else { line.ordre };
-        let base_ht = round2(line.quantite * line.prix_ht * (1.0 - line.remise_pct.max(0.0).min(100.0) / 100.0));
+        line.ordre = if line.ordre <= 0 {
+            (index + 1) as i32
+        } else {
+            line.ordre
+        };
+        let base_ht = round2(
+            line.quantite * line.prix_ht * (1.0 - line.remise_pct.max(0.0).min(100.0) / 100.0),
+        );
         line.montant_ht = base_ht;
         line.montant_tva = round2(base_ht * (line.taux_tva / 100.0));
         line.montant_ttc = round2(line.montant_ht + line.montant_tva);
@@ -470,43 +371,6 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
     invoice.total_tva = round2(total_tva * discount_factor);
     invoice.total_ttc = round2(invoice.total_ht + invoice.total_tva);
     invoice
-}
-
-fn find_table<'a>(tables: &'a [TableInfo], candidates: &[String]) -> Option<&'a TableInfo> {
-    candidates.iter().find_map(|candidate| {
-        tables
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(candidate))
-    })
-}
-
-async fn load_table(client: &mut db::DbClient, tables: &[TableInfo], candidates: &[String]) -> Result<ResolvedTable, String> {
-    let info = find_table(tables, candidates)
-        .ok_or_else(|| format!("Required table not found. Tried: {}", candidates.join(", ")))?;
-    let columns = db::get_columns(client, &info.schema, &info.name).await?;
-    let column_map = columns
-        .into_iter()
-        .map(|column| (column.name.to_ascii_lowercase(), column))
-        .collect::<HashMap<_, _>>();
-
-    Ok(ResolvedTable {
-        schema: info.schema.clone(),
-        name: info.name.clone(),
-        columns: column_map,
-    })
-}
-
-fn pick_required(table: &ResolvedTable, candidates: &[&str]) -> Result<String, String> {
-    candidates
-        .iter()
-        .find_map(|candidate| table.column(candidate).map(|col| col.name.clone()))
-        .ok_or_else(|| format!("Required column missing on {}.{} ({})", table.schema, table.name, candidates.join(", ")))
-}
-
-fn pick_optional(table: &ResolvedTable, candidates: &[&str]) -> Option<String> {
-    candidates
-        .iter()
-        .find_map(|candidate| table.column(candidate).map(|col| col.name.clone()))
 }
 
 async fn resolve_invoice_schema(
@@ -532,8 +396,8 @@ async fn resolve_invoice_schema(
     }
 
     let tables = db::get_tables(client).await?;
-    let piece = load_table(client, &tables, &[native.table_piece.clone()]).await?;
-    let line = load_table(
+    let piece = sage_entity_service::load_table(client, &tables, &[native.table_piece.clone()]).await?;
+    let line = sage_entity_service::load_table(
         client,
         &tables,
         &[
@@ -544,8 +408,8 @@ async fn resolve_invoice_schema(
         ],
     )
     .await?;
-    let article = load_table(client, &tables, &[native.table_article.clone()]).await?;
-    let tiers = load_table(
+    let article = sage_entity_service::load_table(client, &tables, &[native.table_article.clone()]).await?;
+    let tiers = sage_entity_service::load_table(
         client,
         &tables,
         &[
@@ -560,12 +424,12 @@ async fn resolve_invoice_schema(
     let role_tiers = if native.table_roletiers.trim().is_empty() {
         None
     } else {
-        Some(load_table(client, &tables, &[native.table_roletiers.clone()]).await?)
+        Some(sage_entity_service::load_table(client, &tables, &[native.table_roletiers.clone()]).await?)
     };
     let journal = if native.table_journal.trim().is_empty() {
         None
     } else {
-        load_table(
+        sage_entity_service::load_table(
             client,
             &tables,
             &[native.table_journal.clone(), "TPIECE".to_string()],
@@ -578,52 +442,95 @@ async fn resolve_invoice_schema(
         edition: edition.clone(),
         sage_schema,
         native: native.clone(),
-        piece_oid: pick_required(&piece, &["oid", "EC_No"])?,
-        piece_numero: pick_required(&piece, &["numero", "EC_Piece"])?,
-        piece_date: pick_required(&piece, &["pDate", "EC_Date"])?,
-        piece_reference: pick_optional(&piece, &["reference", "EC_RefPiece"]).unwrap_or_else(|| pick_required(&piece, &["numero", "EC_Piece"]).unwrap_or_default()),
-        piece_tiers: pick_required(&piece, &["oidTiers", "CT_Num"])?,
-        piece_nature: pick_required(&piece, &["NaturePiece", "EC_Type"])?,
-        piece_devise: pick_optional(&piece, &["oiddevise", "EC_Devise", "devise"]),
-        piece_journal_fk: pick_optional(&piece, &["oidjournal", "JO_Num"]),
-        line_piece: pick_required(&line, &[&native.col_ligne_piece, "oidpiece", "EC_No"])?,
-        line_article: pick_optional(&line, &[&native.col_ligne_article, "AR_Ref", "oidarticle"]),
-        line_libelle: pick_optional(&line, &[&native.col_ligne_libelle, "DL_Design", "designation", "Caption"]),
-        line_qte: pick_optional(&line, &[&native.col_ligne_qte, "DL_Qte", "qte"]),
-        line_pu_ht: pick_optional(&line, &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"]),
-        line_taux_tva: pick_optional(&line, &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"]),
-        line_montant_ht: pick_optional(&line, &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"]),
-        line_montant_ttc: pick_optional(&line, &[&native.col_ligne_montant_ttc, "DL_MontantTTC", "montant_ttc"]),
-        line_remise: pick_optional(&line, &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"]),
-        line_ordre: pick_optional(&line, &[&native.col_ligne_ordre, "DL_No", "position"]),
-        line_unite: pick_optional(&line, &["unite", "DL_Unite", "UV_Code"]),
-        article_id: pick_optional(&article, &["oid", "AR_Ref", "id"]),
-        article_code: pick_required(&article, &[&native.col_article_code, "AR_Ref", "code"])?,
-        article_libelle: pick_required(&article, &[&native.col_article_libelle, "AR_Design", "Caption", "libelle"])?,
-        article_pu: pick_optional(&article, &[&native.col_article_pu, "AR_PrixVen", "prix_ht"]),
-        article_tva: pick_optional(&article, &[&native.col_article_tva, "AR_TauxTva", "taux_tva"]),
-        article_ref: pick_optional(&article, &[&native.col_article_ref, "AR_Ref", "reference"]),
-        article_unite: pick_optional(&article, &["unite", "AR_UniteVen", "UV_Code"]),
-        article_active: pick_optional(&article, &["actif", "AR_Sommeil", "en_activite"]),
-        tiers_id: pick_required(&tiers, &["oid", "CT_Num", "id"])?,
-        tiers_code: pick_required(&tiers, &["code", "CT_Num", "numero"])?,
-        tiers_nom: pick_required(&tiers, &["raisonSociale", "CT_Intitule", "Caption", "nom"])?,
-        tiers_adresse: pick_optional(&tiers, &["adresse", "adresse1", "CT_Adresse", "voie"]),
-        tiers_cp: pick_optional(&tiers, &["codePostal", "CT_CodePostal", "cp"]),
-        tiers_ville: pick_optional(&tiers, &["ville", "CT_Ville"]),
-        tiers_pays: pick_optional(&tiers, &["pays", "CT_Pays"]),
-        tiers_siret: pick_optional(&tiers, &["siret", "CT_Siret", "siren"]),
-        tiers_email: pick_optional(&tiers, &["email", "EMail", "CT_EMail"]),
-        tiers_telephone: pick_optional(&tiers, &["telephone", "CT_Telephone"]),
-        tiers_tva: pick_optional(&tiers, &["numTvaIntracom", "CT_Identifiant", "tva"]),
-        tiers_type: pick_optional(&tiers, &["CT_Type", "typePersonne", "type"]),
-        tiers_account: pick_optional(&tiers, &["CG_NumPrinc", "compteCollectif", "compte"]),
+        piece_oid: sage_entity_service::pick_required(&piece, &["oid", "EC_No"])?,
+        piece_numero: sage_entity_service::pick_required(&piece, &["numero", "EC_Piece"])?,
+        piece_date: sage_entity_service::pick_required(&piece, &["pDate", "EC_Date"])?,
+        piece_reference: sage_entity_service::pick_optional(&piece, &["reference", "EC_RefPiece"])
+            .unwrap_or_else(|| sage_entity_service::pick_required(&piece, &["numero", "EC_Piece"]).unwrap_or_default()),
+        piece_tiers: sage_entity_service::pick_required(&piece, &["oidTiers", "CT_Num"])?,
+        piece_nature: sage_entity_service::pick_required(&piece, &["NaturePiece", "EC_Type"])?,
+        piece_devise: sage_entity_service::pick_optional(&piece, &["oiddevise", "EC_Devise", "devise"]),
+        piece_journal_fk: sage_entity_service::pick_optional(&piece, &["oidjournal", "JO_Num"]),
+        line_piece: sage_entity_service::pick_required(&line, &[&native.col_ligne_piece, "oidpiece", "EC_No"])?,
+        line_article: sage_entity_service::pick_optional(&line, &[&native.col_ligne_article, "AR_Ref", "oidarticle"]),
+        line_libelle: sage_entity_service::pick_optional(
+            &line,
+            &[
+                &native.col_ligne_libelle,
+                "DL_Design",
+                "designation",
+                "Caption",
+            ],
+        ),
+        line_qte: sage_entity_service::pick_optional(&line, &[&native.col_ligne_qte, "DL_Qte", "qte"]),
+        line_pu_ht: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"],
+        ),
+        line_taux_tva: sage_entity_service::pick_optional(&line, &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"]),
+        line_montant_ht: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"],
+        ),
+        line_montant_ttc: sage_entity_service::pick_optional(
+            &line,
+            &[
+                &native.col_ligne_montant_ttc,
+                "DL_MontantTTC",
+                "montant_ttc",
+            ],
+        ),
+        line_remise: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"],
+        ),
+        line_ordre: sage_entity_service::pick_optional(&line, &[&native.col_ligne_ordre, "DL_No", "position"]),
+        line_unite: sage_entity_service::pick_optional(&line, &["unite", "DL_Unite", "UV_Code"]),
+        article_id: sage_entity_service::pick_optional(&article, &["oid", "AR_Ref", "id"]),
+        article_code: sage_entity_service::pick_required(&article, &[&native.col_article_code, "AR_Ref", "code"])?,
+        article_libelle: sage_entity_service::pick_required(
+            &article,
+            &[
+                &native.col_article_libelle,
+                "AR_Design",
+                "Caption",
+                "libelle",
+            ],
+        )?,
+        article_pu: sage_entity_service::pick_optional(&article, &[&native.col_article_pu, "AR_PrixVen", "prix_ht"]),
+        article_tva: sage_entity_service::pick_optional(
+            &article,
+            &[&native.col_article_tva, "AR_TauxTva", "taux_tva"],
+        ),
+        article_ref: sage_entity_service::pick_optional(&article, &[&native.col_article_ref, "AR_Ref", "reference"]),
+        article_unite: sage_entity_service::pick_optional(&article, &["unite", "AR_UniteVen", "UV_Code"]),
+        article_active: sage_entity_service::pick_optional(&article, &["actif", "AR_Sommeil", "en_activite"]),
+        tiers_id: sage_entity_service::pick_required(&tiers, &["oid", "CT_Num", "id"])?,
+        tiers_code: sage_entity_service::pick_required(&tiers, &["code", "CT_Num", "numero"])?,
+        tiers_nom: sage_entity_service::pick_required(&tiers, &["raisonSociale", "CT_Intitule", "Caption", "nom"])?,
+        tiers_adresse: sage_entity_service::pick_optional(&tiers, &["adresse", "adresse1", "CT_Adresse", "voie"]),
+        tiers_cp: sage_entity_service::pick_optional(&tiers, &["codePostal", "CT_CodePostal", "cp"]),
+        tiers_ville: sage_entity_service::pick_optional(&tiers, &["ville", "CT_Ville"]),
+        tiers_pays: sage_entity_service::pick_optional(&tiers, &["pays", "CT_Pays"]),
+        tiers_siret: sage_entity_service::pick_optional(&tiers, &["siret", "CT_Siret", "siren"]),
+        tiers_email: sage_entity_service::pick_optional(&tiers, &["email", "EMail", "CT_EMail"]),
+        tiers_telephone: sage_entity_service::pick_optional(&tiers, &["telephone", "CT_Telephone"]),
+        tiers_tva: sage_entity_service::pick_optional(&tiers, &["numTvaIntracom", "CT_Identifiant", "tva"]),
+        tiers_type: sage_entity_service::pick_optional(&tiers, &["CT_Type", "typePersonne", "type"]),
+        tiers_account: sage_entity_service::pick_optional(&tiers, &["CG_NumPrinc", "compteCollectif", "compte"]),
         role_tiers_tiers: role_tiers
             .as_ref()
-            .and_then(|table| pick_optional(table, &["oidtiers", "oidTiers"])),
-        role_tiers_account: role_tiers
-            .as_ref()
-            .and_then(|table| pick_optional(table, &["oidcomptePrivilegie", "oidComptePrivilegie", "oidcompteGeneral"])),
+            .and_then(|table| sage_entity_service::pick_optional(table, &["oidtiers", "oidTiers"])),
+        role_tiers_account: role_tiers.as_ref().and_then(|table| {
+            sage_entity_service::pick_optional(
+                table,
+                &[
+                    "oidcomptePrivilegie",
+                    "oidComptePrivilegie",
+                    "oidcompteGeneral",
+                ],
+            )
+        }),
         piece,
         line,
         article,
@@ -863,11 +770,17 @@ async fn generate_invoice_numero(
         if digits.len() >= 3 {
             let current = digits.parse::<i64>().unwrap_or(0) + 1;
             let prefix = &last_numero[..last_numero.len().saturating_sub(digits.len())];
-            return Ok(format!("{}{:0width$}", prefix, current, width = digits.len()));
+            return Ok(format!(
+                "{}{:0width$}",
+                prefix,
+                current,
+                width = digits.len()
+            ));
         }
     }
 
-    let counter = get_next_counter_value(client, &format!("invoice:{}", nature_to_label(nature))).await?;
+    let counter =
+        get_next_counter_value(client, &format!("invoice:{}", nature_to_label(nature))).await?;
     Ok(format!(
         "{}-{}-{:04}",
         default_prefix_for_nature(nature),
@@ -885,7 +798,10 @@ fn get_current_status_sql(piece_id: &str) -> String {
     )
 }
 
-async fn get_current_status(client: &mut db::DbClient, piece_id: &str) -> Result<Option<StatutUpdateResult>, String> {
+async fn get_current_status(
+    client: &mut db::DbClient,
+    piece_id: &str,
+) -> Result<Option<StatutUpdateResult>, String> {
     let data = db::execute_raw_query(client, &get_current_status_sql(piece_id)).await?;
     Ok(data.rows.first().map(|row| StatutUpdateResult {
         piece_id: piece_id.to_string(),
@@ -934,7 +850,10 @@ VALUES ({history_id}, {piece_id}, {from_statut}, {status}, GETDATE(), {updated_b
     Ok(())
 }
 
-async fn fetch_status_history(client: &mut db::DbClient, piece_id: &str) -> Result<Vec<StatusHistoryEntry>, String> {
+async fn fetch_status_history(
+    client: &mut db::DbClient,
+    piece_id: &str,
+) -> Result<Vec<StatusHistoryEntry>, String> {
     let sql = format!(
         "SELECT [id], COALESCE([from_statut], N''), [to_statut], CONVERT(VARCHAR(19), [updated_at], 126), COALESCE([updated_by], N'') \
          FROM [dbo].[{table}] \
@@ -962,32 +881,65 @@ fn invoice_list_select(resolved: &ResolvedInvoiceSchema) -> String {
     let devise_expr = resolved
         .piece_devise
         .as_ref()
-        .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(50)), N'EUR')", qualify("p", column)))
+        .map(|column| {
+            format!(
+                "COALESCE(CAST({} AS NVARCHAR(50)), N'EUR')",
+                qualify("p", column)
+            )
+        })
         .unwrap_or_else(|| "N'EUR'".to_string());
     let tiers_nom_expr = resolved
         .tiers_adresse
         .as_ref()
-        .map(|_| "COALESCE(m.[tiers_nom], CAST(tnom AS NVARCHAR(255)), N'')".replace("tnom", &qualify("t", &resolved.tiers_nom)))
-        .unwrap_or_else(|| format!("COALESCE(m.[tiers_nom], CAST({} AS NVARCHAR(255)), N'')", qualify("t", &resolved.tiers_nom)));
+        .map(|_| {
+            "COALESCE(m.[tiers_nom], CAST(tnom AS NVARCHAR(255)), N'')"
+                .replace("tnom", &qualify("t", &resolved.tiers_nom))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "COALESCE(m.[tiers_nom], CAST({} AS NVARCHAR(255)), N'')",
+                qualify("t", &resolved.tiers_nom)
+            )
+        });
     let tiers_addr_expr = resolved
         .tiers_adresse
         .as_ref()
-        .map(|column| format!("COALESCE(m.[tiers_adresse], CAST({} AS NVARCHAR(255)), N'')", qualify("t", column)))
+        .map(|column| {
+            format!(
+                "COALESCE(m.[tiers_adresse], CAST({} AS NVARCHAR(255)), N'')",
+                qualify("t", column)
+            )
+        })
         .unwrap_or_else(|| "COALESCE(m.[tiers_adresse], N'')".to_string());
     let tiers_cp_expr = resolved
         .tiers_cp
         .as_ref()
-        .map(|column| format!("COALESCE(m.[tiers_cp], CAST({} AS NVARCHAR(50)), N'')", qualify("t", column)))
+        .map(|column| {
+            format!(
+                "COALESCE(m.[tiers_cp], CAST({} AS NVARCHAR(50)), N'')",
+                qualify("t", column)
+            )
+        })
         .unwrap_or_else(|| "COALESCE(m.[tiers_cp], N'')".to_string());
     let tiers_ville_expr = resolved
         .tiers_ville
         .as_ref()
-        .map(|column| format!("COALESCE(m.[tiers_ville], CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+        .map(|column| {
+            format!(
+                "COALESCE(m.[tiers_ville], CAST({} AS NVARCHAR(100)), N'')",
+                qualify("t", column)
+            )
+        })
         .unwrap_or_else(|| "COALESCE(m.[tiers_ville], N'')".to_string());
     let tiers_siret_expr = resolved
         .tiers_siret
         .as_ref()
-        .map(|column| format!("COALESCE(m.[tiers_siret], CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+        .map(|column| {
+            format!(
+                "COALESCE(m.[tiers_siret], CAST({} AS NVARCHAR(100)), N'')",
+                qualify("t", column)
+            )
+        })
         .unwrap_or_else(|| "COALESCE(m.[tiers_siret], N'')".to_string());
 
     format!(
@@ -1106,8 +1058,8 @@ async fn fetch_invoice_internal(
     id: &str,
     piece_id: &str,
 ) -> Result<InvoiceHeader, String> {
-    let connection = load_connection_config(state, id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(state, id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(state, id, &mut client).await?;
 
@@ -1129,10 +1081,12 @@ async fn fetch_invoice_internal(
         .article_id
         .as_ref()
         .zip(resolved.line_article.as_ref())
-        .map(|(_article_id, _line_article)| format!(
-            "COALESCE(CAST({} AS NVARCHAR(100)), lm.[article_code], N'')",
-            qualify("a", &resolved.article_code)
-        ))
+        .map(|(_article_id, _line_article)| {
+            format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), lm.[article_code], N'')",
+                qualify("a", &resolved.article_code)
+            )
+        })
         .unwrap_or_else(|| "COALESCE(lm.[article_code], N'')".to_string());
 
     let article_join = if let Some(line_article) = resolved.line_article.as_ref() {
@@ -1303,8 +1257,8 @@ pub async fn list_invoices(
     tiers_id: Option<String>,
     search: Option<String>,
 ) -> Result<Vec<InvoiceHeader>, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
 
@@ -1380,8 +1334,8 @@ pub async fn create_invoice(
     id: String,
     invoice: InvoiceHeader,
 ) -> Result<InvoiceHeader, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
 
@@ -1394,7 +1348,8 @@ pub async fn create_invoice(
         .piece
         .column(&resolved.piece_oid)
         .ok_or_else(|| "Piece id column metadata missing".to_string())?;
-    let piece_id_is_identity = is_identity_column(&mut client, &resolved.piece, &resolved.piece_oid).await?;
+    let piece_id_is_identity =
+        is_identity_column(&mut client, &resolved.piece, &resolved.piece_oid).await?;
     if invoice.id.trim().is_empty() && !piece_id_is_identity {
         invoice.id = get_next_piece_id(&mut client, &resolved.piece, &resolved.piece_oid).await?;
     }
@@ -1412,7 +1367,11 @@ pub async fn create_invoice(
         piece_values.push(sql_value_for_column(piece_id_column, &invoice.id));
     }
 
-    let add_piece_value = |columns: &mut Vec<String>, values: &mut Vec<String>, column_name: &str, table: &ResolvedTable, value: String| {
+    let add_piece_value = |columns: &mut Vec<String>,
+                           values: &mut Vec<String>,
+                           column_name: &str,
+                           table: &ResolvedTable,
+                           value: String| {
         if table.column(column_name).is_some() {
             columns.push(br(column_name));
             values.push(value);
@@ -1477,7 +1436,11 @@ pub async fn create_invoice(
             &resolved.piece,
             sql_value_for_column(
                 resolved.piece.column(devise_column).unwrap(),
-                if invoice.devise.trim().is_empty() { "EUR" } else { &invoice.devise },
+                if invoice.devise.trim().is_empty() {
+                    "EUR"
+                } else {
+                    &invoice.devise
+                },
             ),
         );
     }
@@ -1498,43 +1461,83 @@ pub async fn create_invoice(
         let mut columns = vec![br(&resolved.line_piece)];
         let mut values = vec![cast_text_to_column("@piece_id_text", line_piece_column)];
 
-        if let Some(column) = resolved.line_article.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_article
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.article_id));
         }
-        if let Some(column) = resolved.line_libelle.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_libelle
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.libelle));
         }
-        if let Some(column) = resolved.line_qte.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_qte
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.quantite));
         }
-        if let Some(column) = resolved.line_pu_ht.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_pu_ht
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.prix_ht));
         }
-        if let Some(column) = resolved.line_taux_tva.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_taux_tva
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.taux_tva));
         }
-        if let Some(column) = resolved.line_montant_ht.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_montant_ht
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.montant_ht));
         }
-        if let Some(column) = resolved.line_montant_ttc.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_montant_ttc
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.montant_ttc));
         }
-        if let Some(column) = resolved.line_remise.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_remise
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.remise_pct));
         }
-        if let Some(column) = resolved.line_ordre.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_ordre
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(line.ordre.to_string());
         }
-        if let Some(column) = resolved.line_unite.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_unite
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.unite));
         }
@@ -1681,30 +1684,58 @@ pub async fn update_invoice(
         return Err("Only Brouillon or Proforma invoices can be updated".to_string());
     }
 
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
 
     let invoice = normalize_invoice(invoice);
     let mut set_clauses = Vec::new();
     if let Some(column) = resolved.piece.column(&resolved.piece_numero) {
-        set_clauses.push(format!("{} = {}", br(&column.name), sql_value_for_column(column, &invoice.numero)));
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&column.name),
+            sql_value_for_column(column, &invoice.numero)
+        ));
     }
     if let Some(column) = resolved.piece.column(&resolved.piece_date) {
-        set_clauses.push(format!("{} = {}", br(&column.name), sql_value_for_column(column, &invoice.date)));
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&column.name),
+            sql_value_for_column(column, &invoice.date)
+        ));
     }
     if let Some(column) = resolved.piece.column(&resolved.piece_reference) {
-        set_clauses.push(format!("{} = {}", br(&column.name), sql_value_for_column(column, &invoice.reference)));
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&column.name),
+            sql_value_for_column(column, &invoice.reference)
+        ));
     }
     if let Some(column) = resolved.piece.column(&resolved.piece_tiers) {
-        set_clauses.push(format!("{} = {}", br(&column.name), sql_value_for_column(column, &invoice.tiers_id)));
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&column.name),
+            sql_value_for_column(column, &invoice.tiers_id)
+        ));
     }
     if let Some(column) = resolved.piece.column(&resolved.piece_nature) {
-        set_clauses.push(format!("{} = {}", br(&column.name), nature_to_sql_value(&invoice.nature, column)));
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&column.name),
+            nature_to_sql_value(&invoice.nature, column)
+        ));
     }
-    if let Some(devise_column) = resolved.piece_devise.as_ref().and_then(|name| resolved.piece.column(name)) {
-        set_clauses.push(format!("{} = {}", br(&devise_column.name), sql_value_for_column(devise_column, &invoice.devise)));
+    if let Some(devise_column) = resolved
+        .piece_devise
+        .as_ref()
+        .and_then(|name| resolved.piece.column(name))
+    {
+        set_clauses.push(format!(
+            "{} = {}",
+            br(&devise_column.name),
+            sql_value_for_column(devise_column, &invoice.devise)
+        ));
     }
 
     let line_piece_column = resolved
@@ -1726,43 +1757,83 @@ pub async fn update_invoice(
         let mut columns = vec![br(&resolved.line_piece)];
         let mut values = vec![cast_text_to_column("@piece_id_text", line_piece_column)];
 
-        if let Some(column) = resolved.line_article.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_article
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.article_id));
         }
-        if let Some(column) = resolved.line_libelle.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_libelle
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.libelle));
         }
-        if let Some(column) = resolved.line_qte.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_qte
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.quantite));
         }
-        if let Some(column) = resolved.line_pu_ht.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_pu_ht
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.prix_ht));
         }
-        if let Some(column) = resolved.line_taux_tva.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_taux_tva
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.taux_tva));
         }
-        if let Some(column) = resolved.line_montant_ht.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_montant_ht
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.montant_ht));
         }
-        if let Some(column) = resolved.line_montant_ttc.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_montant_ttc
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.montant_ttc));
         }
-        if let Some(column) = resolved.line_remise.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_remise
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_number(line.remise_pct));
         }
-        if let Some(column) = resolved.line_ordre.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_ordre
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(line.ordre.to_string());
         }
-        if let Some(column) = resolved.line_unite.as_ref().and_then(|name| resolved.line.column(name)) {
+        if let Some(column) = resolved
+            .line_unite
+            .as_ref()
+            .and_then(|name| resolved.line.column(name))
+        {
             columns.push(br(&column.name));
             values.push(sql_value_for_column(column, &line.unite));
         }
@@ -1864,8 +1935,8 @@ pub async fn update_statut(
     new_statut: String,
     updated_by: Option<String>,
 ) -> Result<StatutUpdateResult, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
 
     let current = get_current_status(&mut client, &piece_id)
@@ -1881,7 +1952,10 @@ pub async fn update_statut(
         return Err("Comptabilise invoices are locked".to_string());
     }
     if !validate_transition(&current.statut, &next) {
-        return Err(format!("Invalid status transition: {} -> {}", current.statut, next));
+        return Err(format!(
+            "Invalid status transition: {} -> {}",
+            current.statut, next
+        ));
     }
 
     upsert_status_batch(
@@ -1913,8 +1987,8 @@ pub async fn delete_invoice(
         return Err("Only Brouillon invoices can be deleted".to_string());
     }
 
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
     let line_piece_column = resolved
@@ -1964,7 +2038,12 @@ async fn resolve_entry_table(
     resolved: &ResolvedInvoiceSchema,
 ) -> Result<ResolvedTable, String> {
     let tables = db::get_tables(client).await?;
-    load_table(client, &tables, &[resolved.sage_schema.table_ecritures.clone()]).await
+    sage_entity_service::load_table(
+        client,
+        &tables,
+        &[resolved.sage_schema.table_ecritures.clone()],
+    )
+    .await
 }
 
 async fn resolve_account_table(
@@ -1972,7 +2051,12 @@ async fn resolve_account_table(
     resolved: &ResolvedInvoiceSchema,
 ) -> Result<ResolvedTable, String> {
     let tables = db::get_tables(client).await?;
-    load_table(client, &tables, &[resolved.sage_schema.table_comptes.clone()]).await
+    sage_entity_service::load_table(
+        client,
+        &tables,
+        &[resolved.sage_schema.table_comptes.clone()],
+    )
+    .await
 }
 
 async fn lookup_account_value(
@@ -1985,9 +2069,19 @@ async fn lookup_account_value(
         return Err("Account code is empty".to_string());
     }
 
-    let id_column = pick_optional(account_table, &["oid", "CG_Num", "CT_Num", "ACC"]).unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
-    let code_column = pick_optional(account_table, &[&resolved.sage_schema.col_compte_num, "codeCompte", "CG_Num", "CT_Num", "ACC"])
+    let id_column = sage_entity_service::pick_optional(account_table, &["oid", "CG_Num", "CT_Num", "ACC"])
         .unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
+    let code_column = sage_entity_service::pick_optional(
+        account_table,
+        &[
+            &resolved.sage_schema.col_compte_num,
+            "codeCompte",
+            "CG_Num",
+            "CT_Num",
+            "ACC",
+        ],
+    )
+    .unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
     let sql = format!(
         "SELECT TOP 1 CAST({id_col} AS NVARCHAR(50)) AS value FROM {table} WHERE CAST({code_col} AS NVARCHAR(100)) = {code}",
         id_col = br(&id_column),
@@ -2053,20 +2147,35 @@ pub async fn comptabiliser_invoice(
         return Err("Only Facture invoices can be comptabilise".to_string());
     }
 
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
     let entry_table = resolve_entry_table(&mut client, &resolved).await?;
     let account_table = resolve_account_table(&mut client, &resolved).await?;
 
-    let tiers_account_code = if invoice.is_supplier { "401000" } else { "411000" };
-    let sales_account_code = if invoice.is_supplier { "607000" } else { "701000" };
-    let vat_account_code = if invoice.is_supplier { "445620" } else { "445710" };
+    let tiers_account_code = if invoice.is_supplier {
+        "401000"
+    } else {
+        "411000"
+    };
+    let sales_account_code = if invoice.is_supplier {
+        "607000"
+    } else {
+        "701000"
+    };
+    let vat_account_code = if invoice.is_supplier {
+        "445620"
+    } else {
+        "445710"
+    };
 
-    let tiers_account_value = lookup_account_value(&mut client, &account_table, &resolved, tiers_account_code).await?;
-    let sales_account_value = lookup_account_value(&mut client, &account_table, &resolved, sales_account_code).await?;
-    let vat_account_value = lookup_account_value(&mut client, &account_table, &resolved, vat_account_code).await?;
+    let tiers_account_value =
+        lookup_account_value(&mut client, &account_table, &resolved, tiers_account_code).await?;
+    let sales_account_value =
+        lookup_account_value(&mut client, &account_table, &resolved, sales_account_code).await?;
+    let vat_account_value =
+        lookup_account_value(&mut client, &account_table, &resolved, vat_account_code).await?;
     let role_value = resolve_tiers_role_for_entry(&mut client, &resolved, &invoice).await?;
 
     let mut tva_breakdown = BTreeMap::<String, f64>::new();
@@ -2096,7 +2205,12 @@ pub async fn comptabiliser_invoice(
         columns
     };
 
-    let build_entry_values = |account_value: &str, label: &str, debit: f64, credit: f64, tiers_value: Option<&str>| -> Vec<String> {
+    let build_entry_values = |account_value: &str,
+                              label: &str,
+                              debit: f64,
+                              credit: f64,
+                              tiers_value: Option<&str>|
+     -> Vec<String> {
         entry_columns
             .iter()
             .map(|column| {
@@ -2104,7 +2218,9 @@ pub async fn comptabiliser_invoice(
                     sql_string(&invoice.date)
                 } else if column.eq_ignore_ascii_case("JO_Num") {
                     sql_string("VT")
-                } else if column.eq_ignore_ascii_case("CG_Num") || column.eq_ignore_ascii_case(&resolved.sage_schema.col_compte) {
+                } else if column.eq_ignore_ascii_case("CG_Num")
+                    || column.eq_ignore_ascii_case(&resolved.sage_schema.col_compte)
+                {
                     let col = entry_table.column(column).unwrap();
                     sql_value_for_column(col, account_value)
                 } else if column.eq_ignore_ascii_case(&resolved.sage_schema.col_libelle) {
@@ -2117,7 +2233,11 @@ pub async fn comptabiliser_invoice(
                 } else if column.eq_ignore_ascii_case("EC_Montant") {
                     sql_number(if debit > 0.0 { debit } else { credit })
                 } else if column.eq_ignore_ascii_case("EC_Sens") {
-                    if debit > 0.0 { "0".to_string() } else { "1".to_string() }
+                    if debit > 0.0 {
+                        "0".to_string()
+                    } else {
+                        "1".to_string()
+                    }
                 } else if column.eq_ignore_ascii_case(&resolved.sage_schema.col_tiers) {
                     match tiers_value {
                         Some(value) => sql_string(value),
@@ -2146,7 +2266,12 @@ pub async fn comptabiliser_invoice(
         Some(invoice.tiers_code.as_str())
     };
 
-    let add_entry = |inserts: &mut Vec<String>, entry_ids: &mut Vec<String>, entry_order: i32, role: &str, amount: f64, values: Vec<String>| {
+    let add_entry = |inserts: &mut Vec<String>,
+                     entry_ids: &mut Vec<String>,
+                     entry_order: i32,
+                     role: &str,
+                     amount: f64,
+                     values: Vec<String>| {
         let entry_id = Uuid::new_v4().to_string();
         inserts.push(format!(
             "INSERT INTO {entry_table} ({columns}) VALUES ({values});
@@ -2172,7 +2297,13 @@ pub async fn comptabiliser_invoice(
             1,
             "achat",
             invoice.total_ht,
-            build_entry_values(&sales_account_value, &format!("Achat {}", invoice.numero), invoice.total_ht, 0.0, None),
+            build_entry_values(
+                &sales_account_value,
+                &format!("Achat {}", invoice.numero),
+                invoice.total_ht,
+                0.0,
+                None,
+            ),
         );
         add_entry(
             &mut inserts,
@@ -2180,7 +2311,13 @@ pub async fn comptabiliser_invoice(
             2,
             "tva_deductible",
             invoice.total_tva,
-            build_entry_values(&vat_account_value, &format!("TVA {}", invoice.numero), invoice.total_tva, 0.0, None),
+            build_entry_values(
+                &vat_account_value,
+                &format!("TVA {}", invoice.numero),
+                invoice.total_tva,
+                0.0,
+                None,
+            ),
         );
         add_entry(
             &mut inserts,
@@ -2188,7 +2325,13 @@ pub async fn comptabiliser_invoice(
             3,
             "fournisseur",
             invoice.total_ttc,
-            build_entry_values(&tiers_account_value, &format!("Fournisseur {}", invoice.numero), 0.0, invoice.total_ttc, tiers_tiers_value),
+            build_entry_values(
+                &tiers_account_value,
+                &format!("Fournisseur {}", invoice.numero),
+                0.0,
+                invoice.total_ttc,
+                tiers_tiers_value,
+            ),
         );
     } else {
         add_entry(
@@ -2197,7 +2340,13 @@ pub async fn comptabiliser_invoice(
             1,
             "client",
             invoice.total_ttc,
-            build_entry_values(&tiers_account_value, &format!("Client {}", invoice.numero), invoice.total_ttc, 0.0, tiers_tiers_value),
+            build_entry_values(
+                &tiers_account_value,
+                &format!("Client {}", invoice.numero),
+                invoice.total_ttc,
+                0.0,
+                tiers_tiers_value,
+            ),
         );
         let mut order = 2;
         for amount in tva_breakdown.values() {
@@ -2207,7 +2356,13 @@ pub async fn comptabiliser_invoice(
                 order,
                 "vente",
                 *amount,
-                build_entry_values(&sales_account_value, &format!("Vente {}", invoice.numero), 0.0, *amount, None),
+                build_entry_values(
+                    &sales_account_value,
+                    &format!("Vente {}", invoice.numero),
+                    0.0,
+                    *amount,
+                    None,
+                ),
             );
             order += 1;
         }
@@ -2217,7 +2372,13 @@ pub async fn comptabiliser_invoice(
             order,
             "tva_collectee",
             invoice.total_tva,
-            build_entry_values(&vat_account_value, &format!("TVA {}", invoice.numero), 0.0, invoice.total_tva, None),
+            build_entry_values(
+                &vat_account_value,
+                &format!("TVA {}", invoice.numero),
+                0.0,
+                invoice.total_tva,
+                None,
+            ),
         );
     }
 
@@ -2273,150 +2434,91 @@ pub async fn list_tiers(
     id: String,
     type_tiers: Option<String>,
     search: Option<String>,
+    limit: Option<u32>,
 ) -> Result<Vec<TiersSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     // Non-fatal: user may have read-only access to the Sage DB.
-    let sdb_tables_available = ensure_invoice_support_tables(&mut client).await.is_ok();
+    let _ = ensure_invoice_support_tables(&mut client).await;
     let type_filter = type_tiers.unwrap_or_else(|| "all".to_string());
+    let limit = limit.unwrap_or(40).clamp(1, 100);
+    let normalized_search = search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
-    // If native schema resolution fails (unsupported edition, missing tables, etc.),
-    // fall back to local-only results rather than returning an error.
-    let resolved = match resolve_invoice_schema(&state, &id, &mut client).await {
-        Ok(r) => Some(r),
-        Err(_) => None,
-    };
+    let entity_ctx = sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
+    let resolved = entity_ctx.tiers;
 
     if resolved.is_none() {
+        // Fall back to local-only when native schema isn't available.
         let local_type_filter = match type_filter.trim().to_ascii_lowercase().as_str() {
             "clients" => Some(vec!["client", "les_deux"]),
             "fournisseurs" => Some(vec!["fournisseur", "les_deux"]),
             _ => None,
         };
-        let local_sql = build_local_tiers_sql(&local_type_filter, search.as_deref());
-        let local_data = db::execute_raw_query(&mut client, &local_sql).await.unwrap_or_else(|_| empty_table_data());
-        return Ok(local_data.rows.iter().map(|row| TiersSummary {
-            id: parse_string(row.first()),
-            code: parse_string(row.get(1)),
-            nom: parse_string(row.get(2)),
-            adresse: parse_string(row.get(3)),
-            cp: parse_string(row.get(4)),
-            ville: parse_string(row.get(5)),
-            pays: parse_string(row.get(6)),
-            siret: parse_string(row.get(7)),
-            email: parse_string(row.get(8)),
-            telephone: parse_string(row.get(9)),
-            tva_intra: parse_string(row.get(10)),
-            type_tiers: parse_string(row.get(11)),
-            encours: 0.0,
-            nb_factures: 0,
-            is_local: true,
-        }).collect());
+        let local_sql = build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
+        let local_data = db::execute_logged_query(
+            &mut client,
+            &local_sql,
+            db::QueryExecutionContext::new("list_tiers", "invoice_search_tiers_local")
+                .with_connection_id(id.clone())
+                .with_database(connection.database.clone())
+                .with_table(LOCAL_TIERS_TABLE)
+                .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+        )
+        .await
+        .unwrap_or_else(|_| empty_table_data());
+
+        return Ok(local_data
+            .rows
+            .iter()
+            .map(|row| TiersSummary {
+                id: sage_entity_service::parse_string(row.first()),
+                code: sage_entity_service::parse_string(row.get(1)),
+                nom: sage_entity_service::parse_string(row.get(2)),
+                adresse: sage_entity_service::parse_string(row.get(3)),
+                cp: sage_entity_service::parse_string(row.get(4)),
+                ville: sage_entity_service::parse_string(row.get(5)),
+                pays: sage_entity_service::parse_string(row.get(6)),
+                siret: sage_entity_service::parse_string(row.get(7)),
+                email: sage_entity_service::parse_string(row.get(8)),
+                telephone: sage_entity_service::parse_string(row.get(9)),
+                tva_intra: sage_entity_service::parse_string(row.get(10)),
+                type_tiers: sage_entity_service::parse_string(row.get(11)),
+                encours: 0.0,
+                nb_factures: 0,
+                is_local: true,
+            })
+            .collect());
     }
     let resolved = resolved.unwrap();
-    let account_table = if resolved.edition == SageEdition::Sage1000 {
-        Some(resolve_account_table(&mut client, &resolved).await?)
-    } else {
-        None
-    };
 
-    let type_expr = if resolved.edition == SageEdition::Sage1000 {
-        if let (Some(role_table), Some(role_tiers_column), Some(role_account_column)) = (
-            resolved.role_tiers.as_ref(),
-            resolved.role_tiers_tiers.as_ref(),
-            resolved.role_tiers_account.as_ref(),
-        ) {
-            let account_table = account_table
-                .as_ref()
-                .ok_or_else(|| "Account table not available for Sage 1000".to_string())?;
-            let account_key = pick_optional(account_table, &["oid", "CG_Num", "CT_Num", "ACC"])
-                .unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
-            let account_code = resolved.sage_schema.col_compte_num.clone();
+    let type_expr = resolved
+        .col_type
+        .as_ref()
+        .map(|column| {
             format!(
                 "CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM {role_table} rt
-                        LEFT JOIN {account_table} ac
-                            ON rt.{role_account} = ac.[{account_key}]
-                        WHERE rt.{role_tiers} = t.[{tiers_id}]
-                          AND LEFT(CAST(ac.[{account_code}] AS NVARCHAR(50)), 2) = N'41'
-                    ) AND EXISTS (
-                        SELECT 1
-                        FROM {role_table} rt
-                        LEFT JOIN {account_table} ac
-                            ON rt.{role_account} = ac.[{account_key}]
-                        WHERE rt.{role_tiers} = t.[{tiers_id}]
-                          AND LEFT(CAST(ac.[{account_code}] AS NVARCHAR(50)), 2) = N'40'
-                    ) THEN N'les_deux'
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM {role_table} rt
-                        LEFT JOIN {account_table} ac
-                            ON rt.{role_account} = ac.[{account_key}]
-                        WHERE rt.{role_tiers} = t.[{tiers_id}]
-                          AND LEFT(CAST(ac.[{account_code}] AS NVARCHAR(50)), 2) = N'40'
-                    ) THEN N'fournisseur'
-                    ELSE N'client'
-                END",
-                role_table = role_table.quoted_name(),
-                account_table = account_table.quoted_name(),
-                role_account = br(role_account_column),
-                account_key = account_key,
-                account_code = account_code,
-                role_tiers = br(role_tiers_column),
-                tiers_id = resolved.tiers_id.clone(),
+                WHEN TRY_CAST({} AS INT) = 1 THEN N'fournisseur'
+                WHEN TRY_CAST({} AS INT) = 2 THEN N'les_deux'
+                WHEN CAST({} AS NVARCHAR(50)) IN (N'0', N'1', N'2') THEN
+                    CASE WHEN TRY_CAST({} AS INT) = 1 THEN N'fournisseur' WHEN TRY_CAST({} AS INT) = 2 THEN N'les_deux' ELSE N'client' END
+                ELSE N'client'
+            END",
+                sage_entity_service::qualify("t", column),
+                sage_entity_service::qualify("t", column),
+                sage_entity_service::qualify("t", column),
+                sage_entity_service::qualify("t", column),
+                sage_entity_service::qualify("t", column),
             )
-        } else {
-            "N'client'".to_string()
-        }
-    } else {
-        resolved
-            .tiers_type
-            .as_ref()
-            .map(|column| format!(
-                "CASE
-                    WHEN TRY_CAST({} AS INT) = 1 THEN N'fournisseur'
-                    WHEN TRY_CAST({} AS INT) = 2 THEN N'les_deux'
-                    ELSE N'client'
-                END",
-                qualify("t", column),
-                qualify("t", column),
-            ))
-            .unwrap_or_else(|| "N'client'".to_string())
-    };
+        })
+        .unwrap_or_else(|| "N'client'".to_string());
 
-    let type_expr_sql = type_expr.clone();
-    let encours_apply = if sdb_tables_available {
-        format!(
-            "OUTER APPLY (
-    SELECT
-        ROUND(SUM(CASE WHEN COALESCE(s.[statut], N'Brouillon') = N'Avoir' THEN -COALESCE(tot.[total_ttc], 0) ELSE COALESCE(tot.[total_ttc], 0) END), 2) AS encours,
-        COUNT(*) AS nb_factures
-    FROM {piece_table} p
-    LEFT JOIN [dbo].[{status_table}] s ON s.[piece_id] = CAST(p.[{piece_oid}] AS NVARCHAR(50))
-    OUTER APPLY (
-        SELECT ROUND(SUM(COALESCE(TRY_CAST(l.[{line_ttc}] AS DECIMAL(18, 6)), 0)), 2) AS total_ttc
-        FROM {line_table} l WHERE l.[{line_piece}] = p.[{piece_oid}]
-    ) tot
-    WHERE CAST(p.[{piece_tiers}] AS NVARCHAR(50)) = CAST({tiers_id} AS NVARCHAR(50))
-) agg",
-            piece_table = resolved.piece.quoted_name(),
-            status_table = STATUS_TABLE,
-            piece_oid = resolved.piece_oid.clone(),
-            line_ttc = resolved.line_montant_ttc.clone().unwrap_or_else(|| "montantTTC".to_string()),
-            line_table = resolved.line.quoted_name(),
-            line_piece = resolved.line_piece.clone(),
-            piece_tiers = resolved.piece_tiers.clone(),
-            tiers_id = qualify("t", &resolved.tiers_id),
-        )
-    } else {
-        "(SELECT CAST(0 AS FLOAT) AS encours, CAST(0 AS BIGINT) AS nb_factures) agg".to_string()
-    };
-
-    let sql = format!(
+    let mut final_sql = format!(
         "
-SELECT
+SELECT TOP ({limit})
     CAST({tiers_id} AS NVARCHAR(50)) AS id,
     CAST({tiers_code} AS NVARCHAR(100)) AS code,
     CAST({tiers_nom} AS NVARCHAR(255)) AS nom,
@@ -2429,110 +2531,171 @@ SELECT
     {tiers_telephone} AS telephone,
     {tiers_tva} AS tva_intra,
     {type_expr} AS type_tiers,
-    COALESCE(agg.[encours], 0) AS encours,
-    COALESCE(agg.[nb_factures], 0) AS nb_factures
+    CAST(0 AS DECIMAL(18, 2)) AS encours,
+    CAST(0 AS BIGINT) AS nb_factures
 FROM {tiers_table} t
-{encours_apply}
 WHERE 1=1
 ",
-        tiers_id = qualify("t", &resolved.tiers_id),
-        tiers_code = qualify("t", &resolved.tiers_code),
-        tiers_nom = qualify("t", &resolved.tiers_nom),
+        limit = limit,
+        tiers_id = sage_entity_service::qualify("t", &resolved.col_id),
+        tiers_code = sage_entity_service::qualify("t", &resolved.col_code),
+        tiers_nom = sage_entity_service::qualify("t", &resolved.col_nom),
         tiers_adresse = resolved
-            .tiers_adresse
+            .col_adresse
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(255)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(255)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_cp = resolved
-            .tiers_cp
+            .col_cp
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(50)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(50)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_ville = resolved
-            .tiers_ville
+            .col_ville
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_pays = resolved
-            .tiers_pays
+            .col_pays
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_siret = resolved
-            .tiers_siret
+            .col_siret
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_email = resolved
-            .tiers_email
+            .col_email
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_telephone = resolved
-            .tiers_telephone
+            .col_telephone
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
         tiers_tva = resolved
-            .tiers_tva
+            .col_tva
             .as_ref()
-            .map(|column| format!("COALESCE(CAST({} AS NVARCHAR(100)), N'')", qualify("t", column)))
+            .map(|column| format!(
+                "COALESCE(CAST({} AS NVARCHAR(100)), N'')",
+                sage_entity_service::qualify("t", column)
+            ))
             .unwrap_or_else(|| "N''".to_string()),
-        type_expr = type_expr_sql,
-        tiers_table = resolved.tiers.quoted_name(),
-        encours_apply = encours_apply,
+        type_expr = type_expr,
+        tiers_table = resolved.table.quoted_name(),
     );
 
-    let mut final_sql = sql;
-    match type_filter.trim().to_ascii_lowercase().as_str() {
-        "clients" => final_sql.push_str(" AND ("),
-        "fournisseurs" => final_sql.push_str(" AND ("),
-        _ => {}
-    }
     if type_filter.eq_ignore_ascii_case("clients") {
-        final_sql.push_str(&format!("{} IN (N'client', N'les_deux'))", type_expr));
-        final_sql.push(')');
+        final_sql.push_str(&format!(" AND ({} IN (N'client', N'les_deux'))", type_expr));
     } else if type_filter.eq_ignore_ascii_case("fournisseurs") {
-        final_sql.push_str(&format!("{} IN (N'fournisseur', N'les_deux'))", type_expr));
-        final_sql.push(')');
+        final_sql.push_str(&format!(" AND ({} IN (N'fournisseur', N'les_deux'))", type_expr));
     }
-    if let Some(value) = search.as_ref().filter(|value| !value.trim().is_empty()) {
-        let search_value = format!("%{}%", value.trim());
+
+    if let Some(value) = normalized_search.as_ref() {
+        let search_value = format!("%{}%", value.replace('\'', "''"));
         final_sql.push_str(&format!(
-            " AND (CAST({} AS NVARCHAR(100)) LIKE {} OR CAST({} AS NVARCHAR(255)) LIKE {} OR CAST({} AS NVARCHAR(100)) LIKE {})",
-            qualify("t", &resolved.tiers_code),
-            sql_string(&search_value),
-            qualify("t", &resolved.tiers_nom),
-            sql_string(&search_value),
+            " AND (
+                CAST({} AS NVARCHAR(100)) LIKE {}
+                OR CAST({} AS NVARCHAR(255)) LIKE {}
+                OR CAST({} AS NVARCHAR(255)) LIKE {}
+                OR CAST({} AS NVARCHAR(100)) LIKE {}
+                OR CAST({} AS NVARCHAR(100)) LIKE {}
+                OR CAST({} AS NVARCHAR(100)) LIKE {}
+                OR CAST({} AS NVARCHAR(100)) LIKE {}
+            )",
+            sage_entity_service::qualify("t", &resolved.col_code),
+            sage_entity_service::sql_string(&search_value),
+            sage_entity_service::qualify("t", &resolved.col_nom),
+            sage_entity_service::sql_string(&search_value),
             resolved
-                .tiers_ville
+                .col_adresse
                 .as_ref()
-                .map(|column| qualify("t", column))
+                .map(|column| sage_entity_service::qualify("t", column))
                 .unwrap_or_else(|| "N''".to_string()),
-            sql_string(&search_value),
+            sage_entity_service::sql_string(&search_value),
+            resolved
+                .col_ville
+                .as_ref()
+                .map(|column| sage_entity_service::qualify("t", column))
+                .unwrap_or_else(|| "N''".to_string()),
+            sage_entity_service::sql_string(&search_value),
+            resolved
+                .col_email
+                .as_ref()
+                .map(|column| sage_entity_service::qualify("t", column))
+                .unwrap_or_else(|| "N''".to_string()),
+            sage_entity_service::sql_string(&search_value),
+            resolved
+                .col_telephone
+                .as_ref()
+                .map(|column| sage_entity_service::qualify("t", column))
+                .unwrap_or_else(|| "N''".to_string()),
+            sage_entity_service::sql_string(&search_value),
+            resolved
+                .col_siret
+                .as_ref()
+                .map(|column| sage_entity_service::qualify("t", column))
+                .unwrap_or_else(|| "N''".to_string()),
+            sage_entity_service::sql_string(&search_value),
         ));
     }
-    final_sql.push_str(&format!(" ORDER BY {} ASC", qualify("t", &resolved.tiers_nom)));
+    final_sql.push_str(&format!(
+        " ORDER BY {} ASC",
+        sage_entity_service::qualify("t", &resolved.col_nom)
+    ));
 
-    let data = db::execute_raw_query(&mut client, &final_sql).await?;
+    let data = db::execute_logged_query(
+        &mut client,
+        &final_sql,
+        db::QueryExecutionContext::new("list_tiers", "invoice_search_tiers")
+            .with_connection_id(id.clone())
+            .with_database(connection.database.clone())
+            .with_table(resolved.table.quoted_name())
+            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+    )
+    .await?;
+
     let mut result: Vec<TiersSummary> = data
         .rows
         .iter()
         .map(|row| TiersSummary {
-            id: parse_string(row.first()),
-            code: parse_string(row.get(1)),
-            nom: parse_string(row.get(2)),
-            adresse: parse_string(row.get(3)),
-            cp: parse_string(row.get(4)),
-            ville: parse_string(row.get(5)),
-            pays: parse_string(row.get(6)),
-            siret: parse_string(row.get(7)),
-            email: parse_string(row.get(8)),
-            telephone: parse_string(row.get(9)),
-            tva_intra: parse_string(row.get(10)),
-            type_tiers: parse_string(row.get(11)),
-            encours: round2(parse_f64(row.get(12))),
-            nb_factures: parse_i64(row.get(13)),
+            id: sage_entity_service::parse_string(row.first()),
+            code: sage_entity_service::parse_string(row.get(1)),
+            nom: sage_entity_service::parse_string(row.get(2)),
+            adresse: sage_entity_service::parse_string(row.get(3)),
+            cp: sage_entity_service::parse_string(row.get(4)),
+            ville: sage_entity_service::parse_string(row.get(5)),
+            pays: sage_entity_service::parse_string(row.get(6)),
+            siret: sage_entity_service::parse_string(row.get(7)),
+            email: sage_entity_service::parse_string(row.get(8)),
+            telephone: sage_entity_service::parse_string(row.get(9)),
+            tva_intra: sage_entity_service::parse_string(row.get(10)),
+            type_tiers: sage_entity_service::parse_string(row.get(11)),
+            encours: 0.0,
+            nb_factures: 0,
             is_local: false,
         })
         .collect();
@@ -2543,23 +2706,34 @@ WHERE 1=1
         "fournisseurs" => Some(vec!["fournisseur", "les_deux"]),
         _ => None,
     };
-    let local_sql = build_local_tiers_sql(&local_type_filter, search.as_deref());
-    if let Ok(local_data) = db::execute_raw_query(&mut client, &local_sql).await {
-        let native_ids: std::collections::HashSet<String> = result.iter().map(|t| t.code.to_lowercase()).collect();
+    let local_sql = build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
+    if let Ok(local_data) = db::execute_logged_query(
+        &mut client,
+        &local_sql,
+        db::QueryExecutionContext::new("list_tiers", "invoice_search_tiers_local_merge")
+            .with_connection_id(id.clone())
+            .with_database(connection.database.clone())
+            .with_table(LOCAL_TIERS_TABLE)
+            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+    )
+    .await
+    {
+        let native_ids: std::collections::HashSet<String> =
+            result.iter().map(|t| t.code.to_lowercase()).collect();
         for row in &local_data.rows {
             let entry = TiersSummary {
-                id: parse_string(row.first()),
-                code: parse_string(row.get(1)),
-                nom: parse_string(row.get(2)),
-                adresse: parse_string(row.get(3)),
-                cp: parse_string(row.get(4)),
-                ville: parse_string(row.get(5)),
-                pays: parse_string(row.get(6)),
-                siret: parse_string(row.get(7)),
-                email: parse_string(row.get(8)),
-                telephone: parse_string(row.get(9)),
-                tva_intra: parse_string(row.get(10)),
-                type_tiers: parse_string(row.get(11)),
+                id: sage_entity_service::parse_string(row.first()),
+                code: sage_entity_service::parse_string(row.get(1)),
+                nom: sage_entity_service::parse_string(row.get(2)),
+                adresse: sage_entity_service::parse_string(row.get(3)),
+                cp: sage_entity_service::parse_string(row.get(4)),
+                ville: sage_entity_service::parse_string(row.get(5)),
+                pays: sage_entity_service::parse_string(row.get(6)),
+                siret: sage_entity_service::parse_string(row.get(7)),
+                email: sage_entity_service::parse_string(row.get(8)),
+                telephone: sage_entity_service::parse_string(row.get(9)),
+                tva_intra: sage_entity_service::parse_string(row.get(10)),
+                type_tiers: sage_entity_service::parse_string(row.get(11)),
                 encours: 0.0,
                 nb_factures: 0,
                 is_local: true,
@@ -2570,16 +2744,24 @@ WHERE 1=1
         }
     }
     result.sort_by(|a, b| a.nom.to_lowercase().cmp(&b.nom.to_lowercase()));
+    result.truncate(limit as usize);
     Ok(result)
 }
 
 fn empty_table_data() -> crate::state::TableData {
-    crate::state::TableData { columns: vec![], rows: vec![], total_count: 0, page: 0, page_size: 0 }
+    crate::state::TableData {
+        columns: vec![],
+        rows: vec![],
+        total_count: 0,
+        page: 0,
+        page_size: 0,
+    }
 }
 
-fn build_local_tiers_sql(type_filter: &Option<Vec<&str>>, search: Option<&str>) -> String {
+fn build_local_tiers_sql(type_filter: &Option<Vec<&str>>, search: Option<&str>, limit: u32) -> String {
     let mut sql = format!(
-        "SELECT [id],[code],[nom],COALESCE([adresse],N'') AS adresse,COALESCE([cp],N'') AS cp,COALESCE([ville],N'') AS ville,COALESCE([pays],N'') AS pays,COALESCE([siret],N'') AS siret,COALESCE([email],N'') AS email,COALESCE([telephone],N'') AS telephone,COALESCE([tva_intra],N'') AS tva_intra,[type_tiers] FROM [dbo].[{table}] WHERE 1=1",
+        "SELECT TOP ({limit}) [id],[code],[nom],COALESCE([adresse],N'') AS adresse,COALESCE([cp],N'') AS cp,COALESCE([ville],N'') AS ville,COALESCE([pays],N'') AS pays,COALESCE([siret],N'') AS siret,COALESCE([email],N'') AS email,COALESCE([telephone],N'') AS telephone,COALESCE([tva_intra],N'') AS tva_intra,[type_tiers] FROM [dbo].[{table}] WHERE 1=1",
+        limit = limit,
         table = LOCAL_TIERS_TABLE
     );
     if let Some(types) = type_filter {
@@ -2589,8 +2771,8 @@ fn build_local_tiers_sql(type_filter: &Option<Vec<&str>>, search: Option<&str>) 
     if let Some(s) = search.filter(|s| !s.trim().is_empty()) {
         let val = format!("%{}%", s.trim().replace('\'', "''"));
         sql.push_str(&format!(
-            " AND ([code] LIKE N'{}' OR [nom] LIKE N'{}' OR [ville] LIKE N'{}')",
-            val, val, val
+            " AND ([code] LIKE N'{}' OR [nom] LIKE N'{}' OR [adresse] LIKE N'{}' OR [ville] LIKE N'{}' OR [email] LIKE N'{}' OR [telephone] LIKE N'{}' OR [siret] LIKE N'{}')",
+            val, val, val, val, val, val, val
         ));
     }
     sql.push_str(" ORDER BY [nom] ASC");
@@ -2602,37 +2784,55 @@ pub async fn list_articles(
     state: State<'_, AppState>,
     id: String,
     search: Option<String>,
+    limit: Option<u32>,
 ) -> Result<Vec<ArticleSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     // Non-fatal: user may have read-only access to the Sage DB.
     let _ = ensure_invoice_support_tables(&mut client).await;
+    let limit = limit.unwrap_or(40).clamp(1, 100);
+    let normalized_search = search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
-    // Fall back to local-only when native schema isn't available.
-    let resolved = match resolve_invoice_schema(&state, &id, &mut client).await {
-        Ok(r) => Some(r),
-        Err(_) => None,
-    };
+    let entity_ctx = sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
+    let resolved = entity_ctx.article;
 
     if resolved.is_none() {
-        let local_sql = build_local_article_sql(search.as_deref());
-        let local_data = db::execute_raw_query(&mut client, &local_sql).await.unwrap_or_else(|_| empty_table_data());
-        return Ok(local_data.rows.iter().map(|row| ArticleSummary {
-            id: parse_string(row.first()),
-            code: parse_string(row.get(1)),
-            libelle: parse_string(row.get(2)),
-            prix_ht: round2(parse_f64(row.get(3))),
-            taux_tva: round2(parse_f64(row.get(4))),
-            unite: parse_string(row.get(5)),
-            reference: parse_string(row.get(6)),
-            en_activite: parse_bool(row.get(7)),
-        }).collect());
+        let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
+        let local_data = db::execute_logged_query(
+            &mut client,
+            &local_sql,
+            db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local")
+                .with_connection_id(id.clone())
+                .with_database(connection.database.clone())
+                .with_table(LOCAL_ARTICLE_TABLE)
+                .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+        )
+            .await
+            .unwrap_or_else(|_| empty_table_data());
+        return Ok(local_data
+            .rows
+            .iter()
+            .map(|row| ArticleSummary {
+                id: sage_entity_service::parse_string(row.first()),
+                code: sage_entity_service::parse_string(row.get(1)),
+                libelle: sage_entity_service::parse_string(row.get(2)),
+                prix_ht: sage_entity_service::parse_f64(row.get(3)),
+                taux_tva: sage_entity_service::parse_f64(row.get(4)),
+                unite: sage_entity_service::parse_string(row.get(5)),
+                reference: sage_entity_service::parse_string(row.get(6)),
+                en_activite: sage_entity_service::parse_bool(row.get(7)),
+            })
+            .collect());
     }
     let resolved = resolved.unwrap();
 
     let mut sql = format!(
         "
-SELECT
+SELECT TOP ({limit})
     CAST({id_expr} AS NVARCHAR(50)) AS id,
     CAST({code_expr} AS NVARCHAR(100)) AS code,
     CAST({label_expr} AS NVARCHAR(255)) AS libelle,
@@ -2644,107 +2844,143 @@ SELECT
         WHEN {active_expr} IS NULL THEN CAST(1 AS BIT)
         WHEN CAST({active_expr} AS NVARCHAR(50)) IN (N'1', N'true', N'TRUE', N'oui') THEN CAST(1 AS BIT)
         WHEN CAST({active_expr} AS NVARCHAR(50)) IN (N'0', N'false', N'FALSE', N'non') THEN CAST(0 AS BIT)
-        ELSE CASE WHEN TRY_CAST({active_expr} AS INT) = 1 THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END
+        ELSE CASE WHEN TRY_CAST({active_expr} AS INT) = 0 THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END
     END AS en_activite
 FROM {article_table} a
 WHERE 1=1
 ",
+        limit = limit,
         id_expr = resolved
-            .article_id
+            .col_id
             .as_ref()
-            .map(|column| qualify("a", column))
-            .unwrap_or_else(|| qualify("a", &resolved.article_code)),
-        code_expr = qualify("a", &resolved.article_code),
-        label_expr = qualify("a", &resolved.article_libelle),
+            .map(|column| sage_entity_service::qualify("a", column))
+            .unwrap_or_else(|| sage_entity_service::qualify("a", &resolved.col_code)),
+        code_expr = sage_entity_service::qualify("a", &resolved.col_code),
+        label_expr = sage_entity_service::qualify("a", &resolved.col_libelle),
         pu_expr = resolved
-            .article_pu
+            .col_pu
             .as_ref()
-            .map(|column| qualify("a", column))
+            .map(|column| sage_entity_service::qualify("a", column))
             .unwrap_or_else(|| "0".to_string()),
         tva_expr = resolved
-            .article_tva
+            .col_tva
             .as_ref()
-            .map(|column| qualify("a", column))
+            .map(|column| sage_entity_service::qualify("a", column))
             .unwrap_or_else(|| "0".to_string()),
         unite_expr = resolved
-            .article_unite
+            .col_unite
             .as_ref()
-            .map(|column| qualify("a", column))
+            .map(|column| sage_entity_service::qualify("a", column))
             .unwrap_or_else(|| "N''".to_string()),
         ref_expr = resolved
-            .article_ref
+            .col_ref
             .as_ref()
-            .map(|column| qualify("a", column))
-            .unwrap_or_else(|| qualify("a", &resolved.article_code)),
+            .map(|column| sage_entity_service::qualify("a", column))
+            .unwrap_or_else(|| sage_entity_service::qualify("a", &resolved.col_code)),
         active_expr = resolved
-            .article_active
+            .col_active
             .as_ref()
-            .map(|column| qualify("a", column))
+            .map(|column| sage_entity_service::qualify("a", column))
             .unwrap_or_else(|| "NULL".to_string()),
-        article_table = resolved.article.quoted_name(),
+        article_table = resolved.table.quoted_name(),
     );
-    if let Some(value) = search.as_ref().filter(|value| !value.trim().is_empty()) {
-        let search_value = format!("%{}%", value.trim());
+    if let Some(value) = normalized_search.as_ref() {
+        let search_value = format!("%{}%", value.replace('\'', "''"));
         sql.push_str(&format!(
-            " AND (CAST({} AS NVARCHAR(100)) LIKE {} OR CAST({} AS NVARCHAR(255)) LIKE {})",
-            qualify("a", &resolved.article_code),
-            sql_string(&search_value),
-            qualify("a", &resolved.article_libelle),
-            sql_string(&search_value),
+            " AND (
+                CAST({} AS NVARCHAR(100)) LIKE {}
+                OR CAST({} AS NVARCHAR(255)) LIKE {}
+                OR CAST({} AS NVARCHAR(100)) LIKE {}
+            )",
+            sage_entity_service::qualify("a", &resolved.col_code),
+            sage_entity_service::sql_string(&search_value),
+            sage_entity_service::qualify("a", &resolved.col_libelle),
+            sage_entity_service::sql_string(&search_value),
+            resolved
+                .col_ref
+                .as_ref()
+                .map(|column| sage_entity_service::qualify("a", column))
+                .unwrap_or_else(|| "N''".to_string()),
+            sage_entity_service::sql_string(&search_value),
         ));
     }
-    sql.push_str(&format!(" ORDER BY {} ASC", qualify("a", &resolved.article_code)));
+    sql.push_str(&format!(
+        " ORDER BY {} ASC",
+        sage_entity_service::qualify("a", &resolved.col_code)
+    ));
 
-    let data = db::execute_raw_query(&mut client, &sql).await?;
+    let data = db::execute_logged_query(
+        &mut client,
+        &sql,
+        db::QueryExecutionContext::new("list_articles", "invoice_search_articles")
+            .with_connection_id(id.clone())
+            .with_database(connection.database.clone())
+            .with_table(resolved.table.quoted_name())
+            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+    )
+    .await?;
     let mut result: Vec<ArticleSummary> = data
         .rows
         .iter()
         .map(|row| ArticleSummary {
-            id: parse_string(row.first()),
-            code: parse_string(row.get(1)),
-            libelle: parse_string(row.get(2)),
-            prix_ht: round2(parse_f64(row.get(3))),
-            taux_tva: round2(parse_f64(row.get(4))),
-            unite: parse_string(row.get(5)),
-            reference: parse_string(row.get(6)),
-            en_activite: parse_bool(row.get(7)),
+            id: sage_entity_service::parse_string(row.first()),
+            code: sage_entity_service::parse_string(row.get(1)),
+            libelle: sage_entity_service::parse_string(row.get(2)),
+            prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
+            taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
+            unite: sage_entity_service::parse_string(row.get(5)),
+            reference: sage_entity_service::parse_string(row.get(6)),
+            en_activite: sage_entity_service::parse_bool(row.get(7)),
         })
         .collect();
 
     // Merge locally-created articles from SDB_ARTICLE
-    let local_sql = build_local_article_sql(search.as_deref());
-    if let Ok(local_data) = db::execute_raw_query(&mut client, &local_sql).await {
-        let native_codes: std::collections::HashSet<String> = result.iter().map(|a| a.code.to_lowercase()).collect();
+    let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
+    if let Ok(local_data) = db::execute_logged_query(
+        &mut client,
+        &local_sql,
+        db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local_merge")
+            .with_connection_id(id.clone())
+            .with_database(connection.database.clone())
+            .with_table(LOCAL_ARTICLE_TABLE)
+            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+    )
+    .await
+    {
+        let native_ids: std::collections::HashSet<String> =
+            result.iter().map(|a| a.code.to_lowercase()).collect();
         for row in &local_data.rows {
             let entry = ArticleSummary {
-                id: parse_string(row.first()),
-                code: parse_string(row.get(1)),
-                libelle: parse_string(row.get(2)),
-                prix_ht: round2(parse_f64(row.get(3))),
-                taux_tva: round2(parse_f64(row.get(4))),
-                unite: parse_string(row.get(5)),
-                reference: parse_string(row.get(6)),
-                en_activite: parse_bool(row.get(7)),
+                id: sage_entity_service::parse_string(row.first()),
+                code: sage_entity_service::parse_string(row.get(1)),
+                libelle: sage_entity_service::parse_string(row.get(2)),
+                prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
+                taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
+                unite: sage_entity_service::parse_string(row.get(5)),
+                reference: sage_entity_service::parse_string(row.get(6)),
+                en_activite: sage_entity_service::parse_bool(row.get(7)),
             };
-            if !native_codes.contains(&entry.code.to_lowercase()) {
+            if !native_ids.contains(&entry.code.to_lowercase()) {
                 result.push(entry);
             }
         }
     }
     result.sort_by(|a, b| a.code.to_lowercase().cmp(&b.code.to_lowercase()));
+    result.truncate(limit as usize);
     Ok(result)
 }
 
-fn build_local_article_sql(search: Option<&str>) -> String {
+fn build_local_article_sql(search: Option<&str>, limit: u32) -> String {
     let mut sql = format!(
-        "SELECT [id],[code],COALESCE([libelle],N'') AS libelle,COALESCE([prix_ht],0) AS prix_ht,COALESCE([taux_tva],0) AS taux_tva,COALESCE([unite],N'') AS unite,COALESCE([reference],N'') AS reference,[en_activite] FROM [dbo].[{table}] WHERE 1=1",
+        "SELECT TOP ({limit}) [id],[code],COALESCE([libelle],N'') AS libelle,COALESCE([prix_ht],0) AS prix_ht,COALESCE([taux_tva],0) AS taux_tva,COALESCE([unite],N'') AS unite,COALESCE([reference],N'') AS reference,[en_activite] FROM [dbo].[{table}] WHERE 1=1",
+        limit = limit,
         table = LOCAL_ARTICLE_TABLE
     );
     if let Some(s) = search.filter(|s| !s.trim().is_empty()) {
         let val = format!("%{}%", s.trim().replace('\'', "''"));
         sql.push_str(&format!(
-            " AND ([code] LIKE N'{}' OR [libelle] LIKE N'{}')",
-            val, val
+            " AND ([code] LIKE N'{}' OR [libelle] LIKE N'{}' OR [reference] LIKE N'{}')",
+            val, val, val
         ));
     }
     sql.push_str(" ORDER BY [code] ASC");
@@ -2757,8 +2993,8 @@ pub async fn create_tiers(
     id: String,
     mut tiers: TiersSummary,
 ) -> Result<TiersSummary, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     tiers.id = format!("sdb-{}", Uuid::new_v4());
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -2790,8 +3026,8 @@ pub async fn update_tiers(
     id: String,
     tiers: TiersSummary,
 ) -> Result<TiersSummary, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sql = format!(
@@ -2821,8 +3057,8 @@ pub async fn delete_tiers(
     id: String,
     tiers_id: String,
 ) -> Result<(), String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let sql = format!(
         "DELETE FROM [dbo].[{table}] WHERE [id]={id}",
@@ -2839,8 +3075,8 @@ pub async fn create_article(
     id: String,
     mut article: ArticleSummary,
 ) -> Result<ArticleSummary, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     article.id = format!("sdb-{}", Uuid::new_v4());
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -2867,8 +3103,8 @@ pub async fn update_article(
     id: String,
     article: ArticleSummary,
 ) -> Result<ArticleSummary, String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sql = format!(
@@ -2894,8 +3130,8 @@ pub async fn delete_article(
     id: String,
     article_id: String,
 ) -> Result<(), String> {
-    let connection = load_connection_config(&state, &id)?;
-    let mut client = db::connect(&connection).await?;
+    let _connection = load_connection_config(&state, &id)?;
+    let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let sql = format!(
         "DELETE FROM [dbo].[{table}] WHERE [id]={id}",

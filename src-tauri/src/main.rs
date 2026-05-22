@@ -6,6 +6,7 @@ mod commands;
 mod db;
 mod invoice_commands;
 mod invoice_compat;
+mod sage_entity_service;
 mod network_scan;
 mod pdf_engine;
 mod sage_compat;
@@ -13,7 +14,33 @@ mod state;
 
 use state::AppState;
 
+#[cfg(target_os = "windows")]
+fn configure_windows_webview2() {
+    use std::path::PathBuf;
+
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some() {
+        return;
+    }
+
+    let base_dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+    let webview_dir: PathBuf = base_dir.join("SageDataBridge").join("WebView2");
+
+    if let Err(err) = std::fs::create_dir_all(&webview_dir) {
+        eprintln!(
+            "failed to prepare WebView2 user data folder at {}: {}",
+            webview_dir.display(),
+            err
+        );
+        return;
+    }
+
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    configure_windows_webview2();
+
     tauri::Builder::default()
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![

@@ -6,6 +6,40 @@ import * as XLSX from "xlsx";
 // Re-export tauri invoke for easy mocking/testing
 export { invoke };
 
+const DASHBOARD_TIMEOUT_MS = 40_000;
+const INVOICE_TIMEOUT_MS = 30_000;
+const SEARCH_TIMEOUT_MS = 15_000;
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timeoutId = globalThis.setTimeout(() => {
+        reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timeoutId) globalThis.clearTimeout(timeoutId);
+  });
+}
+
+function invokeWithTimeout(command, payload, { timeoutMs, label }) {
+  return withTimeout(invoke(command, payload), timeoutMs, label);
+}
+
+function logInvoiceRequest(scope, payload) {
+  console.debug("[invoice]", scope, "request", payload);
+}
+
+function logInvoiceResponse(scope, meta) {
+  console.debug("[invoice]", scope, "response", meta);
+}
+
+function logInvoiceError(scope, error, payload) {
+  console.error("[invoice]", scope, "error", { error: String(error), payload });
+}
+
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 export const hasPassword = () => invoke("has_password");
@@ -71,10 +105,18 @@ export const clearQueryHistory = (connectionId = null) =>
 // ─── Analytics / Dashboard ───────────────────────────────────────────────────
 
 export const getGrandLivre = (id, dateFrom, dateTo, accountPrefix = null) =>
-  invoke("get_grand_livre", { id, dateFrom, dateTo, accountPrefix });
+  invokeWithTimeout(
+    "get_grand_livre",
+    { id, dateFrom, dateTo, accountPrefix },
+    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Grand livre" },
+  );
 
 export const getBalance = (id, dateFrom, dateTo, accountPrefix = null) =>
-  invoke("get_balance", { id, dateFrom, dateTo, accountPrefix });
+  invokeWithTimeout(
+    "get_balance",
+    { id, dateFrom, dateTo, accountPrefix },
+    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Balance" },
+  );
 
 export const getGrandLivreAuxiliaire = (
   id,
@@ -82,16 +124,24 @@ export const getGrandLivreAuxiliaire = (
   dateTo,
   tiersType,
   accountPrefix = null,
-) => invoke("get_grand_livre_auxiliaire", {
-  id,
-  dateFrom,
-  dateTo,
-  tiersType,
-  accountPrefix,
-});
+) => invokeWithTimeout(
+  "get_grand_livre_auxiliaire",
+  {
+    id,
+    dateFrom,
+    dateTo,
+    tiersType,
+    accountPrefix,
+  },
+  { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Auxiliary ledger" },
+);
 
 export const getDashboardKpis = (id, dateFrom, dateTo, accountPrefix = null) =>
-  invoke("get_dashboard_kpis", { id, dateFrom, dateTo, accountPrefix });
+  invokeWithTimeout(
+    "get_dashboard_kpis",
+    { id, dateFrom, dateTo, accountPrefix },
+    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Dashboard overview" },
+  );
 
 export const fetchTableRows = async (
   id,
@@ -199,17 +249,43 @@ export const listInvoices = (id, {
   statut = null,
   tiersId = null,
   search = null,
-} = {}) => invoke("list_invoices", {
-  id,
-  dateFrom,
-  dateTo,
-  nature,
-  statut,
-  tiersId,
-  search,
-});
+} = {}) => {
+  const payload = {
+    id,
+    dateFrom,
+    dateTo,
+    nature,
+    statut,
+    tiersId,
+    search,
+  };
+  logInvoiceRequest("listInvoices", payload);
+  return invokeWithTimeout("list_invoices", payload, {
+    timeoutMs: INVOICE_TIMEOUT_MS,
+    label: "Invoice list",
+  }).then((items) => {
+    logInvoiceResponse("listInvoices", { status: "success", count: items.length });
+    return items;
+  }).catch((error) => {
+    logInvoiceError("listInvoices", error, payload);
+    throw error;
+  });
+};
 
-export const getInvoice = (id, pieceId) => invoke("get_invoice", { id, pieceId });
+export const getInvoice = (id, pieceId) => {
+  const payload = { id, pieceId };
+  logInvoiceRequest("getInvoice", payload);
+  return invokeWithTimeout("get_invoice", payload, {
+    timeoutMs: INVOICE_TIMEOUT_MS,
+    label: "Invoice detail",
+  }).then((item) => {
+    logInvoiceResponse("getInvoice", { status: "success", pieceId: item?.id || pieceId });
+    return item;
+  }).catch((error) => {
+    logInvoiceError("getInvoice", error, payload);
+    throw error;
+  });
+};
 export const createInvoice = (id, invoice) => invoke("create_invoice", { id, invoice });
 export const updateInvoice = (id, invoice) => invoke("update_invoice", { id, invoice });
 
@@ -223,11 +299,32 @@ export const updateStatut = (id, pieceId, newStatut, updatedBy = "") => invoke("
 export const deleteInvoice = (id, pieceId) => invoke("delete_invoice", { id, pieceId });
 export const comptabiliserInvoice = (id, pieceId) => invoke("comptabiliser_invoice", { id, pieceId });
 
-export const listTiers = (id, typeTiers = "all", search = null) => invoke("list_tiers", {
-  id,
-  typeTiers,
-  search,
-});
+export const listTiers = (id, typeTiers = "all", search = null, { limit = 40 } = {}) =>
+  invokeWithTimeout("list_tiers", {
+    id,
+    typeTiers,
+    search,
+    limit,
+  }, {
+    timeoutMs: SEARCH_TIMEOUT_MS,
+    label: "Tiers search",
+  });
+
+export const searchTiers = (id, query, typeTiers = "all", { limit = 40 } = {}) => {
+  const payload = { id, typeTiers, search: query || null, limit };
+  logInvoiceRequest("searchTiers", payload);
+  return invokeWithTimeout("list_tiers", payload, {
+    timeoutMs: SEARCH_TIMEOUT_MS,
+    label: "Tiers search",
+  }).then((items) => {
+    logInvoiceResponse("searchTiers", { status: "success", count: items.length });
+    return items;
+  }).catch((error) => {
+    logInvoiceError("searchTiers", error, payload);
+    throw error;
+  });
+};
+
 const normalizeTiersPayload = (tiers = {}) => ({
   id: tiers.id ?? "",
   code: tiers.code ?? "",
@@ -256,7 +353,27 @@ export const updateTiers = (id, tiers) => invoke("update_tiers", {
 });
 export const deleteTiers = (id, tiersId) => invoke("delete_tiers", { id, tiersId });
 
-export const listArticles = (id, search = null) => invoke("list_articles", { id, search });
+export const listArticles = (id, search = null, { limit = 40 } = {}) =>
+  invokeWithTimeout("list_articles", { id, search, limit }, {
+    timeoutMs: SEARCH_TIMEOUT_MS,
+    label: "Article search",
+  });
+
+export const searchArticles = (id, query, { limit = 40 } = {}) => {
+  const payload = { id, search: query || null, limit };
+  logInvoiceRequest("searchArticles", payload);
+  return invokeWithTimeout("list_articles", payload, {
+    timeoutMs: SEARCH_TIMEOUT_MS,
+    label: "Article search",
+  }).then((items) => {
+    logInvoiceResponse("searchArticles", { status: "success", count: items.length });
+    return items;
+  }).catch((error) => {
+    logInvoiceError("searchArticles", error, payload);
+    throw error;
+  });
+};
+
 export const createArticle = (id, article) => invoke("create_article", { id, article });
 export const updateArticle = (id, article) => invoke("update_article", { id, article });
 export const deleteArticle = (id, articleId) => invoke("delete_article", { id, articleId });

@@ -142,7 +142,7 @@ pub struct Filter {
     pub column: String,
     pub operator: String, // =, !=, >, <, >=, <=, LIKE, NOT LIKE, IS NULL, IS NOT NULL, BETWEEN, IN
     pub value: Option<String>,
-    pub value2: Option<String>, // for BETWEEN
+    pub value2: Option<String>,    // for BETWEEN
     pub data_type: Option<String>, // hint for value quoting
 }
 
@@ -299,6 +299,16 @@ impl AppState {
             .find(|connection| connection.id == id)
             .cloned()
             .ok_or_else(|| format!("Connection '{}' not found", id))
+    }
+
+    pub fn get_active_connection(&self, id: &str) -> Result<ConnectionConfig, String> {
+        self.resolve_connection_config(id)
+    }
+
+    pub fn invalidate_client_cache(&self, id: &str) -> Result<(), String> {
+        let mut cache = self.client_cache.lock().map_err(|e| e.to_string())?;
+        cache.remove(id);
+        Ok(())
     }
 
     pub fn get_connection_schema(&self, id: &str) -> Option<crate::sage_compat::SageSchema> {
