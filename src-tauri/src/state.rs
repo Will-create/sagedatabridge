@@ -11,6 +11,18 @@ fn default_active_template_id() -> String {
     "builtin-modern".to_string()
 }
 
+fn default_query_timeout_secs() -> u64 {
+    60
+}
+
+fn default_dashboard_timeout_secs() -> u64 {
+    90
+}
+
+fn default_login_timeout_secs() -> u64 {
+    60
+}
+
 /// A saved database connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -220,6 +232,28 @@ pub struct AppConfig {
     pub invoice_templates: Vec<InvoiceTemplate>,
     #[serde(default = "default_active_template_id")]
     pub active_template_id: String,
+    #[serde(default = "default_query_timeout_secs")]
+    pub query_timeout_secs: u64,
+    #[serde(default = "default_dashboard_timeout_secs")]
+    pub dashboard_timeout_secs: u64,
+    #[serde(default = "default_login_timeout_secs")]
+    pub login_timeout_secs: u64,
+    #[serde(default = "default_account_ar")]
+    pub account_ar: String,
+    #[serde(default = "default_account_sales")]
+    pub account_sales: String,
+    #[serde(default = "default_account_vat")]
+    pub account_vat: String,
+}
+
+fn default_account_ar() -> String {
+    "411000".to_string()
+}
+fn default_account_sales() -> String {
+    "701000".to_string()
+}
+fn default_account_vat() -> String {
+    "445710".to_string()
 }
 
 /// Connection status

@@ -212,6 +212,7 @@ export default function App() {
 
     try {
       await switchDatabase(connId, database);
+      getActiveSchemas().then(setActiveSchemas).catch(() => {});
       return openLoadedDatabase(connId, database, nextAdminMode);
     } catch (err) {
       showStatus(t("status_database_failed") + err, "error");
@@ -251,6 +252,7 @@ export default function App() {
     setInvoicingOpen(false);
     showStatus(t("status_connecting"), "idle");
     setStatuses((current) => ({ ...current, [id]: "connecting" }));
+    setGlobalLoading(true);
 
     try {
       await connectDb(id);
@@ -270,6 +272,7 @@ export default function App() {
       showToast({ type: "error", msg: String(err) });
     } finally {
       setDatabasesLoading(false);
+      setGlobalLoading(false);
     }
   }, [activeConnId, activeDatabase, adminMode, connections, openLoadedDatabase, statuses, t]);
 
@@ -284,22 +287,32 @@ export default function App() {
       return;
     }
 
+    setGlobalLoading(true);
     const activated = await activateDatabase(activeConnId, database, adminMode);
-    if (!activated) return;
+    if (!activated) {
+      setGlobalLoading(false);
+      return;
+    }
 
-    if (!activeConnection) return;
+    if (!activeConnection) {
+      setGlobalLoading(false);
+      return;
+    }
 
     try {
       const saved = await saveConnection({
         ...activeConnection,
+        id: activeConnId, // Ensure ID is preserved
         name: connectionDisplayName(activeConnection, database),
         database,
       });
       setConnections((current) => upsertConnection(current, saved));
     } catch (error) {
       showToast({ type: "error", msg: String(error) });
+    } finally {
+      setGlobalLoading(false);
     }
-  }, [activeConnId, activeConnection, activeDatabase, activateDatabase, adminMode]);
+  }, [activeConnId, activeConnection, activeDatabase, activateDatabase, adminMode, showToast]);
 
   const handleDuplicateWithDatabase = useCallback(async (baseConnection, database) => {
     if (!baseConnection || !database) return;
@@ -311,7 +324,7 @@ export default function App() {
       // 1. Create new connection object
       const newConn = {
         ...baseConnection,
-        id: undefined, // Let backend generate new ID or we'll get it from save
+        id: "",
         name: connectionDisplayName(baseConnection, database),
         database,
       };
@@ -632,6 +645,15 @@ export default function App() {
           onClose={() => setTemplateDesignerOpen(false)}
         />
       ) : null}
+
+      {globalLoading && (
+        <div className="global-overlay">
+          <div className="empty-state">
+            <div className="spinner" style={{ width: 40, height: 40, borderWidth: 3 }} />
+            <p style={{ marginTop: 12, fontSize: 14, fontWeight: 500 }}>{t("loading")}</p>
+          </div>
+        </div>
+      )}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>

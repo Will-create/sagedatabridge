@@ -6,10 +6,10 @@ mod commands;
 mod db;
 mod invoice_commands;
 mod invoice_compat;
-mod sage_entity_service;
 mod network_scan;
 mod pdf_engine;
 mod sage_compat;
+mod sage_entity_service;
 mod state;
 
 use state::AppState;
@@ -57,6 +57,9 @@ fn main() {
             commands::set_admin_password,
             commands::verify_admin_password,
             commands::remove_admin_password,
+            // Settings
+            commands::get_settings,
+            commands::save_settings,
             // Field history
             commands::get_field_history,
             commands::save_field_history,

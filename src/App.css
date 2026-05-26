@@ -231,6 +231,11 @@ html, body, #root {
   flex-shrink: 0;
 }
 
+.sidebar.disabled {
+  pointer-events: none;
+  opacity: 0.7;
+}
+
 .sidebar-scroll {
   flex: 1;
   overflow-y: auto;
@@ -2059,6 +2064,17 @@ select { appearance: none; cursor: pointer; }
 .toast.error { border-color: var(--red); }
 .toast.error svg { color: var(--red); }
 
+.global-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 @keyframes toastIn {
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -2089,7 +2105,27 @@ select { appearance: none; cursor: pointer; }
 }
 
 .context-menu-item:hover { background: var(--bg-hover); color: var(--text-hi); }
+.context-menu-item.active { background: var(--accent-mute); color: var(--accent); }
 .context-menu-item.danger:hover { background: var(--danger-bg); color: var(--red); }
+.context-menu-item.disabled { opacity: 0.5; cursor: default; }
+
+.context-menu-item {
+  position: relative;
+}
+
+.context-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  background: var(--bg-modal);
+  border: 1px solid var(--border-mid);
+  border-radius: var(--r-md);
+  padding: 4px;
+  min-width: 160px;
+  max-height: 400px;
+  overflow-y: auto;
+  box-shadow: var(--shadow-pop);
+}
 
 .context-menu-sep {
   height: 1px;
@@ -3625,7 +3661,15 @@ select { appearance: none; cursor: pointer; }
   gap: 12px;
 }
 
+.invoice-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .invoice-searchbox {
+  flex: 1 1 220px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -3635,6 +3679,22 @@ select { appearance: none; cursor: pointer; }
   padding: 0 12px;
   min-height: 42px;
   color: var(--text-lo);
+}
+
+.invoice-search-count {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-mid);
+  background: linear-gradient(180deg, var(--bg-elevated), rgba(255, 255, 255, 0.02));
+  color: var(--text-mid);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .invoice-searchbox.directory {
@@ -3950,15 +4010,36 @@ select { appearance: none; cursor: pointer; }
 }
 
 .invoice-history-item {
-  display: grid;
-  grid-template-columns: 180px 1fr 120px;
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
   background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  font-size: 11.5px;
+}
+
+.invoice-history-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.invoice-history-item-top span {
+  color: var(--text-lo);
+  font-family: var(--font-mono);
+}
+
+.invoice-history-item-main {
+  font-weight: 500;
+  color: var(--text-hi);
+}
+
+.invoice-history-item-actor {
   color: var(--text-mid);
-  font-size: 11px;
+  font-style: italic;
 }
 
 .invoice-kpi-grid.compact {
@@ -3976,6 +4057,88 @@ select { appearance: none; cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* ─── Invoicing Refinements ─────────────────────────── */
+.invoicing-layout.list-collapsed {
+  grid-template-columns: 42px minmax(0, 1fr);
+}
+
+.invoicing-layout.list-collapsed .invoice-list-panel {
+  display: none;
+}
+
+.invoice-list-header {
+  display: flex;
+  align-items: flex-start;
+  padding-right: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.invoice-list-header .invoice-list-toolbar {
+  flex: 1;
+  border-bottom: 0;
+  padding-right: 4px;
+}
+
+.invoice-list-header .panel-header-btn {
+  margin-top: 16px;
+}
+
+.invoice-editor.compact {
+  gap: 8px;
+}
+
+.invoice-editor.compact .invoice-editor-card {
+  padding: 12px;
+  border-radius: 12px;
+}
+
+.invoice-editor.compact .invoice-editor-grid {
+  gap: 8px 12px;
+}
+
+.invoice-editor.compact .invoice-editor-grid label span,
+.invoice-editor.compact .invoice-editor-label {
+  font-size: 9px;
+  margin-bottom: 2px;
+}
+
+.invoice-editor.compact input,
+.invoice-editor.compact select,
+.invoice-editor.compact textarea,
+.invoice-lines-table.compact input,
+.invoice-lines-table.compact select {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+
+.invoice-lines-table.compact th,
+.invoice-lines-table.compact td {
+  padding: 4px 6px;
+}
+
+.invoice-lines-table.compact thead th {
+  font-size: 9px;
+}
+
+.invoice-editor.compact .invoice-action-bar {
+  margin-bottom: 8px;
+}
+
+.invoice-editor.compact .invoice-totals-layout {
+  gap: 8px;
+}
+
+.invoice-editor.compact .invoice-detail-row {
+  padding: 4px 0;
+}
+
+.invoice-editor.compact .invoice-grand-total {
+  margin-top: 8px;
+  padding-top: 8px;
+  font-size: 16px;
 }
 
 .invoice-kpi-card span {

@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import {
+  getSettings,
   hasAdminPassword,
   hasPin,
   removeAdminPassword,
   removePin,
+  saveSettings,
   setAdminPassword,
   setPin,
   verifyAdminPassword,
@@ -30,12 +32,12 @@ function DrawerToggle({ label, hint, checked, disabled = false, onChange }) {
   );
 }
 
-function SecretField({ label, value, onChange, placeholder, inputMode = undefined }) {
+function SecretField({ label, value, onChange, placeholder, inputMode = undefined, type = "password" }) {
   return (
     <label className="settings-secret-field">
       <span>{label}</span>
       <input
-        type="password"
+        type={type}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
@@ -91,19 +93,35 @@ export default function SettingsDrawer({
   const [pinForm, setPinForm] = useState({ current: "", next: "", confirm: "" });
   const [adminForm, setAdminForm] = useState({ current: "", next: "", confirm: "" });
 
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsStatus, setSettingsStatus] = useState({ error: "", success: "" });
+  const [settingsForm, setSettingsForm] = useState({
+    query_timeout_secs: 60,
+    dashboard_timeout_secs: 90,
+    login_timeout_secs: 60,
+    account_ar: "411000",
+    account_sales: "701000",
+    account_vat: "445710",
+  });
+
   useEffect(() => {
     if (!open) return;
 
     let cancelled = false;
     setLoadingSecurity(true);
-    Promise.all([hasPin(), hasAdminPassword()])
-      .then(([nextPinConfigured, nextAdminConfigured]) => {
+    setSettingsLoading(true);
+    Promise.all([hasPin(), hasAdminPassword(), getSettings()])
+      .then(([nextPinConfigured, nextAdminConfigured, currentSettings]) => {
         if (cancelled) return;
         setPinConfigured(nextPinConfigured);
         setAdminPasswordConfigured(nextAdminConfigured);
+        setSettingsForm(currentSettings);
       })
       .finally(() => {
-        if (!cancelled) setLoadingSecurity(false);
+        if (!cancelled) {
+          setLoadingSecurity(false);
+          setSettingsLoading(false);
+        }
       });
 
     return () => {
@@ -119,6 +137,7 @@ export default function SettingsDrawer({
       setAdminUnlock({ visible: false, password: "", error: "", loading: false });
       setPinForm({ current: "", next: "", confirm: "" });
       setAdminForm({ current: "", next: "", confirm: "" });
+      setSettingsStatus({ error: "", success: "" });
     }
   }, [open]);
 
@@ -264,6 +283,26 @@ export default function SettingsDrawer({
     }
   };
 
+  const handleSaveSettings = async () => {
+    setSettingsLoading(true);
+    setSettingsStatus({ error: "", success: "" });
+    try {
+      await saveSettings({
+        query_timeout_secs: Number(settingsForm.query_timeout_secs),
+        dashboard_timeout_secs: Number(settingsForm.dashboard_timeout_secs),
+        login_timeout_secs: Number(settingsForm.login_timeout_secs),
+        account_ar: String(settingsForm.account_ar),
+        account_sales: String(settingsForm.account_sales),
+        account_vat: String(settingsForm.account_vat),
+      });
+      setSettingsStatus({ error: "", success: t("settings_saved") || "Settings saved!" });
+    } catch (err) {
+      setSettingsStatus({ error: String(err), success: "" });
+    } finally {
+      setSettingsLoading(false);
+    }
+  };
+
   return (
     <div className="settings-drawer-overlay" onClick={(event) => event.target === event.currentTarget && onClose()}>
       <aside className="settings-drawer settings-drawer-wide">
@@ -282,6 +321,7 @@ export default function SettingsDrawer({
         <div className="settings-tabs">
           <TabButton active={activeTab === "general"} label={t("settings_tab_general")} onClick={() => setActiveTab("general")} />
           <TabButton active={activeTab === "security"} label={t("settings_tab_security")} onClick={() => setActiveTab("security")} />
+          <TabButton active={activeTab === "advanced"} label={t("settings_tab_advanced") || "Advanced"} onClick={() => setActiveTab("advanced")} />
           <TabButton active={activeTab === "about"} label={t("settings_tab_about")} onClick={() => setActiveTab("about")} />
         </div>
 
@@ -371,6 +411,79 @@ export default function SettingsDrawer({
                 </div>
                 <span className="settings-link-arrow">›</span>
               </button>
+            </div>
+          ) : null}
+
+          {activeTab === "advanced" ? (
+            <div className="settings-panel-grid">
+              <div className="settings-secret-card">
+                <div className="settings-secret-copy">
+                  <strong>{t("settings_timeouts_title") || "Database Timeouts"}</strong>
+                  <span>{t("settings_timeouts_hint") || "Configure request durations for large databases."}</span>
+                </div>
+
+                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <SecretField
+                    label={t("settings_query_timeout") || "Query Timeout (s)"}
+                    value={settingsForm.query_timeout_secs}
+                    type="number"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, query_timeout_secs: val }))}
+                    inputMode="numeric"
+                  />
+                  <SecretField
+                    label={t("settings_dashboard_timeout") || "Dashboard Timeout (s)"}
+                    value={settingsForm.dashboard_timeout_secs}
+                    type="number"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, dashboard_timeout_secs: val }))}
+                    inputMode="numeric"
+                  />
+                  <SecretField
+                    label={t("settings_login_timeout") || "Login Timeout (s)"}
+                    value={settingsForm.login_timeout_secs}
+                    type="number"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, login_timeout_secs: val }))}
+                    inputMode="numeric"
+                  />
+                </div>
+              </div>
+
+              <div className="settings-secret-card">
+                <div className="settings-secret-copy">
+                  <strong>{t("settings_accounting_title") || "Accounting Integration"}</strong>
+                  <span>{t("settings_accounting_hint") || "Configure ledger account codes for invoice posting."}</span>
+                </div>
+
+                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <SecretField
+                    label={t("settings_account_ar") || "Accounts Receivable (Client)"}
+                    value={settingsForm.account_ar}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, account_ar: val }))}
+                  />
+                  <SecretField
+                    label={t("settings_account_sales") || "Sales Account (Vente)"}
+                    value={settingsForm.account_sales}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, account_sales: val }))}
+                  />
+                  <SecretField
+                    label={t("settings_account_vat") || "VAT Account (TVA)"}
+                    value={settingsForm.account_vat}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, account_vat: val }))}
+                  />
+                </div>
+
+                {settingsStatus.error ? <div className="settings-feedback error">{settingsStatus.error}</div> : null}
+                {settingsStatus.success ? <div className="settings-feedback success">{settingsStatus.success}</div> : null}
+
+                <div className="settings-actions">
+                  <span />
+                  <button type="button" className="btn btn-accent" onClick={handleSaveSettings} disabled={settingsLoading}>
+                    {settingsLoading ? t("saving") : t("save")}
+                  </button>
+                </div>
+              </div>
             </div>
           ) : null}
 

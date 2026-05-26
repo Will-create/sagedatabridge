@@ -89,10 +89,13 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function formatCurrency(value, devise = "EUR") {
+function formatCurrency(value, devise = "XOF") {
+  const isXof = (devise || "XOF").toUpperCase() === "XOF";
   return new Intl.NumberFormat("fr-FR", {
     style: "currency",
-    currency: devise || "EUR",
+    currency: devise || "XOF",
+    minimumFractionDigits: isXof ? 0 : 2,
+    maximumFractionDigits: isXof ? 0 : 2,
   }).format(Number(value) || 0);
 }
 
@@ -147,7 +150,7 @@ function buildBlankInvoice(nature = "Facture", template = null) {
     nature,
     statut: nature === "Proforma" ? "Proforma" : nature === "Commande" ? "Bon_Commande" : "Brouillon",
     reference: "",
-    devise: "EUR",
+    devise: "XOF",
     total_ht: 0,
     total_tva: 0,
     total_ttc: 0,
@@ -193,7 +196,7 @@ function computeInvoice(invoice) {
 
   return {
     ...invoice,
-    devise: invoice.devise || "EUR",
+    devise: invoice.devise || "XOF",
     remise_globale: remiseGlobale,
     lignes,
     total_ht: totalHt,
@@ -211,6 +214,7 @@ function duplicateInvoice(invoice) {
     statut: "Brouillon",
     statut_history: [],
     date: todayIso(),
+    devise: invoice.devise || "XOF",
     lignes: invoice.lignes.map((line, index) => ({
       ...line,
       id: `line-copy-${Date.now()}-${index + 1}`,
@@ -739,6 +743,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const { t } = useT();
 
   const [activeTab, setActiveTab] = useState("factures");
+  const [listCollapsed, setListCollapsed] = useState(false);
   const [documents, setDocuments] = useState([]);
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [documentsError, setDocumentsError] = useState("");
@@ -753,6 +758,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [saving, setSaving] = useState(false);
+  const [actionBusy, setActionBusy] = useState("");
   const [templates, setTemplates] = useState([]);
   const [templateId, setTemplateId] = useState(EMPTY_TEMPLATE_ID);
   const [previewHtml, setPreviewHtml] = useState("");
@@ -777,17 +783,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const debouncedTierSearch = useDebouncedValue(tierSearch, 300);
   const debouncedArticleSearch = useDebouncedValue(articleSearch, 300);
   const documentTab = DOCUMENT_TABS.find((tab) => tab.id === activeTab) ?? null;
-  const directoryTab = DIRECTORY_TABS.find((tab) => tab.id === activeTab) ?? null;
-  const directoryTierType = directoryTab?.type ?? "all";
 
-  const loadDirectoryTiers = useCallback(
-    async (query = "") => searchTiers(connId, query, directoryTierType, { limit: 60 }),
-    [connId, directoryTierType],
-  );
-  const loadDirectoryArticles = useCallback(
-    async (query = "") => searchArticles(connId, query, { limit: 60 }),
-    [connId],
-  );
   const loadEditorTiers = useCallback(
     async (query = "") => searchTiers(connId, query, "all", { limit: 20 }),
     [connId],
@@ -818,7 +814,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     if (!connId) return Promise.resolve([]);
     setTiersLoading(true);
     setTiersError("");
-    return loadDirectoryTiers(debouncedTierSearch)
+    return searchTiers(connId, debouncedTierSearch, "all", { limit: 60 })
       .then((items) => {
         setTiers(items);
         return items;
@@ -829,13 +825,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         return [];
       })
       .finally(() => setTiersLoading(false));
-  }, [connId, debouncedTierSearch, loadDirectoryTiers]);
+  }, [connId, debouncedTierSearch]);
 
   const refreshArticles = useCallback(() => {
     if (!connId) return Promise.resolve([]);
     setArticlesLoading(true);
     setArticlesError("");
-    return loadDirectoryArticles(debouncedArticleSearch)
+    return searchArticles(connId, debouncedArticleSearch, { limit: 60 })
       .then((items) => {
         setArticles(items);
         return items;
@@ -846,55 +842,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         return [];
       })
       .finally(() => setArticlesLoading(false));
-  }, [connId, debouncedArticleSearch, loadDirectoryArticles]);
-
-  useEffect(() => {
-    if (!connId || !directoryTab?.type) return undefined;
-    let cancelled = false;
-
-    if (directoryTab.type === "articles") {
-      setArticlesLoading(true);
-      setArticlesError("");
-      loadDirectoryArticles(debouncedArticleSearch)
-        .then((items) => {
-          if (!cancelled) setArticles(items);
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          setArticles([]);
-          setArticlesError(String(error));
-        })
-        .finally(() => {
-          if (!cancelled) setArticlesLoading(false);
-        });
-    } else {
-      setTiersLoading(true);
-      setTiersError("");
-      loadDirectoryTiers(debouncedTierSearch)
-        .then((items) => {
-          if (!cancelled) setTiers(items);
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          setTiers([]);
-          setTiersError(String(error));
-        })
-        .finally(() => {
-          if (!cancelled) setTiersLoading(false);
-        });
-    }
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    connId,
-    debouncedArticleSearch,
-    debouncedTierSearch,
-    directoryTab?.type,
-    loadDirectoryArticles,
-    loadDirectoryTiers,
-  ]);
+  }, [connId, debouncedArticleSearch]);
 
   useEffect(() => {
     if (!connId || !documentTab) return;
@@ -979,6 +927,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   );
 
   const workingInvoice = mode === "edit" ? editorInvoice : selectedInvoice;
+  const actionPending = actionBusy !== "";
   const currentStatus = workingInvoice?.statut || "Brouillon";
   const nextStatuses = STATUS_TRANSITIONS[currentStatus] || [];
 
@@ -1003,14 +952,32 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const saveCurrentInvoice = async (openPreviewAfter = false) => {
     if (!editorInvoice) return;
+
+    // Basic validation
+    if (!editorInvoice.tiers_id) {
+      alert(t("invoice_validation_client_required") || "Veuillez sélectionner un tiers.");
+      return;
+    }
+    if (!editorInvoice.lignes || editorInvoice.lignes.length === 0) {
+      alert(t("invoice_validation_lines_required") || "L'invoice doit comporter au moins une ligne.");
+      return;
+    }
+
     setSaving(true);
     try {
       const payload = computeInvoice(editorInvoice);
       const saved = payload.id ? await updateInvoice(connId, payload) : await createInvoice(connId, payload);
+
       setSelectedId(saved.id);
       setSelectedInvoice(saved);
       setEditorInvoice(saved);
-      setMode(openPreviewAfter ? "preview" : "view");
+
+      if (openPreviewAfter) {
+        await openPreview(saved);
+      } else {
+        setMode("view");
+      }
+
       await listInvoices(connId, {
         nature: documentTab?.nature,
         statut: statutFilter || null,
@@ -1018,44 +985,68 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         dateTo: dateTo || null,
         search: debouncedSearch || null,
       }).then(setDocuments);
-      if (openPreviewAfter) {
-        await openPreview(saved);
-      }
+    } catch (error) {
+      console.error("[invoice] Save error:", error);
+      alert(t("error") + ": " + error);
     } finally {
       setSaving(false);
     }
   };
 
   const handleStatusChange = async (newStatus) => {
-    if (!selectedInvoice?.id) return;
-    await updateStatut(connId, selectedInvoice.id, newStatus, "SDB");
-    await refreshSelectedInvoice(selectedInvoice.id);
-    const items = await listInvoices(connId, {
-      nature: documentTab?.nature,
-      statut: statutFilter || null,
-      dateFrom: dateFrom || null,
-      dateTo: dateTo || null,
-      search: debouncedSearch || null,
-    });
-    setDocuments(items);
+    if (!selectedInvoice?.id || actionPending) return;
+    setActionBusy("status");
+    try {
+      await updateStatut(connId, selectedInvoice.id, newStatus, "SDB");
+      await refreshSelectedInvoice(selectedInvoice.id);
+      const items = await listInvoices(connId, {
+        nature: documentTab?.nature,
+        statut: statutFilter || null,
+        dateFrom: dateFrom || null,
+        dateTo: dateTo || null,
+        search: debouncedSearch || null,
+      });
+      setDocuments(items);
+    } catch (error) {
+      console.error("[invoice] Status update error:", error);
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
   };
 
   const handleDelete = async () => {
-    if (!selectedInvoice?.id) return;
+    if (!selectedInvoice?.id || actionPending) return;
     if (!window.confirm(t("invoice_delete_confirm", selectedInvoice.numero || selectedInvoice.id))) return;
-    await deleteInvoice(connId, selectedInvoice.id);
-    const items = await listInvoices(connId, { nature: documentTab?.nature });
-    setDocuments(items);
-    setSelectedId(items[0]?.id || "");
-    setSelectedInvoice(null);
+    setActionBusy("delete");
+    try {
+      await deleteInvoice(connId, selectedInvoice.id);
+      const items = await listInvoices(connId, { nature: documentTab?.nature });
+      setDocuments(items);
+      setSelectedId(items[0]?.id || "");
+      setSelectedInvoice(null);
+    } catch (error) {
+      console.error("[invoice] Delete error:", error);
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
   };
 
   const handleComptabiliser = async () => {
-    if (!selectedInvoice?.id) return;
-    await comptabiliserInvoice(connId, selectedInvoice.id);
-    await refreshSelectedInvoice(selectedInvoice.id);
-    const items = await listInvoices(connId, { nature: documentTab?.nature });
-    setDocuments(items);
+    if (!selectedInvoice?.id || actionPending) return;
+    setActionBusy("post");
+    try {
+      await comptabiliserInvoice(connId, selectedInvoice.id);
+      await refreshSelectedInvoice(selectedInvoice.id);
+      const items = await listInvoices(connId, { nature: documentTab?.nature });
+      setDocuments(items);
+    } catch (error) {
+      console.error("[invoice] Post error:", error);
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
   };
 
   const handleExportPdf = async () => {
@@ -1135,19 +1126,19 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       const breakdown = getTvaBreakdown(editorInvoice);
 
       return (
-        <div className="invoice-editor">
+        <div className="invoice-editor compact">
           <div className="invoice-action-bar">
-            <button type="button" className="btn" onClick={() => {
+            <button type="button" className="btn btn-sm" onClick={() => {
               setMode("view");
               setEditorInvoice(selectedInvoice);
             }}>
               {t("cancel")}
             </button>
-            <button type="button" className="btn" onClick={() => saveCurrentInvoice(false)} disabled={saving}>
+            <button type="button" className="btn btn-sm" onClick={() => saveCurrentInvoice(false)} disabled={saving}>
               <SaveIcon />
               {t("invoice_save_draft")}
             </button>
-            <button type="button" className="btn btn-accent" onClick={() => saveCurrentInvoice(true)} disabled={saving}>
+            <button type="button" className="btn btn-sm btn-accent" onClick={() => saveCurrentInvoice(true)} disabled={saving}>
               <Eye size={14} />
               {t("invoice_save_and_preview")}
             </button>
@@ -1177,9 +1168,17 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <span>{t("invoice_due_date")}</span>
                 <input type="date" value={editorInvoice.date_echeance} onChange={(event) => updateEditor({ date_echeance: event.target.value })} />
               </label>
-              <label className="span-2">
+              <label>
                 <span>{t("invoice_reference")}</span>
                 <input value={editorInvoice.reference} onChange={(event) => updateEditor({ reference: event.target.value })} />
+              </label>
+              <label>
+                <span>{t("invoice_currency")}</span>
+                <select value={editorInvoice.devise} onChange={(event) => updateEditor({ devise: event.target.value })}>
+                  <option value="EUR">EUR (€)</option>
+                  <option value="USD">USD ($)</option>
+                  <option value="XOF">XOF (CFA)</option>
+                </select>
               </label>
               <div className="span-2">
                 <span className="invoice-editor-label">{t("invoice_customer")}</span>
@@ -1237,14 +1236,14 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           <section className="invoice-editor-card">
             <div className="invoice-editor-section-head">
               <strong>{t("invoice_lines")}</strong>
-              <button type="button" className="btn" onClick={addLine}>
-                <FilePlus2 size={14} />
+              <button type="button" className="btn btn-sm" onClick={addLine}>
+                <FilePlus2 size={13} />
                 {t("invoice_add_line")}
               </button>
             </div>
 
             <div className="invoice-lines-table-wrap">
-              <table className="invoice-lines-table">
+              <table className="invoice-lines-table compact">
                 <thead>
                   <tr>
                     <th>#</th>
@@ -1306,11 +1305,30 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                       <td><input type="number" step="0.01" value={line.prix_ht} onChange={(event) => updateLine(index, { prix_ht: event.target.value })} /></td>
                       <td><input type="number" step="0.01" value={line.remise_pct} onChange={(event) => updateLine(index, { remise_pct: event.target.value })} /></td>
                       <td className="num">{formatCurrency(line.montant_ht, editorInvoice.devise)}</td>
-                      <td><input type="number" step="0.01" value={line.taux_tva} onChange={(event) => updateLine(index, { taux_tva: event.target.value })} /></td>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <input type="number" step="0.01" style={{ width: 60 }} value={line.taux_tva} onChange={(event) => updateLine(index, { taux_tva: event.target.value })} />
+                          <select
+                            style={{ width: 45, padding: "4px 2px" }}
+                            value=""
+                            onChange={(e) => {
+                              if (e.target.value) updateLine(index, { taux_tva: Number(e.target.value) });
+                              e.target.value = "";
+                            }}
+                          >
+                            <option value="">⋯</option>
+                            <option value="18">18%</option>
+                            <option value="20">20%</option>
+                            <option value="10">10%</option>
+                            <option value="5.5">5.5%</option>
+                            <option value="0">0%</option>
+                          </select>
+                        </div>
+                      </td>
                       <td className="num">{formatCurrency(line.montant_ttc, editorInvoice.devise)}</td>
                       <td>
-                        <button type="button" className="btn btn-icon" onClick={() => removeLine(index)}>
-                          <Trash2 size={14} />
+                        <button type="button" className="btn btn-icon btn-sm" onClick={() => removeLine(index)}>
+                          <Trash2 size={13} />
                         </button>
                       </td>
                     </tr>
@@ -1323,11 +1341,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
               <div className="invoice-editor-card subtle">
                 <label>
                   <span>{t("invoice_notes")}</span>
-                  <textarea rows="5" value={editorInvoice.notes} onChange={(event) => updateEditor({ notes: event.target.value })} />
+                  <textarea rows="3" value={editorInvoice.notes} onChange={(event) => updateEditor({ notes: event.target.value })} />
                 </label>
                 <label>
                   <span>{t("invoice_payment_conditions")}</span>
-                  <textarea rows="4" value={editorInvoice.conditions} onChange={(event) => updateEditor({ conditions: event.target.value })} />
+                  <textarea rows="2" value={editorInvoice.conditions} onChange={(event) => updateEditor({ conditions: event.target.value })} />
                 </label>
               </div>
               <div className="invoice-editor-card totals">
@@ -1363,8 +1381,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         <div className="invoice-action-bar">
           <button
             type="button"
-            className="btn"
-            disabled={displayStatus(selectedInvoice.statut) === "Comptabilisé"}
+            className="btn btn-sm"
+            disabled={actionPending || displayStatus(selectedInvoice.statut) === "Comptabilisé"}
             onClick={() => {
               setEditorInvoice(computeInvoice(selectedInvoice));
               setMode("edit");
@@ -1377,7 +1395,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           <select
             className="invoice-inline-select"
             value=""
-            disabled={!nextStatuses.length}
+            disabled={actionPending || !nextStatuses.length}
             onChange={(event) => {
               if (event.target.value) handleStatusChange(event.target.value);
               event.target.value = "";
@@ -1391,18 +1409,18 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             ))}
           </select>
 
-          <button type="button" className="btn" onClick={() => openPreview(selectedInvoice)}>
+          <button type="button" className="btn btn-sm" onClick={() => openPreview(selectedInvoice)} disabled={actionPending}>
             <Eye size={14} />
             {t("invoice_preview")}
           </button>
-          <button type="button" className="btn" onClick={handleExportPdf}>
+          <button type="button" className="btn btn-sm" onClick={handleExportPdf} disabled={actionPending}>
             <BadgeEuro size={14} />
             {t("invoice_export_pdf")}
           </button>
           <button
             type="button"
-            className="btn"
-            disabled={selectedInvoice.nature !== "Facture" || displayStatus(selectedInvoice.statut) === "Comptabilisé"}
+            className="btn btn-sm"
+            disabled={actionPending || selectedInvoice.nature !== "Facture" || displayStatus(selectedInvoice.statut) === "Comptabilisé"}
             onClick={handleComptabiliser}
           >
             <BadgeEuro size={14} />
@@ -1410,7 +1428,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </button>
           <button
             type="button"
-            className="btn"
+            className="btn btn-sm"
+            disabled={actionPending}
             onClick={() => {
               const copy = duplicateInvoice(selectedInvoice);
               setSelectedInvoice(copy);
@@ -1423,8 +1442,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </button>
           <button
             type="button"
-            className="btn btn-danger"
-            disabled={selectedInvoice.statut !== "Brouillon"}
+            className="btn btn-sm btn-danger"
+            disabled={actionPending || selectedInvoice.statut !== "Brouillon"}
             onClick={handleDelete}
           >
             <Trash2 size={14} />
@@ -1526,9 +1545,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           <div className="invoice-history-list">
             {(selectedInvoice.statut_history || []).length ? selectedInvoice.statut_history.map((entry) => (
               <div key={entry.id} className="invoice-history-item">
-                <span>{entry.updated_at}</span>
-                <strong>{displayStatus(entry.from_statut || "Brouillon")} → {displayStatus(entry.to_statut)}</strong>
-                <span>{entry.updated_by || "SDB"}</span>
+                <div className="invoice-history-item-top">
+                  <span>{entry.updated_at}</span>
+                  <span className="invoice-history-item-actor">{entry.updated_by || "SDB"}</span>
+                </div>
+                <div className="invoice-history-item-main">
+                  {displayStatus(entry.from_statut || "Brouillon")} → {displayStatus(entry.to_statut)}
+                </div>
               </div>
             )) : <div className="sidebar-empty-copy">{t("invoice_no_history")}</div>}
           </div>
@@ -1541,7 +1564,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     <div className="invoicing-shell">
       <header className="invoicing-header">
         <div className="invoicing-header-start">
-          <button type="button" className="btn" onClick={onBack}>
+          <button type="button" className="btn btn-sm" onClick={onBack}>
             <ArrowLeft size={14} />
             {t("invoice_back")}
           </button>
@@ -1551,7 +1574,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </div>
         </div>
         <div className="invoicing-header-actions">
-          <button type="button" className="btn" onClick={onOpenTemplateDesigner}>
+          <button type="button" className="btn btn-sm" onClick={onOpenTemplateDesigner}>
             <Printer size={14} />
             {t("invoice_template_appearance")}
           </button>
@@ -1560,7 +1583,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       </header>
 
       <div className="invoice-tabbar">
-        {[...DOCUMENT_TABS, ...DIRECTORY_TABS].map((tab) => (
+        {DOCUMENT_TABS.map((tab) => (
           <TabButton
             key={tab.id}
             active={activeTab === tab.id}
@@ -1579,17 +1602,22 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         ))}
       </div>
 
-      {documentTab ? (
-        <div className="invoicing-layout">
-          <aside className="invoice-list-panel">
+      <div className={`invoicing-layout ${listCollapsed ? "list-collapsed" : ""}`}>
+        <aside className="invoice-list-panel">
+          <div className="invoice-list-header">
             <div className="invoice-list-toolbar">
-              <div className="invoice-searchbox">
-                <Search size={14} />
-                <input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder={t("invoice_search_placeholder")}
-                />
+              <div className="invoice-search-row">
+                <div className="invoice-searchbox">
+                  <Search size={14} />
+                  <input
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder={t("invoice_search_placeholder")}
+                  />
+                </div>
+                <div className="invoice-search-count" aria-live="polite">
+                  {documentsLoading ? t("loading") : t("invoice_results_count", documents.length)}
+                </div>
               </div>
               <div className="invoice-filter-grid">
                 <select value={statutFilter} onChange={(event) => setStatutFilter(event.target.value)}>
@@ -1605,170 +1633,73 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
               </div>
             </div>
-
-            <div className="invoice-list-scroll">
-              {documentsLoading ? (
-                <div className="empty-state">
-                  <div className="spinner" />
-                  <p>{t("invoice_loading_list")}</p>
-                </div>
-              ) : documentsError ? (
-                <div className="empty-state">
-                  <FileText size={28} />
-                  <p>{documentsError}</p>
-                </div>
-              ) : documents.length ? documents.map((invoice) => (
-                <InvoiceCard
-                  key={invoice.id}
-                  invoice={invoice}
-                  active={invoice.id === selectedId && mode !== "edit"}
-                  onClick={() => {
-                    setSelectedId(invoice.id);
-                    setMode("view");
-                  }}
-                />
-              )) : (
-                <div className="empty-state">
-                  <FileText size={28} />
-                  <p>{t("invoice_empty_list")}</p>
-                </div>
-              )}
-            </div>
-
-            <button
-              type="button"
-              className="btn btn-accent invoice-new-btn"
-              onClick={() => {
-                const fresh = buildBlankInvoice(documentTab.nature, selectedTemplate);
-                setSelectedId("");
-                setSelectedInvoice(fresh);
-                setEditorInvoice(fresh);
-                setMode("edit");
-              }}
-            >
-              <FilePlus2 size={14} />
-              {t("invoice_new_document", t(documentTab.labelKey))}
+            <button className="panel-header-btn" onClick={() => setListCollapsed(true)} title={t("panel_hide_connections")}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M15 18l-6-6 6-6" />
+              </svg>
             </button>
-          </aside>
+          </div>
 
-          <main className="invoice-detail-panel">
-            {renderDocumentView()}
-          </main>
-        </div>
-      ) : activeTab === "articles" ? (
-        <div className="invoice-directory-layout">
-          <section className="invoice-directory-list">
-            <div className="invoice-searchbox directory">
-              <Search size={14} />
-              <input value={articleSearch} onChange={(event) => setArticleSearch(event.target.value)} placeholder={t("invoice_articles_search")} />
-            </div>
-            <button type="button" className="btn invoice-directory-create" onClick={() => setArticleModal({ initial: BLANK_ARTICLE })}>
-              <FilePlus2 size={14} />
-              {t("invoice_new_article")}
+          <div className="invoice-list-scroll">
+            {documentsLoading ? (
+              <div className="empty-state">
+                <div className="spinner" />
+                <p>{t("invoice_loading_list")}</p>
+              </div>
+            ) : documentsError ? (
+              <div className="empty-state">
+                <FileText size={28} />
+                <p>{documentsError}</p>
+              </div>
+            ) : documents.length ? documents.map((invoice) => (
+              <InvoiceCard
+                key={invoice.id}
+                invoice={invoice}
+                active={invoice.id === selectedId && mode !== "edit"}
+                onClick={() => {
+                  setSelectedId(invoice.id);
+                  setMode("view");
+                }}
+              />
+            )) : (
+              <div className="empty-state">
+                <FileText size={28} />
+                <p>{t("invoice_empty_list")}</p>
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-accent invoice-new-btn"
+            onClick={() => {
+              const fresh = buildBlankInvoice(documentTab.nature, selectedTemplate);
+              setSelectedId("");
+              setSelectedInvoice(fresh);
+              setEditorInvoice(fresh);
+              setMode("edit");
+            }}
+          >
+            <FilePlus2 size={14} />
+            {t("invoice_new_document", t(documentTab.labelKey))}
+          </button>
+        </aside>
+
+        {listCollapsed && (
+          <div className="panel-rail">
+            <button className="panel-rail-btn" onClick={() => setListCollapsed(false)} title={t("panel_show_connections")}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="4" y="4" width="8" height="16" rx="1" />
+                <path d="M16 8l4 4-4 4" />
+              </svg>
             </button>
-            <div className="invoice-directory-items">
-              {articlesLoading ? <div className="spinner" /> : null}
-              {!articlesLoading && articlesError ? <div className="invoice-form-error">{articlesError}</div> : null}
-              {!articlesLoading && !articlesError && !articles.length ? (
-                <div className="empty-state">
-                  <Package2 size={24} />
-                  <p>{t("invoice_no_article_found")}</p>
-                </div>
-              ) : null}
-              {!articlesLoading && !articlesError ? articles.map((article) => (
-                <div key={article.id} className={`invoice-directory-item-wrap ${selectedArticle?.id === article.id ? "active" : ""}`}>
-                  <button
-                    type="button"
-                    className="invoice-directory-item-main"
-                    onClick={() => setSelectedArticle(article)}
-                  >
-                    <strong>{article.code}</strong>
-                    <span>{article.libelle}</span>
-                    <em>{formatCurrency(article.prix_ht)}</em>
-                  </button>
-                  {article.id?.startsWith("sdb-") && (
-                    <div className="invoice-directory-item-actions">
-                      <button type="button" className="btn btn-icon" title={t("edit")} onClick={() => setArticleModal({ initial: article })}>
-                        <PencilLine size={12} />
-                      </button>
-                      <button type="button" className="btn btn-icon btn-danger" title={t("delete")} onClick={async () => {
-                        if (!window.confirm(t("invoice_confirm_delete"))) return;
-                        await deleteArticle(connId, article.id);
-                        refreshArticles();
-                        if (selectedArticle?.id === article.id) setSelectedArticle(null);
-                      }}>
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )) : null}
-            </div>
-          </section>
-          <ArticlesPanel article={selectedArticle} />
-        </div>
-      ) : (
-        <div className="invoice-directory-layout">
-          <section className="invoice-directory-list">
-            <div className="invoice-searchbox directory">
-              <Search size={14} />
-              <input value={tierSearch} onChange={(event) => setTierSearch(event.target.value)} placeholder={t("invoice_tiers_search")} />
-            </div>
-            <button
-              type="button"
-              className="btn invoice-directory-create"
-              onClick={() => setTiersModal({ initial: { ...BLANK_TIERS, type_tiers: activeTab === "fournisseurs" ? "fournisseur" : "client" } })}
-            >
-              <FilePlus2 size={14} />
-              {activeTab === "clients" ? t("invoice_new_client") : t("invoice_new_supplier")}
-            </button>
-            <div className="invoice-directory-items">
-              {tiersLoading ? <div className="spinner" /> : null}
-              {!tiersLoading && tiersError ? <div className="invoice-form-error">{tiersError}</div> : null}
-              {!tiersLoading && !tiersError && !tiers.length ? (
-                <div className="empty-state">
-                  <Users size={24} />
-                  <p>{activeTab === "fournisseurs" ? t("invoice_no_supplier_found") : t("invoice_no_client_found")}</p>
-                </div>
-              ) : null}
-              {!tiersLoading && !tiersError ? tiers.map((tier) => (
-                <div key={tier.id} className={`invoice-directory-item-wrap ${selectedTier?.id === tier.id ? "active" : ""}`}>
-                  <button
-                    type="button"
-                    className="invoice-directory-item-main"
-                    onClick={() => setSelectedTier(tier)}
-                  >
-                    <strong>{tier.code}</strong>
-                    <span>{tier.nom}</span>
-                    <em>{tier.ville}</em>
-                  </button>
-                  {tier.is_local && (
-                    <div className="invoice-directory-item-actions">
-                      <button type="button" className="btn btn-icon" title={t("edit")} onClick={() => setTiersModal({ initial: tier })}>
-                        <PencilLine size={12} />
-                      </button>
-                      <button type="button" className="btn btn-icon btn-danger" title={t("delete")} onClick={async () => {
-                        if (!window.confirm(t("invoice_confirm_delete"))) return;
-                        await deleteTiers(connId, tier.id);
-                        refreshTiers();
-                        if (selectedTier?.id === tier.id) setSelectedTier(null);
-                      }}>
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )) : null}
-            </div>
-          </section>
-          <TiersPanel
-            tier={selectedTier}
-            invoices={selectedTierInvoices}
-            loading={tierDocsLoading}
-            error={tierDocsError}
-          />
-        </div>
-      )}
+          </div>
+        )}
+
+        <main className="invoice-detail-panel">
+          {renderDocumentView()}
+        </main>
+      </div>
 
       {mode === "preview" ? (
         <PreviewModal

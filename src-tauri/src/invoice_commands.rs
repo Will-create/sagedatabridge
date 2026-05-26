@@ -12,8 +12,8 @@ use crate::sage_compat::{SageEdition, SageSchema};
 use crate::state::{AppState, ColumnInfo, ConnectionConfig};
 
 use crate::sage_entity_service::{
-    self, ArticleSummary, ResolvedTable, TiersSummary,
-    qualify, sql_string, sql_opt_string, round2, parse_f64, parse_i32, parse_i64, parse_bool, parse_string, br
+    self, br, parse_bool, parse_f64, parse_i32, parse_i64, parse_string, qualify, round2,
+    sql_opt_string, sql_string, ArticleSummary, ResolvedTable, TiersSummary,
 };
 
 const STATUS_TABLE: &str = "SDB_PIECE_STATUS";
@@ -154,6 +154,16 @@ struct ResolvedInvoiceSchema {
     tiers_account: Option<String>,
     role_tiers_tiers: Option<String>,
     role_tiers_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InvoiceSupportTableAvailability {
+    status: bool,
+    status_history: bool,
+    meta: bool,
+    line_meta: bool,
+    local_tiers: bool,
+    local_article: bool,
 }
 
 fn load_connection_config(
@@ -373,6 +383,21 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
     invoice
 }
 
+fn invoice_query_context(
+    endpoint: &str,
+    query_name: &str,
+    connection_id: &str,
+    database: &str,
+    table: impl Into<String>,
+    timeout_secs: u64,
+) -> db::QueryExecutionContext {
+    db::QueryExecutionContext::new(endpoint, query_name)
+        .with_connection_id(connection_id.to_string())
+        .with_database(database.to_string())
+        .with_table(table.into())
+        .with_timeout_secs(timeout_secs)
+}
+
 async fn resolve_invoice_schema(
     state: &State<'_, AppState>,
     id: &str,
@@ -396,7 +421,8 @@ async fn resolve_invoice_schema(
     }
 
     let tables = db::get_tables(client).await?;
-    let piece = sage_entity_service::load_table(client, &tables, &[native.table_piece.clone()]).await?;
+    let piece =
+        sage_entity_service::load_table(client, &tables, &[native.table_piece.clone()]).await?;
     let line = sage_entity_service::load_table(
         client,
         &tables,
@@ -408,7 +434,8 @@ async fn resolve_invoice_schema(
         ],
     )
     .await?;
-    let article = sage_entity_service::load_table(client, &tables, &[native.table_article.clone()]).await?;
+    let article =
+        sage_entity_service::load_table(client, &tables, &[native.table_article.clone()]).await?;
     let tiers = sage_entity_service::load_table(
         client,
         &tables,
@@ -424,7 +451,10 @@ async fn resolve_invoice_schema(
     let role_tiers = if native.table_roletiers.trim().is_empty() {
         None
     } else {
-        Some(sage_entity_service::load_table(client, &tables, &[native.table_roletiers.clone()]).await?)
+        Some(
+            sage_entity_service::load_table(client, &tables, &[native.table_roletiers.clone()])
+                .await?,
+        )
     };
     let journal = if native.table_journal.trim().is_empty() {
         None
@@ -446,13 +476,25 @@ async fn resolve_invoice_schema(
         piece_numero: sage_entity_service::pick_required(&piece, &["numero", "EC_Piece"])?,
         piece_date: sage_entity_service::pick_required(&piece, &["pDate", "EC_Date"])?,
         piece_reference: sage_entity_service::pick_optional(&piece, &["reference", "EC_RefPiece"])
-            .unwrap_or_else(|| sage_entity_service::pick_required(&piece, &["numero", "EC_Piece"]).unwrap_or_default()),
+            .unwrap_or_else(|| {
+                sage_entity_service::pick_required(&piece, &["numero", "EC_Piece"])
+                    .unwrap_or_default()
+            }),
         piece_tiers: sage_entity_service::pick_required(&piece, &["oidTiers", "CT_Num"])?,
         piece_nature: sage_entity_service::pick_required(&piece, &["NaturePiece", "EC_Type"])?,
-        piece_devise: sage_entity_service::pick_optional(&piece, &["oiddevise", "EC_Devise", "devise"]),
+        piece_devise: sage_entity_service::pick_optional(
+            &piece,
+            &["oiddevise", "EC_Devise", "devise"],
+        ),
         piece_journal_fk: sage_entity_service::pick_optional(&piece, &["oidjournal", "JO_Num"]),
-        line_piece: sage_entity_service::pick_required(&line, &[&native.col_ligne_piece, "oidpiece", "EC_No"])?,
-        line_article: sage_entity_service::pick_optional(&line, &[&native.col_ligne_article, "AR_Ref", "oidarticle"]),
+        line_piece: sage_entity_service::pick_required(
+            &line,
+            &[&native.col_ligne_piece, "oidpiece", "EC_No"],
+        )?,
+        line_article: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_article, "AR_Ref", "oidarticle"],
+        ),
         line_libelle: sage_entity_service::pick_optional(
             &line,
             &[
@@ -462,12 +504,18 @@ async fn resolve_invoice_schema(
                 "Caption",
             ],
         ),
-        line_qte: sage_entity_service::pick_optional(&line, &[&native.col_ligne_qte, "DL_Qte", "qte"]),
+        line_qte: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_qte, "DL_Qte", "qte"],
+        ),
         line_pu_ht: sage_entity_service::pick_optional(
             &line,
             &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"],
         ),
-        line_taux_tva: sage_entity_service::pick_optional(&line, &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"]),
+        line_taux_tva: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"],
+        ),
         line_montant_ht: sage_entity_service::pick_optional(
             &line,
             &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"],
@@ -484,10 +532,16 @@ async fn resolve_invoice_schema(
             &line,
             &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"],
         ),
-        line_ordre: sage_entity_service::pick_optional(&line, &[&native.col_ligne_ordre, "DL_No", "position"]),
+        line_ordre: sage_entity_service::pick_optional(
+            &line,
+            &[&native.col_ligne_ordre, "DL_No", "position"],
+        ),
         line_unite: sage_entity_service::pick_optional(&line, &["unite", "DL_Unite", "UV_Code"]),
         article_id: sage_entity_service::pick_optional(&article, &["oid", "AR_Ref", "id"]),
-        article_code: sage_entity_service::pick_required(&article, &[&native.col_article_code, "AR_Ref", "code"])?,
+        article_code: sage_entity_service::pick_required(
+            &article,
+            &[&native.col_article_code, "AR_Ref", "code"],
+        )?,
         article_libelle: sage_entity_service::pick_required(
             &article,
             &[
@@ -497,27 +551,57 @@ async fn resolve_invoice_schema(
                 "libelle",
             ],
         )?,
-        article_pu: sage_entity_service::pick_optional(&article, &[&native.col_article_pu, "AR_PrixVen", "prix_ht"]),
+        article_pu: sage_entity_service::pick_optional(
+            &article,
+            &[&native.col_article_pu, "AR_PrixVen", "prix_ht"],
+        ),
         article_tva: sage_entity_service::pick_optional(
             &article,
             &[&native.col_article_tva, "AR_TauxTva", "taux_tva"],
         ),
-        article_ref: sage_entity_service::pick_optional(&article, &[&native.col_article_ref, "AR_Ref", "reference"]),
-        article_unite: sage_entity_service::pick_optional(&article, &["unite", "AR_UniteVen", "UV_Code"]),
-        article_active: sage_entity_service::pick_optional(&article, &["actif", "AR_Sommeil", "en_activite"]),
+        article_ref: sage_entity_service::pick_optional(
+            &article,
+            &[&native.col_article_ref, "AR_Ref", "reference"],
+        ),
+        article_unite: sage_entity_service::pick_optional(
+            &article,
+            &["unite", "AR_UniteVen", "UV_Code"],
+        ),
+        article_active: sage_entity_service::pick_optional(
+            &article,
+            &["actif", "AR_Sommeil", "en_activite"],
+        ),
         tiers_id: sage_entity_service::pick_required(&tiers, &["oid", "CT_Num", "id"])?,
         tiers_code: sage_entity_service::pick_required(&tiers, &["code", "CT_Num", "numero"])?,
-        tiers_nom: sage_entity_service::pick_required(&tiers, &["raisonSociale", "CT_Intitule", "Caption", "nom"])?,
-        tiers_adresse: sage_entity_service::pick_optional(&tiers, &["adresse", "adresse1", "CT_Adresse", "voie"]),
-        tiers_cp: sage_entity_service::pick_optional(&tiers, &["codePostal", "CT_CodePostal", "cp"]),
+        tiers_nom: sage_entity_service::pick_required(
+            &tiers,
+            &["raisonSociale", "CT_Intitule", "Caption", "nom"],
+        )?,
+        tiers_adresse: sage_entity_service::pick_optional(
+            &tiers,
+            &["adresse", "adresse1", "CT_Adresse", "voie"],
+        ),
+        tiers_cp: sage_entity_service::pick_optional(
+            &tiers,
+            &["codePostal", "CT_CodePostal", "cp"],
+        ),
         tiers_ville: sage_entity_service::pick_optional(&tiers, &["ville", "CT_Ville"]),
         tiers_pays: sage_entity_service::pick_optional(&tiers, &["pays", "CT_Pays"]),
         tiers_siret: sage_entity_service::pick_optional(&tiers, &["siret", "CT_Siret", "siren"]),
         tiers_email: sage_entity_service::pick_optional(&tiers, &["email", "EMail", "CT_EMail"]),
         tiers_telephone: sage_entity_service::pick_optional(&tiers, &["telephone", "CT_Telephone"]),
-        tiers_tva: sage_entity_service::pick_optional(&tiers, &["numTvaIntracom", "CT_Identifiant", "tva"]),
-        tiers_type: sage_entity_service::pick_optional(&tiers, &["CT_Type", "typePersonne", "type"]),
-        tiers_account: sage_entity_service::pick_optional(&tiers, &["CG_NumPrinc", "compteCollectif", "compte"]),
+        tiers_tva: sage_entity_service::pick_optional(
+            &tiers,
+            &["numTvaIntracom", "CT_Identifiant", "tva"],
+        ),
+        tiers_type: sage_entity_service::pick_optional(
+            &tiers,
+            &["CT_Type", "typePersonne", "type"],
+        ),
+        tiers_account: sage_entity_service::pick_optional(
+            &tiers,
+            &["CG_NumPrinc", "compteCollectif", "compte"],
+        ),
         role_tiers_tiers: role_tiers
             .as_ref()
             .and_then(|table| sage_entity_service::pick_optional(table, &["oidtiers", "oidTiers"])),
@@ -538,6 +622,22 @@ async fn resolve_invoice_schema(
         role_tiers,
         journal,
     };
+
+    eprintln!(
+        "[sage] invoice_schema connection_id={} database={} requested={} resolved={} piece_table={}.{} line_table={}.{} tiers_table={}.{} article_table={}.{}",
+        id,
+        connection.database,
+        connection.sage_edition,
+        schema.edition.as_str(),
+        schema.piece.schema,
+        schema.piece.name,
+        schema.line.schema,
+        schema.line.name,
+        schema.tiers.schema,
+        schema.tiers.name,
+        schema.article.schema,
+        schema.article.name,
+    );
 
     Ok(schema)
 }
@@ -673,6 +773,143 @@ END;
     );
     db::execute_raw_query(client, &sql2).await?;
     Ok(())
+}
+
+fn parse_support_flag(value: Option<&Value>) -> bool {
+    parse_bool(value) || parse_i64(value) == 1
+}
+
+async fn detect_invoice_support_table_availability(
+    client: &mut db::DbClient,
+) -> InvoiceSupportTableAvailability {
+    let sql = format!(
+        "
+SELECT
+    CASE WHEN OBJECT_ID(N'dbo.{status}', N'U') IS NULL THEN 0 ELSE 1 END AS has_status,
+    CASE WHEN OBJECT_ID(N'dbo.{history}', N'U') IS NULL THEN 0 ELSE 1 END AS has_history,
+    CASE WHEN OBJECT_ID(N'dbo.{meta}', N'U') IS NULL THEN 0 ELSE 1 END AS has_meta,
+    CASE WHEN OBJECT_ID(N'dbo.{line_meta}', N'U') IS NULL THEN 0 ELSE 1 END AS has_line_meta,
+    CASE WHEN OBJECT_ID(N'dbo.{tiers}', N'U') IS NULL THEN 0 ELSE 1 END AS has_local_tiers,
+    CASE WHEN OBJECT_ID(N'dbo.{article}', N'U') IS NULL THEN 0 ELSE 1 END AS has_local_article
+",
+        status = STATUS_TABLE,
+        history = STATUS_HISTORY_TABLE,
+        meta = META_TABLE,
+        line_meta = LINE_META_TABLE,
+        tiers = LOCAL_TIERS_TABLE,
+        article = LOCAL_ARTICLE_TABLE,
+    );
+
+    match db::execute_raw_query(client, &sql).await {
+        Ok(data) => {
+            let availability = data
+                .rows
+                .first()
+                .map(|row| InvoiceSupportTableAvailability {
+                    status: parse_support_flag(row.first()),
+                    status_history: parse_support_flag(row.get(1)),
+                    meta: parse_support_flag(row.get(2)),
+                    line_meta: parse_support_flag(row.get(3)),
+                    local_tiers: parse_support_flag(row.get(4)),
+                    local_article: parse_support_flag(row.get(5)),
+                })
+                .unwrap_or_default();
+
+            eprintln!(
+                "[sage] invoice_support_tables database={} status={} history={} meta={} line_meta={} local_tiers={} local_article={}",
+                client.config.database,
+                availability.status,
+                availability.status_history,
+                availability.meta,
+                availability.line_meta,
+                availability.local_tiers,
+                availability.local_article,
+            );
+
+            availability
+        }
+        Err(error) => {
+            eprintln!(
+                "[sage] invoice_support_tables_probe_error database={} error={}",
+                client.config.database, error,
+            );
+            InvoiceSupportTableAvailability::default()
+        }
+    }
+}
+
+fn status_join_sql(has_status: bool, piece_oid_expr: &str) -> String {
+    if has_status {
+        format!(
+            "LEFT JOIN [dbo].[{table}] s
+    ON s.[piece_id] = CAST({piece_oid_expr} AS NVARCHAR(50))",
+            table = STATUS_TABLE,
+            piece_oid_expr = piece_oid_expr,
+        )
+    } else {
+        "LEFT JOIN (
+    SELECT
+        CAST(NULL AS NVARCHAR(50)) AS [piece_id],
+        CAST(NULL AS NVARCHAR(50)) AS [statut]
+    WHERE 1 = 0
+) s ON 1 = 0"
+            .to_string()
+    }
+}
+
+fn meta_join_sql(has_meta: bool, piece_oid_expr: &str) -> String {
+    if has_meta {
+        format!(
+            "LEFT JOIN [dbo].[{table}] m
+    ON m.[piece_id] = CAST({piece_oid_expr} AS NVARCHAR(50))",
+            table = META_TABLE,
+            piece_oid_expr = piece_oid_expr,
+        )
+    } else {
+        "LEFT JOIN (
+    SELECT
+        CAST(NULL AS NVARCHAR(50)) AS [piece_id],
+        CAST(NULL AS DATE) AS [date_echeance],
+        CAST(NULL AS NVARCHAR(100)) AS [tiers_code],
+        CAST(NULL AS NVARCHAR(255)) AS [tiers_nom],
+        CAST(NULL AS NVARCHAR(255)) AS [tiers_adresse],
+        CAST(NULL AS NVARCHAR(50)) AS [tiers_cp],
+        CAST(NULL AS NVARCHAR(100)) AS [tiers_ville],
+        CAST(NULL AS NVARCHAR(100)) AS [tiers_pays],
+        CAST(NULL AS NVARCHAR(100)) AS [tiers_siret],
+        CAST(NULL AS NVARCHAR(100)) AS [tiers_tva],
+        CAST(NULL AS NVARCHAR(MAX)) AS [notes],
+        CAST(NULL AS NVARCHAR(MAX)) AS [conditions],
+        CAST(NULL AS FLOAT) AS [remise_globale],
+        CAST(NULL AS BIT) AS [is_supplier]
+    WHERE 1 = 0
+) m ON 1 = 0"
+            .to_string()
+    }
+}
+
+fn line_meta_join_sql(has_line_meta: bool, piece_id_sql: &str, ordre_expr: &str) -> String {
+    if has_line_meta {
+        format!(
+            "LEFT JOIN [dbo].[{table}] lm
+    ON lm.[piece_id] = {piece_id_sql}
+   AND lm.[ordre] = COALESCE(TRY_CAST({ordre_expr} AS INT), 0)",
+            table = LINE_META_TABLE,
+            piece_id_sql = piece_id_sql,
+            ordre_expr = ordre_expr,
+        )
+    } else {
+        "LEFT JOIN (
+    SELECT
+        CAST(NULL AS NVARCHAR(100)) AS [line_key],
+        CAST(NULL AS NVARCHAR(50)) AS [piece_id],
+        CAST(NULL AS INT) AS [ordre],
+        CAST(NULL AS NVARCHAR(100)) AS [article_code],
+        CAST(NULL AS NVARCHAR(50)) AS [unite]
+    WHERE 1 = 0
+) lm ON 1 = 0"
+            .to_string()
+    }
 }
 
 async fn is_identity_column(
@@ -852,8 +1089,13 @@ VALUES ({history_id}, {piece_id}, {from_statut}, {status}, GETDATE(), {updated_b
 
 async fn fetch_status_history(
     client: &mut db::DbClient,
+    availability: InvoiceSupportTableAvailability,
     piece_id: &str,
 ) -> Result<Vec<StatusHistoryEntry>, String> {
+    if !availability.status_history {
+        return Ok(Vec::new());
+    }
+
     let sql = format!(
         "SELECT [id], COALESCE([from_statut], N''), [to_statut], CONVERT(VARCHAR(19), [updated_at], 126), COALESCE([updated_by], N'') \
          FROM [dbo].[{table}] \
@@ -876,18 +1118,24 @@ async fn fetch_status_history(
         .collect())
 }
 
-fn invoice_list_select(resolved: &ResolvedInvoiceSchema) -> String {
+fn invoice_list_select(
+    resolved: &ResolvedInvoiceSchema,
+    availability: InvoiceSupportTableAvailability,
+) -> String {
     let nature_expr = nature_sql_case(&resolved.edition, &qualify("p", &resolved.piece_nature));
+    let piece_oid_expr = qualify("p", &resolved.piece_oid);
+    let status_join = status_join_sql(availability.status, &piece_oid_expr);
+    let meta_join = meta_join_sql(availability.meta, &piece_oid_expr);
     let devise_expr = resolved
         .piece_devise
         .as_ref()
         .map(|column| {
             format!(
-                "COALESCE(CAST({} AS NVARCHAR(50)), N'EUR')",
+                "COALESCE(CAST({} AS NVARCHAR(50)), N'XOF')",
                 qualify("p", column)
             )
         })
-        .unwrap_or_else(|| "N'EUR'".to_string());
+        .unwrap_or_else(|| "N'XOF'".to_string());
     let tiers_nom_expr = resolved
         .tiers_adresse
         .as_ref()
@@ -972,10 +1220,8 @@ SELECT
 FROM {piece_table} p
 LEFT JOIN {tiers_table} t
     ON {piece_tiers} = {tiers_id}
-LEFT JOIN [dbo].[{status_table}] s
-    ON s.[piece_id] = CAST({piece_oid} AS NVARCHAR(50))
-LEFT JOIN [dbo].[{meta_table}] m
-    ON m.[piece_id] = CAST({piece_oid} AS NVARCHAR(50))
+{status_join}
+{meta_join}
 OUTER APPLY (
     SELECT
         ROUND(SUM(COALESCE(TRY_CAST({line_ht} AS DECIMAL(18, 6)), 0)), 2) AS total_ht,
@@ -989,7 +1235,7 @@ OUTER APPLY (
     WHERE {line_piece} = {piece_oid}
 ) tot
 ",
-        piece_oid = qualify("p", &resolved.piece_oid),
+        piece_oid = piece_oid_expr,
         piece_numero = qualify("p", &resolved.piece_numero),
         piece_date = qualify("p", &resolved.piece_date),
         piece_tiers = qualify("p", &resolved.piece_tiers),
@@ -1005,8 +1251,8 @@ OUTER APPLY (
         piece_table = resolved.piece.quoted_name(),
         tiers_table = resolved.tiers.quoted_name(),
         tiers_id = qualify("t", &resolved.tiers_id),
-        status_table = STATUS_TABLE,
-        meta_table = META_TABLE,
+        status_join = status_join,
+        meta_join = meta_join,
         line_ht = resolved
             .line_montant_ht
             .as_ref()
@@ -1060,16 +1306,29 @@ async fn fetch_invoice_internal(
 ) -> Result<InvoiceHeader, String> {
     let _connection = load_connection_config(state, id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
-    ensure_invoice_support_tables(&mut client).await?;
+    let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let resolved = resolve_invoice_schema(state, id, &mut client).await?;
+    let database_name = client.config.database.clone();
 
-    let mut header_sql = invoice_list_select(&resolved);
+    let mut header_sql = invoice_list_select(&resolved, support_tables);
     header_sql.push_str(&format!(
         " WHERE CAST({} AS NVARCHAR(50)) = {}",
         qualify("p", &resolved.piece_oid),
         sql_string(piece_id)
     ));
-    let header_data = db::execute_raw_query(&mut client, &header_sql).await?;
+    let header_data = db::execute_logged_query(
+        &mut client,
+        &header_sql,
+        invoice_query_context(
+            "get_invoice",
+            "invoice_get_header",
+            id,
+            &database_name,
+            resolved.piece.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     let header_row = header_data
         .rows
         .first()
@@ -1104,6 +1363,14 @@ async fn fetch_invoice_internal(
         String::new()
     };
 
+    let ordre_expr = resolved
+        .line_ordre
+        .as_ref()
+        .map(|column| qualify("l", column))
+        .unwrap_or_else(|| "ROW_NUMBER() OVER (ORDER BY (SELECT 1))".to_string());
+    let piece_id_sql = sql_string(piece_id);
+    let line_meta_join = line_meta_join_sql(support_tables.line_meta, &piece_id_sql, &ordre_expr);
+
     let line_sql = format!(
         "
 SELECT
@@ -1126,18 +1393,12 @@ SELECT
     COALESCE(TRY_CAST({ttc_expr} AS DECIMAL(18, 6)), 0) AS montant_ttc
 FROM {line_table} l
 {article_join}
-LEFT JOIN [dbo].[{line_meta_table}] lm
-    ON lm.[piece_id] = {piece_id_sql}
-   AND lm.[ordre] = COALESCE(TRY_CAST({ordre_expr} AS INT), 0)
+{line_meta_join}
 WHERE {line_piece_expr} = {piece_fk_sql}
 ORDER BY ordre ASC
 ",
-        piece_id_sql = sql_string(piece_id),
-        ordre_expr = resolved
-            .line_ordre
-            .as_ref()
-            .map(|column| qualify("l", column))
-            .unwrap_or_else(|| "ROW_NUMBER() OVER (ORDER BY (SELECT 1))".to_string()),
+        piece_id_sql = piece_id_sql,
+        ordre_expr = ordre_expr,
         article_id_expr = resolved
             .line_article
             .as_ref()
@@ -1211,7 +1472,7 @@ ORDER BY ordre ASC
             )),
         line_table = resolved.line.quoted_name(),
         article_join = article_join,
-        line_meta_table = LINE_META_TABLE,
+        line_meta_join = line_meta_join,
         line_piece_expr = qualify("l", &resolved.line_piece),
         piece_fk_sql = {
             let column = resolved
@@ -1222,7 +1483,19 @@ ORDER BY ordre ASC
         },
     );
 
-    let line_data = db::execute_raw_query(&mut client, &line_sql).await?;
+    let line_data = db::execute_logged_query(
+        &mut client,
+        &line_sql,
+        invoice_query_context(
+            "get_invoice",
+            "invoice_get_lines",
+            id,
+            &database_name,
+            resolved.line.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     invoice.lignes = line_data
         .rows
         .iter()
@@ -1242,7 +1515,7 @@ ORDER BY ordre ASC
             montant_ttc: round2(parse_f64(row.get(12))),
         })
         .collect();
-    invoice.statut_history = fetch_status_history(&mut client, piece_id).await?;
+    invoice.statut_history = fetch_status_history(&mut client, support_tables, piece_id).await?;
     Ok(invoice)
 }
 
@@ -1259,10 +1532,11 @@ pub async fn list_invoices(
 ) -> Result<Vec<InvoiceHeader>, String> {
     let _connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
-    ensure_invoice_support_tables(&mut client).await?;
+    let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
+    let database_name = client.config.database.clone();
 
-    let mut sql = invoice_list_select(&resolved);
+    let mut sql = invoice_list_select(&resolved, support_tables);
     sql.push_str(" WHERE 1=1");
 
     if let Some(value) = date_from.as_ref().filter(|value| !value.trim().is_empty()) {
@@ -1315,7 +1589,19 @@ pub async fn list_invoices(
         qualify("p", &resolved.piece_numero)
     ));
 
-    let data = db::execute_raw_query(&mut client, &sql).await?;
+    let data = db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "list_invoices",
+            "invoice_list",
+            &id,
+            &database_name,
+            resolved.piece.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     Ok(data.rows.iter().map(|row| map_invoice_row(row)).collect())
 }
 
@@ -1338,6 +1624,7 @@ pub async fn create_invoice(
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
+    let database_name = client.config.database.clone();
 
     let mut invoice = normalize_invoice(invoice);
     if invoice.numero.trim().is_empty() {
@@ -1437,7 +1724,7 @@ pub async fn create_invoice(
             sql_value_for_column(
                 resolved.piece.column(devise_column).unwrap(),
                 if invoice.devise.trim().is_empty() {
-                    "EUR"
+                    "XOF"
                 } else {
                     &invoice.devise
                 },
@@ -1665,7 +1952,19 @@ END CATCH
         numero = sql_string(&invoice.numero),
     );
 
-    let created = db::execute_raw_query(&mut client, &sql).await?;
+    let created = db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "create_invoice",
+            "invoice_create",
+            &id,
+            &database_name,
+            resolved.piece.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     if let Some(row) = created.rows.first() {
         invoice.id = parse_string(row.first());
         invoice.numero = parse_string(row.get(1));
@@ -1688,6 +1987,7 @@ pub async fn update_invoice(
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
+    let database_name = client.config.database.clone();
 
     let invoice = normalize_invoice(invoice);
     let mut set_clauses = Vec::new();
@@ -1921,7 +2221,19 @@ END CATCH
         remise_globale = sql_number(invoice.remise_globale),
         is_supplier = if invoice.is_supplier { "1" } else { "0" },
     );
-    db::execute_raw_query(&mut client, &sql).await?;
+    db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "update_invoice",
+            "invoice_update",
+            &id,
+            &database_name,
+            resolved.piece.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
 
     existing = fetch_invoice_internal(&state, &id, &invoice.id).await?;
     Ok(existing)
@@ -1991,6 +2303,7 @@ pub async fn delete_invoice(
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
+    let database_name = client.config.database.clone();
     let line_piece_column = resolved
         .line
         .column(&resolved.line_piece)
@@ -2029,7 +2342,19 @@ END CATCH
             resolved.piece.column(&resolved.piece_oid).unwrap(),
         ),
     );
-    db::execute_raw_query(&mut client, &sql).await?;
+    db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "delete_invoice",
+            "invoice_delete",
+            &id,
+            &database_name,
+            resolved.piece.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2063,14 +2388,17 @@ async fn lookup_account_value(
     client: &mut db::DbClient,
     account_table: &ResolvedTable,
     resolved: &ResolvedInvoiceSchema,
+    connection_id: &str,
+    database: &str,
     code: &str,
 ) -> Result<String, String> {
     if code.trim().is_empty() {
         return Err("Account code is empty".to_string());
     }
 
-    let id_column = sage_entity_service::pick_optional(account_table, &["oid", "CG_Num", "CT_Num", "ACC"])
-        .unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
+    let id_column =
+        sage_entity_service::pick_optional(account_table, &["oid", "CG_Num", "CT_Num", "ACC"])
+            .unwrap_or_else(|| resolved.sage_schema.col_compte_num.clone());
     let code_column = sage_entity_service::pick_optional(
         account_table,
         &[
@@ -2089,7 +2417,19 @@ async fn lookup_account_value(
         code_col = br(&code_column),
         code = sql_string(code),
     );
-    let data = db::execute_raw_query(client, &sql).await?;
+    let data = db::execute_logged_query(
+        client,
+        &sql,
+        invoice_query_context(
+            "comptabiliser_invoice",
+            "invoice_post_account_lookup",
+            connection_id,
+            database,
+            account_table.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     let value = data
         .rows
         .first()
@@ -2102,6 +2442,8 @@ async fn lookup_account_value(
 async fn resolve_tiers_role_for_entry(
     client: &mut db::DbClient,
     resolved: &ResolvedInvoiceSchema,
+    connection_id: &str,
+    database: &str,
     invoice: &InvoiceHeader,
 ) -> Result<Option<String>, String> {
     if resolved.edition != SageEdition::Sage1000 {
@@ -2125,7 +2467,19 @@ async fn resolve_tiers_role_for_entry(
             role_table.column(role_tiers_tiers).unwrap(),
         )
     );
-    let data = db::execute_raw_query(client, &sql).await?;
+    let data = db::execute_logged_query(
+        client,
+        &sql,
+        invoice_query_context(
+            "comptabiliser_invoice",
+            "invoice_post_role_lookup",
+            connection_id,
+            database,
+            role_table.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     Ok(data
         .rows
         .first()
@@ -2153,30 +2507,62 @@ pub async fn comptabiliser_invoice(
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
     let entry_table = resolve_entry_table(&mut client, &resolved).await?;
     let account_table = resolve_account_table(&mut client, &resolved).await?;
+    let database_name = client.config.database.clone();
+
+    let (cfg_ar, cfg_sales, cfg_vat) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            config.account_ar.clone(),
+            config.account_sales.clone(),
+            config.account_vat.clone(),
+        )
+    };
 
     let tiers_account_code = if invoice.is_supplier {
-        "401000"
+        "401000" // Still hardcoded for suppliers for now, but could be made configurable too
     } else {
-        "411000"
+        &cfg_ar
     };
     let sales_account_code = if invoice.is_supplier {
         "607000"
     } else {
-        "701000"
+        &cfg_sales
     };
     let vat_account_code = if invoice.is_supplier {
         "445620"
     } else {
-        "445710"
+        &cfg_vat
     };
 
-    let tiers_account_value =
-        lookup_account_value(&mut client, &account_table, &resolved, tiers_account_code).await?;
-    let sales_account_value =
-        lookup_account_value(&mut client, &account_table, &resolved, sales_account_code).await?;
-    let vat_account_value =
-        lookup_account_value(&mut client, &account_table, &resolved, vat_account_code).await?;
-    let role_value = resolve_tiers_role_for_entry(&mut client, &resolved, &invoice).await?;
+    let tiers_account_value = lookup_account_value(
+        &mut client,
+        &account_table,
+        &resolved,
+        &id,
+        &database_name,
+        tiers_account_code,
+    )
+    .await?;
+    let sales_account_value = lookup_account_value(
+        &mut client,
+        &account_table,
+        &resolved,
+        &id,
+        &database_name,
+        sales_account_code,
+    )
+    .await?;
+    let vat_account_value = lookup_account_value(
+        &mut client,
+        &account_table,
+        &resolved,
+        &id,
+        &database_name,
+        vat_account_code,
+    )
+    .await?;
+    let role_value =
+        resolve_tiers_role_for_entry(&mut client, &resolved, &id, &database_name, &invoice).await?;
 
     let mut tva_breakdown = BTreeMap::<String, f64>::new();
     for line in &invoice.lignes {
@@ -2419,7 +2805,19 @@ END CATCH
         history_id = sql_string(&Uuid::new_v4().to_string()),
         from_statut = sql_string(&normalize_status(&invoice.statut)),
     );
-    db::execute_raw_query(&mut client, &sql).await?;
+    db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "comptabiliser_invoice",
+            "invoice_post",
+            &id,
+            &database_name,
+            entry_table.quoted_name(),
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
 
     Ok(ComptabilisationResult {
         piece_id,
@@ -2438,8 +2836,7 @@ pub async fn list_tiers(
 ) -> Result<Vec<TiersSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
-    // Non-fatal: user may have read-only access to the Sage DB.
-    let _ = ensure_invoice_support_tables(&mut client).await;
+    let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let type_filter = type_tiers.unwrap_or_else(|| "all".to_string());
     let limit = limit.unwrap_or(40).clamp(1, 100);
     let normalized_search = search
@@ -2448,17 +2845,22 @@ pub async fn list_tiers(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let entity_ctx = sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
+    let entity_ctx =
+        sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
     let resolved = entity_ctx.tiers;
 
     if resolved.is_none() {
         // Fall back to local-only when native schema isn't available.
+        if !support_tables.local_tiers {
+            return Ok(Vec::new());
+        }
         let local_type_filter = match type_filter.trim().to_ascii_lowercase().as_str() {
             "clients" => Some(vec!["client", "les_deux"]),
             "fournisseurs" => Some(vec!["fournisseur", "les_deux"]),
             _ => None,
         };
-        let local_sql = build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
+        let local_sql =
+            build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
         let local_data = db::execute_logged_query(
             &mut client,
             &local_sql,
@@ -2611,7 +3013,10 @@ WHERE 1=1
     if type_filter.eq_ignore_ascii_case("clients") {
         final_sql.push_str(&format!(" AND ({} IN (N'client', N'les_deux'))", type_expr));
     } else if type_filter.eq_ignore_ascii_case("fournisseurs") {
-        final_sql.push_str(&format!(" AND ({} IN (N'fournisseur', N'les_deux'))", type_expr));
+        final_sql.push_str(&format!(
+            " AND ({} IN (N'fournisseur', N'les_deux'))",
+            type_expr
+        ));
     }
 
     if let Some(value) = normalized_search.as_ref() {
@@ -2701,45 +3106,48 @@ WHERE 1=1
         .collect();
 
     // Merge locally-created tiers from SDB_TIERS
-    let local_type_filter = match type_filter.trim().to_ascii_lowercase().as_str() {
-        "clients" => Some(vec!["client", "les_deux"]),
-        "fournisseurs" => Some(vec!["fournisseur", "les_deux"]),
-        _ => None,
-    };
-    let local_sql = build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
-    if let Ok(local_data) = db::execute_logged_query(
-        &mut client,
-        &local_sql,
-        db::QueryExecutionContext::new("list_tiers", "invoice_search_tiers_local_merge")
-            .with_connection_id(id.clone())
-            .with_database(connection.database.clone())
-            .with_table(LOCAL_TIERS_TABLE)
-            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
-    )
-    .await
-    {
-        let native_ids: std::collections::HashSet<String> =
-            result.iter().map(|t| t.code.to_lowercase()).collect();
-        for row in &local_data.rows {
-            let entry = TiersSummary {
-                id: sage_entity_service::parse_string(row.first()),
-                code: sage_entity_service::parse_string(row.get(1)),
-                nom: sage_entity_service::parse_string(row.get(2)),
-                adresse: sage_entity_service::parse_string(row.get(3)),
-                cp: sage_entity_service::parse_string(row.get(4)),
-                ville: sage_entity_service::parse_string(row.get(5)),
-                pays: sage_entity_service::parse_string(row.get(6)),
-                siret: sage_entity_service::parse_string(row.get(7)),
-                email: sage_entity_service::parse_string(row.get(8)),
-                telephone: sage_entity_service::parse_string(row.get(9)),
-                tva_intra: sage_entity_service::parse_string(row.get(10)),
-                type_tiers: sage_entity_service::parse_string(row.get(11)),
-                encours: 0.0,
-                nb_factures: 0,
-                is_local: true,
-            };
-            if !native_ids.contains(&entry.code.to_lowercase()) {
-                result.push(entry);
+    if support_tables.local_tiers {
+        let local_type_filter = match type_filter.trim().to_ascii_lowercase().as_str() {
+            "clients" => Some(vec!["client", "les_deux"]),
+            "fournisseurs" => Some(vec!["fournisseur", "les_deux"]),
+            _ => None,
+        };
+        let local_sql =
+            build_local_tiers_sql(&local_type_filter, normalized_search.as_deref(), limit);
+        if let Ok(local_data) = db::execute_logged_query(
+            &mut client,
+            &local_sql,
+            db::QueryExecutionContext::new("list_tiers", "invoice_search_tiers_local_merge")
+                .with_connection_id(id.clone())
+                .with_database(connection.database.clone())
+                .with_table(LOCAL_TIERS_TABLE)
+                .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+        )
+        .await
+        {
+            let native_ids: std::collections::HashSet<String> =
+                result.iter().map(|t| t.code.to_lowercase()).collect();
+            for row in &local_data.rows {
+                let entry = TiersSummary {
+                    id: sage_entity_service::parse_string(row.first()),
+                    code: sage_entity_service::parse_string(row.get(1)),
+                    nom: sage_entity_service::parse_string(row.get(2)),
+                    adresse: sage_entity_service::parse_string(row.get(3)),
+                    cp: sage_entity_service::parse_string(row.get(4)),
+                    ville: sage_entity_service::parse_string(row.get(5)),
+                    pays: sage_entity_service::parse_string(row.get(6)),
+                    siret: sage_entity_service::parse_string(row.get(7)),
+                    email: sage_entity_service::parse_string(row.get(8)),
+                    telephone: sage_entity_service::parse_string(row.get(9)),
+                    tva_intra: sage_entity_service::parse_string(row.get(10)),
+                    type_tiers: sage_entity_service::parse_string(row.get(11)),
+                    encours: 0.0,
+                    nb_factures: 0,
+                    is_local: true,
+                };
+                if !native_ids.contains(&entry.code.to_lowercase()) {
+                    result.push(entry);
+                }
             }
         }
     }
@@ -2758,7 +3166,11 @@ fn empty_table_data() -> crate::state::TableData {
     }
 }
 
-fn build_local_tiers_sql(type_filter: &Option<Vec<&str>>, search: Option<&str>, limit: u32) -> String {
+fn build_local_tiers_sql(
+    type_filter: &Option<Vec<&str>>,
+    search: Option<&str>,
+    limit: u32,
+) -> String {
     let mut sql = format!(
         "SELECT TOP ({limit}) [id],[code],[nom],COALESCE([adresse],N'') AS adresse,COALESCE([cp],N'') AS cp,COALESCE([ville],N'') AS ville,COALESCE([pays],N'') AS pays,COALESCE([siret],N'') AS siret,COALESCE([email],N'') AS email,COALESCE([telephone],N'') AS telephone,COALESCE([tva_intra],N'') AS tva_intra,[type_tiers] FROM [dbo].[{table}] WHERE 1=1",
         limit = limit,
@@ -2788,8 +3200,7 @@ pub async fn list_articles(
 ) -> Result<Vec<ArticleSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
-    // Non-fatal: user may have read-only access to the Sage DB.
-    let _ = ensure_invoice_support_tables(&mut client).await;
+    let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let limit = limit.unwrap_or(40).clamp(1, 100);
     let normalized_search = search
         .as_deref()
@@ -2797,10 +3208,14 @@ pub async fn list_articles(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let entity_ctx = sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
+    let entity_ctx =
+        sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
     let resolved = entity_ctx.article;
 
     if resolved.is_none() {
+        if !support_tables.local_article {
+            return Ok(Vec::new());
+        }
         let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
         let local_data = db::execute_logged_query(
             &mut client,
@@ -2811,8 +3226,8 @@ pub async fn list_articles(
                 .with_table(LOCAL_ARTICLE_TABLE)
                 .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
         )
-            .await
-            .unwrap_or_else(|_| empty_table_data());
+        .await
+        .unwrap_or_else(|_| empty_table_data());
         return Ok(local_data
             .rows
             .iter()
@@ -2935,33 +3350,35 @@ WHERE 1=1
         .collect();
 
     // Merge locally-created articles from SDB_ARTICLE
-    let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
-    if let Ok(local_data) = db::execute_logged_query(
-        &mut client,
-        &local_sql,
-        db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local_merge")
-            .with_connection_id(id.clone())
-            .with_database(connection.database.clone())
-            .with_table(LOCAL_ARTICLE_TABLE)
-            .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
-    )
-    .await
-    {
-        let native_ids: std::collections::HashSet<String> =
-            result.iter().map(|a| a.code.to_lowercase()).collect();
-        for row in &local_data.rows {
-            let entry = ArticleSummary {
-                id: sage_entity_service::parse_string(row.first()),
-                code: sage_entity_service::parse_string(row.get(1)),
-                libelle: sage_entity_service::parse_string(row.get(2)),
-                prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
-                taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
-                unite: sage_entity_service::parse_string(row.get(5)),
-                reference: sage_entity_service::parse_string(row.get(6)),
-                en_activite: sage_entity_service::parse_bool(row.get(7)),
-            };
-            if !native_ids.contains(&entry.code.to_lowercase()) {
-                result.push(entry);
+    if support_tables.local_article {
+        let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
+        if let Ok(local_data) = db::execute_logged_query(
+            &mut client,
+            &local_sql,
+            db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local_merge")
+                .with_connection_id(id.clone())
+                .with_database(connection.database.clone())
+                .with_table(LOCAL_ARTICLE_TABLE)
+                .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+        )
+        .await
+        {
+            let native_ids: std::collections::HashSet<String> =
+                result.iter().map(|a| a.code.to_lowercase()).collect();
+            for row in &local_data.rows {
+                let entry = ArticleSummary {
+                    id: sage_entity_service::parse_string(row.first()),
+                    code: sage_entity_service::parse_string(row.get(1)),
+                    libelle: sage_entity_service::parse_string(row.get(2)),
+                    prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
+                    taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
+                    unite: sage_entity_service::parse_string(row.get(5)),
+                    reference: sage_entity_service::parse_string(row.get(6)),
+                    en_activite: sage_entity_service::parse_bool(row.get(7)),
+                };
+                if !native_ids.contains(&entry.code.to_lowercase()) {
+                    result.push(entry);
+                }
             }
         }
     }
@@ -2985,6 +3402,36 @@ fn build_local_article_sql(search: Option<&str>, limit: u32) -> String {
     }
     sql.push_str(" ORDER BY [code] ASC");
     sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_invoice_sql_uses_empty_support_sources_when_tables_are_missing() {
+        let status_join = status_join_sql(false, "[p].[oid]");
+        let meta_join = meta_join_sql(false, "[p].[oid]");
+        let line_meta_join = line_meta_join_sql(false, "N'piece-1'", "[l].[ordre]");
+
+        assert!(status_join.contains("WHERE 1 = 0"));
+        assert!(meta_join.contains("WHERE 1 = 0"));
+        assert!(line_meta_join.contains("WHERE 1 = 0"));
+        assert!(!status_join.contains(&format!("[dbo].[{}]", STATUS_TABLE)));
+        assert!(!meta_join.contains(&format!("[dbo].[{}]", META_TABLE)));
+        assert!(!line_meta_join.contains(&format!("[dbo].[{}]", LINE_META_TABLE)));
+    }
+
+    #[test]
+    fn read_only_invoice_sql_uses_real_support_tables_when_available() {
+        let status_join = status_join_sql(true, "[p].[oid]");
+        let meta_join = meta_join_sql(true, "[p].[oid]");
+        let line_meta_join = line_meta_join_sql(true, "N'piece-1'", "[l].[ordre]");
+
+        assert!(status_join.contains(&format!("[dbo].[{}]", STATUS_TABLE)));
+        assert!(meta_join.contains(&format!("[dbo].[{}]", META_TABLE)));
+        assert!(line_meta_join.contains(&format!("[dbo].[{}]", LINE_META_TABLE)));
+    }
 }
 
 #[tauri::command]
@@ -3060,12 +3507,25 @@ pub async fn delete_tiers(
     let _connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
+    let database_name = client.config.database.clone();
     let sql = format!(
         "DELETE FROM [dbo].[{table}] WHERE [id]={id}",
         table = LOCAL_TIERS_TABLE,
         id = sql_string(&tiers_id),
     );
-    db::execute_raw_query(&mut client, &sql).await?;
+    db::execute_logged_query(
+        &mut client,
+        &sql,
+        invoice_query_context(
+            "delete_tiers",
+            "tiers_delete",
+            &id,
+            &database_name,
+            LOCAL_TIERS_TABLE,
+            db::DEFAULT_QUERY_TIMEOUT_SECS,
+        ),
+    )
+    .await?;
     Ok(())
 }
 

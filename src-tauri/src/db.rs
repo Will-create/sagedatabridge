@@ -31,9 +31,34 @@ pub struct CachedClient {
     pub connected_at: std::time::Instant,
 }
 
-pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
-pub const DASHBOARD_QUERY_TIMEOUT_SECS: u64 = 35;
+fn get_query_timeout(state: &crate::state::AppState) -> Duration {
+    let config = state.config.lock().ok();
+    let secs = config
+        .map(|c| c.query_timeout_secs)
+        .unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn get_dashboard_timeout(state: &crate::state::AppState) -> Duration {
+    let config = state.config.lock().ok();
+    let secs = config
+        .map(|c| c.dashboard_timeout_secs)
+        .unwrap_or(DASHBOARD_QUERY_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn get_login_timeout(state: &crate::state::AppState) -> Duration {
+    let config = state.config.lock().ok();
+    let secs = config
+        .map(|c| c.login_timeout_secs)
+        .unwrap_or(LOGIN_QUERY_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 pub const SEARCH_QUERY_TIMEOUT_SECS: u64 = 15;
+pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 60;
+pub const DASHBOARD_QUERY_TIMEOUT_SECS: u64 = 90;
+pub const LOGIN_QUERY_TIMEOUT_SECS: u64 = 60;
 const SLOW_QUERY_THRESHOLD_MS: u128 = 2_500;
 
 #[derive(Debug, Clone, Default)]
@@ -75,8 +100,12 @@ impl QueryExecutionContext {
         self
     }
 
-    fn resolved_timeout(&self) -> Duration {
-        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS).max(1))
+    pub fn resolved_timeout(&self, state: Option<&crate::state::AppState>) -> Duration {
+        let config_secs = state
+            .and_then(|s| s.config.lock().ok())
+            .map(|c| c.query_timeout_secs)
+            .unwrap_or(DEFAULT_QUERY_TIMEOUT_SECS);
+        Duration::from_secs(self.timeout_secs.unwrap_or(config_secs).max(1))
     }
 }
 
@@ -94,6 +123,7 @@ fn log_query_result(
     context: &QueryExecutionContext,
     sql: &str,
     duration: Duration,
+    timeout: Duration,
     row_count: Option<i64>,
     error: Option<&str>,
 ) {
@@ -125,13 +155,14 @@ fn log_query_result(
 
     if let Some(message) = error {
         eprintln!(
-            "[sql] status=error endpoint={} query={} connection_id={} database={} table={} duration_ms={} error={} sql=\"{}\"",
+            "[sql] status=error endpoint={} query={} connection_id={} database={} table={} duration_ms={} timeout_secs={} error={} sql=\"{}\"",
             endpoint,
             query_name,
             connection_id,
             database,
             table,
             duration.as_millis(),
+            timeout.as_secs(),
             message,
             shorten_sql(sql, 900),
         );
@@ -139,25 +170,27 @@ fn log_query_result(
     }
 
     eprintln!(
-        "[sql] status=ok endpoint={} query={} connection_id={} database={} table={} duration_ms={} rows={}",
+        "[sql] status=ok endpoint={} query={} connection_id={} database={} table={} duration_ms={} timeout_secs={} rows={}",
         endpoint,
         query_name,
         connection_id,
         database,
         table,
         duration.as_millis(),
+        timeout.as_secs(),
         row_count.unwrap_or(0),
     );
 
     if duration.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
         eprintln!(
-            "[sql-slow] endpoint={} query={} connection_id={} database={} table={} duration_ms={} sql=\"{}\"",
+            "[sql-slow] endpoint={} query={} connection_id={} database={} table={} duration_ms={} timeout_secs={} sql=\"{}\"",
             endpoint,
             query_name,
             connection_id,
             database,
             table,
             duration.as_millis(),
+            timeout.as_secs(),
             shorten_sql(sql, 900),
         );
     }
@@ -173,9 +206,13 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
     let join = tokio::task::spawn_blocking(task);
-    let result = tokio::time::timeout(timeout, join)
-        .await
-        .map_err(|_| format!("{} timed out after {} seconds", timeout_label, timeout.as_secs()))?;
+    let result = tokio::time::timeout(timeout, join).await.map_err(|_| {
+        format!(
+            "{} timed out after {} seconds",
+            timeout_label,
+            timeout.as_secs()
+        )
+    })?;
 
     result.map_err(|e| e.to_string())?
 }
@@ -291,7 +328,7 @@ async fn connect_tds(conn: &ConnectionConfig) -> Result<TdsClient, String> {
         .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
 
     let client = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
         Client::connect(config, tcp.compat_write()),
     )
     .await
@@ -410,7 +447,7 @@ fn open_odbc_connection(conn: &ConnectionConfig) -> Result<odbc_api::Connection<
 
     for driver in ODBC_SQL_SERVER_DRIVERS {
         let options = ConnectionOptions {
-            login_timeout_sec: Some(10),
+            login_timeout_sec: Some(30),
             packet_size: None,
         };
         let mut connection_string = format!(
@@ -598,7 +635,10 @@ pub async fn get_databases(client: &mut DbClient) -> Result<Vec<String>, String>
     }
 }
 
-async fn get_databases_tds(client: &mut TdsClient, timeout: Duration) -> Result<Vec<String>, String> {
+async fn get_databases_tds(
+    client: &mut TdsClient,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
     let sql = r#"
         SELECT name
         FROM sys.databases
@@ -639,10 +679,8 @@ pub async fn get_tables(client: &mut DbClient) -> Result<Vec<TableInfo>, String>
         #[cfg(windows)]
         DbBackend::Odbc => {
             let config = client.config.clone();
-            run_blocking_with_timeout(timeout, "Listing tables", move || {
-                get_tables_odbc(&config)
-            })
-            .await
+            run_blocking_with_timeout(timeout, "Listing tables", move || get_tables_odbc(&config))
+                .await
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
@@ -651,7 +689,10 @@ pub async fn get_tables(client: &mut DbClient) -> Result<Vec<TableInfo>, String>
     }
 }
 
-async fn get_tables_tds(client: &mut TdsClient, timeout: Duration) -> Result<Vec<TableInfo>, String> {
+async fn get_tables_tds(
+    client: &mut TdsClient,
+    timeout: Duration,
+) -> Result<Vec<TableInfo>, String> {
     let sql = r#"
         SELECT
             s.name AS schema_name,
@@ -1207,7 +1248,10 @@ pub async fn get_table_data(
         }
         DbBackend::Tiberius => {
             let mut tds = connect_tds(&client.config).await?;
-            get_table_data_tds(&mut tds, schema, table, page, page_size, filters, columns, timeout).await
+            get_table_data_tds(
+                &mut tds, schema, table, page, page_size, filters, columns, timeout,
+            )
+            .await
         }
     }
 }
@@ -1232,8 +1276,8 @@ async fn get_table_data_tds(
 
     let count_sql = format!("SELECT COUNT_BIG(*) FROM {} {}", full_table, where_clause);
 
-    let count_rows = query_first_result_tds(client, &count_sql, timeout, "Counting table rows")
-        .await?;
+    let count_rows =
+        query_first_result_tds(client, &count_sql, timeout, "Counting table rows").await?;
 
     let total_count: i64 = count_rows.first().and_then(|r| r.get(0)).unwrap_or(0);
 
@@ -1637,7 +1681,7 @@ pub async fn execute_logged_query(
     sql: &str,
     context: QueryExecutionContext,
 ) -> Result<TableData, String> {
-    let timeout = context.resolved_timeout();
+    let timeout = context.resolved_timeout(None);
     let started = Instant::now();
 
     let result = match client.backend {
@@ -1663,10 +1707,11 @@ pub async fn execute_logged_query(
             &context,
             sql,
             duration,
+            timeout,
             Some(data.total_count),
             None,
         ),
-        Err(error) => log_query_result(client, &context, sql, duration, None, Some(error)),
+        Err(error) => log_query_result(client, &context, sql, duration, timeout, None, Some(error)),
     }
 
     result
@@ -1766,12 +1811,7 @@ pub async fn open_tds_connection(conn: &ConnectionConfig) -> Result<TdsClient, S
 
 /// Execute a raw SQL query on an EXISTING TDS connection (used for streaming chunks)
 pub async fn run_tds_query(tds: &mut TdsClient, sql: &str) -> Result<TableData, String> {
-    execute_raw_query_tds(
-        tds,
-        sql,
-        Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
-    )
-    .await
+    execute_raw_query_tds(tds, sql, Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS)).await
 }
 
 /// Get or create a cached DbClient for a connection (avoids re-probing backend on every command)

@@ -2,31 +2,19 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { save } from "@tauri-apps/api/dialog";
 import { writeBinaryFile } from "@tauri-apps/api/fs";
 import * as XLSX from "xlsx";
+import { createInvokeWithTimeout, withTimeout } from "../utils/tauriTimeout";
 
 // Re-export tauri invoke for easy mocking/testing
 export { invoke };
 
-const DASHBOARD_TIMEOUT_MS = 40_000;
-const INVOICE_TIMEOUT_MS = 30_000;
-const SEARCH_TIMEOUT_MS = 15_000;
-
-function withTimeout(promise, timeoutMs, label) {
-  let timeoutId;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timeoutId = globalThis.setTimeout(() => {
-        reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
-    }),
-  ]).finally(() => {
-    if (timeoutId) globalThis.clearTimeout(timeoutId);
-  });
-}
-
-function invokeWithTimeout(command, payload, { timeoutMs, label }) {
-  return withTimeout(invoke(command, payload), timeoutMs, label);
-}
+const CONNECTION_TIMEOUT_MS = 75_000;
+const METADATA_TIMEOUT_MS = 75_000;
+const TABLE_DATA_TIMEOUT_MS = 90_000;
+const DASHBOARD_TIMEOUT_MS = 100_000;
+const INVOICE_TIMEOUT_MS = 75_000;
+const SEARCH_TIMEOUT_MS = 10_000;
+const EXPORT_TIMEOUT_MS = 180_000;
+const invokeWithTimeout = createInvokeWithTimeout(invoke);
 
 function logInvoiceRequest(scope, payload) {
   console.debug("[invoice]", scope, "request", payload);
@@ -38,6 +26,20 @@ function logInvoiceResponse(scope, meta) {
 
 function logInvoiceError(scope, error, payload) {
   console.error("[invoice]", scope, "error", { error: String(error), payload });
+}
+
+function runInvoiceMutation(scope, command, payload, label) {
+  logInvoiceRequest(scope, payload);
+  return invokeWithTimeout(command, payload, {
+    timeoutMs: INVOICE_TIMEOUT_MS,
+    label,
+  }).then((result) => {
+    logInvoiceResponse(scope, { status: "success" });
+    return result;
+  }).catch((error) => {
+    logInvoiceError(scope, error, payload);
+    throw error;
+  });
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
@@ -55,6 +57,11 @@ export const setAdminPassword = (password) => invoke("set_admin_password", { pas
 export const verifyAdminPassword = (password) => invoke("verify_admin_password", { password });
 export const removeAdminPassword = () => invoke("remove_admin_password");
 
+// ─── Settings ───────────────────────────────────────────────────────────────────
+
+export const getSettings = () => invoke("get_settings");
+export const saveSettings = (settings) => invoke("save_settings", { settings });
+
 // ─── Field History ────────────────────────────────────────────────────────────
 
 export const getFieldHistory = (field) => invoke("get_field_history", { field });
@@ -68,10 +75,19 @@ export const saveConnection = (connection) => invoke("save_connection", { connec
 export const deleteConnection = (id) => invoke("delete_connection", { id });
 export const testConnection = (connection) => invoke("test_connection", { connection });
 export const discoverDatabases = (connection) => invoke("discover_databases", { connection });
-export const connectDb = (id) => invoke("connect_db", { id });
-export const getDatabases = (connectionId) => invoke("get_databases", { connectionId });
+export const connectDb = (id) => invokeWithTimeout("connect_db", { id }, {
+  timeoutMs: CONNECTION_TIMEOUT_MS,
+  label: "Connect database",
+});
+export const getDatabases = (connectionId) => invokeWithTimeout("get_databases", { connectionId }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "Load databases",
+});
 export const switchDatabase = (connectionId, database) =>
-  invoke("switch_database", { connectionId, database });
+  invokeWithTimeout("switch_database", { connectionId, database }, {
+    timeoutMs: CONNECTION_TIMEOUT_MS,
+    label: "Switch database",
+  });
 export const disconnectDb = (id) => invoke("disconnect_db", { id });
 export const getConnectionStatuses = () => invoke("get_connection_statuses");
 export const detectSageEdition = (connectionId) => invoke("detect_sage_edition", { connectionId });
@@ -82,15 +98,27 @@ export const getActiveSchemas = () => invoke("get_active_schemas");
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
-export const getTables = (id) => invoke("get_tables", { id });
+export const getTables = (id) => invokeWithTimeout("get_tables", { id }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "Load tables",
+});
 export const getColumns = (id, schema, table) =>
-  invoke("get_columns", { id, schema, table });
-export const getRelationships = (id) => invoke("get_relationships", { id });
+  invokeWithTimeout("get_columns", { id, schema, table }, {
+    timeoutMs: METADATA_TIMEOUT_MS,
+    label: `Load columns for ${schema}.${table}`,
+  });
+export const getRelationships = (id) => invokeWithTimeout("get_relationships", { id }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "Load relationships",
+});
 
 // ─── Data ─────────────────────────────────────────────────────────────────────
 
 export const getTableData = (id, schema, table, page, pageSize, filters) =>
-  invoke("get_table_data", { id, schema, table, page, pageSize, filters });
+  invokeWithTimeout("get_table_data", { id, schema, table, page, pageSize, filters }, {
+    timeoutMs: TABLE_DATA_TIMEOUT_MS,
+    label: `Load rows for ${schema}.${table}`,
+  });
 
 export const executeQuery = (id, sql) => invoke("execute_query", { id, sql });
 export const listSavedQueries = (connectionId = null) =>
@@ -175,7 +203,10 @@ export const exportToCsv = async (id, schema, table, filters, selectedColumns) =
     filters: [{ name: "CSV", extensions: ["csv"] }],
   });
   if (!filePath) return null;
-  return invoke("export_csv", { id, schema, table, filters, selectedColumns, filePath });
+  return invokeWithTimeout("export_csv", { id, schema, table, filters, selectedColumns, filePath }, {
+    timeoutMs: EXPORT_TIMEOUT_MS,
+    label: `Export CSV for ${schema}.${table}`,
+  });
 };
 
 export const exportToJson = async (id, schema, table, filters, selectedColumns) => {
@@ -184,7 +215,10 @@ export const exportToJson = async (id, schema, table, filters, selectedColumns) 
     filters: [{ name: "JSON", extensions: ["json"] }],
   });
   if (!filePath) return null;
-  return invoke("export_json", { id, schema, table, filters, selectedColumns, filePath });
+  return invokeWithTimeout("export_json", { id, schema, table, filters, selectedColumns, filePath }, {
+    timeoutMs: EXPORT_TIMEOUT_MS,
+    label: `Export JSON for ${schema}.${table}`,
+  });
 };
 
 export const exportToSql = async (id, schema, table, filters) => {
@@ -193,7 +227,10 @@ export const exportToSql = async (id, schema, table, filters) => {
     filters: [{ name: "SQL", extensions: ["sql"] }],
   });
   if (!filePath) return null;
-  return invoke("export_sql", { id, schema, table, filters, filePath });
+  return invokeWithTimeout("export_sql", { id, schema, table, filters, filePath }, {
+    timeoutMs: EXPORT_TIMEOUT_MS,
+    label: `Export SQL for ${schema}.${table}`,
+  });
 };
 
 export const exportToExcel = async (id, schema, table, filters, selectedColumns) => {
@@ -203,41 +240,43 @@ export const exportToExcel = async (id, schema, table, filters, selectedColumns)
   });
   if (!filePath) return null;
 
-  const { columns, rows } = await fetchTableRows(id, schema, table, filters);
-  const selectedSet = new Set(selectedColumns);
-  const exportIndexes = columns
-    .map((column, index) => ({ column, index }))
-    .filter(({ column }) => selectedSet.size === 0 || selectedSet.has(column.name));
+  return withTimeout((async () => {
+    const { columns, rows } = await fetchTableRows(id, schema, table, filters);
+    const selectedSet = new Set(selectedColumns);
+    const exportIndexes = columns
+      .map((column, index) => ({ column, index }))
+      .filter(({ column }) => selectedSet.size === 0 || selectedSet.has(column.name));
 
-  const headers = exportIndexes.map(({ column }) => column.name);
-  const body = rows.map((row) => exportIndexes.map(({ index }) => row[index]));
+    const headers = exportIndexes.map(({ column }) => column.name);
+    const body = rows.map((row) => exportIndexes.map(({ index }) => row[index]));
 
-  const worksheet = XLSX.utils.aoa_to_sheet([headers, ...body]);
-  const workbook = XLSX.utils.book_new();
-  const sheetName = `${schema}_${table}`.replace(/[\\/?*\[\]:]/g, "_").slice(0, 31) || "Export";
-  const range = XLSX.utils.decode_range(worksheet["!ref"] || "A1");
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...body]);
+    const workbook = XLSX.utils.book_new();
+    const sheetName = `${schema}_${table}`.replace(/[\\/?*\[\]:]/g, "_").slice(0, 31) || "Export";
+    const range = XLSX.utils.decode_range(worksheet["!ref"] || "A1");
 
-  worksheet["!cols"] = headers.map((header, index) => {
-    const sampleWidth = body.reduce((max, row) => {
-      const value = row[index];
-      const length = value == null ? 4 : String(value).length;
-      return Math.max(max, length);
-    }, header.length);
-    return { wch: Math.min(Math.max(sampleWidth + 2, 10), 40) };
-  });
-  worksheet["!autofilter"] = {
-    ref: XLSX.utils.encode_range({
-      s: { r: 0, c: 0 },
-      e: { r: range.e.r, c: range.e.c },
-    }),
-  };
+    worksheet["!cols"] = headers.map((header, index) => {
+      const sampleWidth = body.reduce((max, row) => {
+        const value = row[index];
+        const length = value == null ? 4 : String(value).length;
+        return Math.max(max, length);
+      }, header.length);
+      return { wch: Math.min(Math.max(sampleWidth + 2, 10), 40) };
+    });
+    worksheet["!autofilter"] = {
+      ref: XLSX.utils.encode_range({
+        s: { r: 0, c: 0 },
+        e: { r: range.e.r, c: range.e.c },
+      }),
+    };
 
-  XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
 
-  const contents = new Uint8Array(XLSX.write(workbook, { bookType: "xlsx", type: "array" }));
-  await writeBinaryFile(filePath, contents);
+    const contents = new Uint8Array(XLSX.write(workbook, { bookType: "xlsx", type: "array" }));
+    await writeBinaryFile(filePath, contents);
 
-  return filePath;
+    return filePath;
+  })(), EXPORT_TIMEOUT_MS, `Export Excel for ${schema}.${table}`);
 };
 
 // ─── Invoicing ───────────────────────────────────────────────────────────────
@@ -286,18 +325,43 @@ export const getInvoice = (id, pieceId) => {
     throw error;
   });
 };
-export const createInvoice = (id, invoice) => invoke("create_invoice", { id, invoice });
-export const updateInvoice = (id, invoice) => invoke("update_invoice", { id, invoice });
+export const createInvoice = (id, invoice) => runInvoiceMutation(
+  "createInvoice",
+  "create_invoice",
+  { id, invoice },
+  "Create invoice",
+);
+export const updateInvoice = (id, invoice) => runInvoiceMutation(
+  "updateInvoice",
+  "update_invoice",
+  { id, invoice },
+  "Update invoice",
+);
 
-export const updateStatut = (id, pieceId, newStatut, updatedBy = "") => invoke("update_statut", {
-  id,
-  pieceId,
-  newStatut,
-  updatedBy,
-});
+export const updateStatut = (id, pieceId, newStatut, updatedBy = "") => runInvoiceMutation(
+  "updateStatut",
+  "update_statut",
+  {
+    id,
+    pieceId,
+    newStatut,
+    updatedBy,
+  },
+  "Update invoice status",
+);
 
-export const deleteInvoice = (id, pieceId) => invoke("delete_invoice", { id, pieceId });
-export const comptabiliserInvoice = (id, pieceId) => invoke("comptabiliser_invoice", { id, pieceId });
+export const deleteInvoice = (id, pieceId) => runInvoiceMutation(
+  "deleteInvoice",
+  "delete_invoice",
+  { id, pieceId },
+  "Delete invoice",
+);
+export const comptabiliserInvoice = (id, pieceId) => runInvoiceMutation(
+  "comptabiliserInvoice",
+  "comptabiliser_invoice",
+  { id, pieceId },
+  "Post invoice",
+);
 
 export const listTiers = (id, typeTiers = "all", search = null, { limit = 40 } = {}) =>
   invokeWithTimeout("list_tiers", {

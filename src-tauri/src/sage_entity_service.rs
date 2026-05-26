@@ -1,12 +1,12 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use tauri::State;
 
 use crate::db;
-use crate::sage_compat::SageEdition;
-use crate::state::{AppState, TableInfo, ColumnInfo};
 use crate::invoice_compat::InvoiceSchema;
+use crate::sage_compat::SageEdition;
+use crate::state::{AppState, ColumnInfo, TableInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TiersSummary {
@@ -128,10 +128,14 @@ pub async fn resolve_entity_search_context(
             "CUSTOMERS".to_string(),
             "SUPPLIERS".to_string(),
         ],
-    ).await;
+    )
+    .await;
 
     if let Some(ref t) = tiers_table {
-        println!("[SageEntityService] Detected tiers table: {}.{}", t.schema, t.name);
+        println!(
+            "[SageEntityService] Detected tiers table: {}.{}",
+            t.schema, t.name
+        );
     } else {
         println!("[SageEntityService] No tiers table detected");
     }
@@ -147,21 +151,50 @@ pub async fn resolve_entity_search_context(
             "ITEMS".to_string(),
             "PRODUCTS".to_string(),
         ],
-    ).await;
+    )
+    .await;
 
     if let Some(ref a) = article_table {
-        println!("[SageEntityService] Detected article table: {}.{}", a.schema, a.name);
+        println!(
+            "[SageEntityService] Detected article table: {}.{}",
+            a.schema, a.name
+        );
     } else {
         println!("[SageEntityService] No article table detected");
     }
 
     let tiers_mapping = if let Some(table) = tiers_table {
         Some(ResolvedTiersMapping {
-            col_id: pick_required(&table, &["oid", "CT_Num", "id", "TIERS_ID"]).unwrap_or_else(|_| "CT_Num".to_string()),
-            col_code: pick_required(&table, &[&native.table_tiers, "code", "CT_Num", "numero", "TIERS_CODE"]).unwrap_or_else(|_| "CT_Num".to_string()),
-            col_nom: pick_required(&table, &["raisonSociale", "CT_Intitule", "Caption", "nom", "TIERS_NAME", "INTITULE"]).unwrap_or_else(|_| "CT_Intitule".to_string()),
+            col_id: pick_required(&table, &["oid", "CT_Num", "id", "TIERS_ID"])
+                .unwrap_or_else(|_| "CT_Num".to_string()),
+            col_code: pick_required(
+                &table,
+                &[
+                    &native.table_tiers,
+                    "code",
+                    "CT_Num",
+                    "numero",
+                    "TIERS_CODE",
+                ],
+            )
+            .unwrap_or_else(|_| "CT_Num".to_string()),
+            col_nom: pick_required(
+                &table,
+                &[
+                    "raisonSociale",
+                    "CT_Intitule",
+                    "Caption",
+                    "nom",
+                    "TIERS_NAME",
+                    "INTITULE",
+                ],
+            )
+            .unwrap_or_else(|_| "CT_Intitule".to_string()),
             col_adresse: pick_optional(&table, &["adresse", "adresse1", "CT_Adresse", "voie"]),
-            col_cp: pick_optional(&table, &["codePostal", "CT_CodePostal", "cp", "CODE_POSTAL"]),
+            col_cp: pick_optional(
+                &table,
+                &["codePostal", "CT_CodePostal", "cp", "CODE_POSTAL"],
+            ),
             col_ville: pick_optional(&table, &["ville", "CT_Ville"]),
             col_pays: pick_optional(&table, &["pays", "CT_Pays"]),
             col_siret: pick_optional(&table, &["siret", "CT_Siret", "siren"]),
@@ -178,10 +211,41 @@ pub async fn resolve_entity_search_context(
     let article_mapping = if let Some(table) = article_table {
         Some(ResolvedArticleMapping {
             col_id: pick_optional(&table, &["oid", "AR_Ref", "id"]),
-            col_code: pick_required(&table, &[&native.col_article_code, "AR_Ref", "code", "ITEM_CODE"]).unwrap_or_else(|_| "AR_Ref".to_string()),
-            col_libelle: pick_required(&table, &[&native.col_article_libelle, "AR_Design", "Caption", "libelle", "ITEM_NAME", "DESIGNATION"]).unwrap_or_else(|_| "AR_Design".to_string()),
-            col_pu: pick_optional(&table, &[&native.col_article_pu, "AR_PrixVen", "prix_ht", "UNIT_PRICE"]),
-            col_tva: pick_optional(&table, &[&native.col_article_tva, "AR_TauxTva", "taux_tva", "VAT_RATE"]),
+            col_code: pick_required(
+                &table,
+                &[&native.col_article_code, "AR_Ref", "code", "ITEM_CODE"],
+            )
+            .unwrap_or_else(|_| "AR_Ref".to_string()),
+            col_libelle: pick_required(
+                &table,
+                &[
+                    &native.col_article_libelle,
+                    "AR_Design",
+                    "Caption",
+                    "libelle",
+                    "ITEM_NAME",
+                    "DESIGNATION",
+                ],
+            )
+            .unwrap_or_else(|_| "AR_Design".to_string()),
+            col_pu: pick_optional(
+                &table,
+                &[
+                    &native.col_article_pu,
+                    "AR_PrixVen",
+                    "prix_ht",
+                    "UNIT_PRICE",
+                ],
+            ),
+            col_tva: pick_optional(
+                &table,
+                &[
+                    &native.col_article_tva,
+                    "AR_TauxTva",
+                    "taux_tva",
+                    "VAT_RATE",
+                ],
+            ),
             col_ref: pick_optional(&table, &[&native.col_article_ref, "AR_Ref", "reference"]),
             col_unite: pick_optional(&table, &["unite", "AR_UniteVen", "UV_Code"]),
             col_active: pick_optional(&table, &["actif", "AR_Sommeil", "en_activite"]),
@@ -202,9 +266,14 @@ pub async fn load_table(
     tables: &[TableInfo],
     candidates: &[String],
 ) -> Result<ResolvedTable, String> {
-    let info = candidates.iter().find_map(|candidate| {
-        tables.iter().find(|t| t.name.eq_ignore_ascii_case(candidate))
-    }).ok_or_else(|| format!("Required table not found. Tried: {}", candidates.join(", ")))?;
+    let info = candidates
+        .iter()
+        .find_map(|candidate| {
+            tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(candidate))
+        })
+        .ok_or_else(|| format!("Required table not found. Tried: {}", candidates.join(", ")))?;
 
     let columns = db::get_columns(client, &info.schema, &info.name).await?;
     let column_map = columns
@@ -225,10 +294,14 @@ async fn load_table_optional(
     candidates: &[String],
 ) -> Option<ResolvedTable> {
     let info = candidates.iter().find_map(|candidate| {
-        tables.iter().find(|t| t.name.eq_ignore_ascii_case(candidate))
+        tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(candidate))
     })?;
 
-    let columns = db::get_columns(client, &info.schema, &info.name).await.ok()?;
+    let columns = db::get_columns(client, &info.schema, &info.name)
+        .await
+        .ok()?;
     let column_map = columns
         .into_iter()
         .map(|column| (column.name.to_ascii_lowercase(), column))

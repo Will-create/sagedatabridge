@@ -2,6 +2,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use tauri::State;
@@ -144,6 +145,44 @@ pub fn remove_admin_password(state: State<AppState>) -> Result<(), String> {
     state.save_config()
 }
 
+// ─── Settings ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub query_timeout_secs: u64,
+    pub dashboard_timeout_secs: u64,
+    pub login_timeout_secs: u64,
+    pub account_ar: String,
+    pub account_sales: String,
+    pub account_vat: String,
+}
+
+#[tauri::command]
+pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(AppSettings {
+        query_timeout_secs: config.query_timeout_secs,
+        dashboard_timeout_secs: config.dashboard_timeout_secs,
+        login_timeout_secs: config.login_timeout_secs,
+        account_ar: config.account_ar.clone(),
+        account_sales: config.account_sales.clone(),
+        account_vat: config.account_vat.clone(),
+    })
+}
+
+#[tauri::command]
+pub fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config.query_timeout_secs = settings.query_timeout_secs;
+    config.dashboard_timeout_secs = settings.dashboard_timeout_secs;
+    config.login_timeout_secs = settings.login_timeout_secs;
+    config.account_ar = settings.account_ar;
+    config.account_sales = settings.account_sales;
+    config.account_vat = settings.account_vat;
+    drop(config);
+    state.save_config()
+}
+
 // ─── Field History ────────────────────────────────────────────────────────────
 
 /// Get the input history for a field key (most recent first, max 10)
@@ -261,7 +300,14 @@ pub fn save_connection(
             "conn_username".to_string(),
             connection.username.clone(),
         );
+        {
+            let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
+            if let Some(active_connection) = active.get_mut(&updated.id) {
+                active_connection.config = updated.clone();
+            }
+        }
         state.invalidate_client_cache(&updated.id)?;
+        sync_active_schema_for_connection(&state, &updated.id, &updated)?;
 
         Ok(updated)
     } else {
@@ -335,6 +381,279 @@ pub async fn discover_databases(connection: ConnectionConfig) -> Result<Vec<Stri
 
 // ─── Schema Detection ─────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct SchemaResolutionOutcome {
+    schema: SageSchema,
+    source: &'static str,
+    evidence: Vec<String>,
+    confidence: u8,
+}
+
+fn explicit_schema_for_connection(connection: &ConnectionConfig) -> Option<SageSchema> {
+    match connection.sage_edition.as_str() {
+        "sage100" => Some(SageSchema::for_edition(&SageEdition::Sage100)),
+        "sage1000" => Some(SageSchema::for_edition(&SageEdition::Sage1000)),
+        "sagex3" => Some(SageSchema::for_edition(&SageEdition::SageX3)),
+        "custom" => Some(
+            connection
+                .custom_schema
+                .clone()
+                .unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic)),
+        ),
+        _ => None,
+    }
+}
+
+fn sync_active_schema_for_connection(
+    state: &State<'_, AppState>,
+    id: &str,
+    connection: &ConnectionConfig,
+) -> Result<(), String> {
+    let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
+    if let Some(schema) = explicit_schema_for_connection(connection) {
+        schemas.insert(id.to_string(), schema);
+    } else {
+        schemas.remove(id);
+    }
+    Ok(())
+}
+
+fn connection_profile_summary(connection: &ConnectionConfig) -> String {
+    let host = connection.host.trim();
+    let instance = connection.instance_name.trim();
+    let server = if instance.is_empty() {
+        host.to_string()
+    } else {
+        format!("{}\\{}", host, instance)
+    };
+    format!(
+        "server={} database={} auth={} encrypt={} trust_cert={}",
+        server,
+        connection.database.trim(),
+        if connection.use_windows_auth {
+            "windows"
+        } else {
+            "sql"
+        },
+        connection.encrypt,
+        connection.trust_cert,
+    )
+}
+
+fn detect_sage_schema_from_probes(
+    found100: Vec<String>,
+    found_x3: Vec<String>,
+    found1000: Vec<String>,
+    has_tecriture_edate: bool,
+) -> DetectionResult {
+    if found100.len() >= 3 {
+        let schema = SageSchema::for_edition(&SageEdition::Sage100);
+        return DetectionResult {
+            edition: "sage100".into(),
+            confidence: 95,
+            evidence: found100,
+            schema,
+        };
+    }
+
+    if found_x3.len() >= 3 {
+        let schema = SageSchema::for_edition(&SageEdition::SageX3);
+        return DetectionResult {
+            edition: "sagex3".into(),
+            confidence: 92,
+            evidence: found_x3,
+            schema,
+        };
+    }
+
+    if found1000.len() >= 4 {
+        let mut confidence = 95;
+        let mut evidence = found1000;
+        if evidence
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("TECRITURE"))
+            && has_tecriture_edate
+        {
+            confidence = 99;
+            evidence.push("TECRITURE.eDate".into());
+        }
+
+        let mut schema = SageSchema::for_edition(&SageEdition::Sage1000);
+        schema.confidence = confidence;
+        return DetectionResult {
+            edition: "sage1000".into(),
+            confidence,
+            evidence,
+            schema,
+        };
+    }
+
+    let mut evidence = Vec::new();
+    evidence.extend(found100.into_iter().map(|name| format!("sage100:{}", name)));
+    evidence.extend(found_x3.into_iter().map(|name| format!("sagex3:{}", name)));
+    evidence.extend(
+        found1000
+            .into_iter()
+            .map(|name| format!("sage1000:{}", name)),
+    );
+    if has_tecriture_edate {
+        evidence.push("sage1000:TECRITURE.eDate".into());
+    }
+
+    let schema = SageSchema::for_edition(&SageEdition::Generic);
+    DetectionResult {
+        edition: "generic".into(),
+        confidence: 0,
+        evidence,
+        schema,
+    }
+}
+
+fn has_custom_mapping(schema: &SageSchema) -> bool {
+    !schema.table_ecritures.trim().is_empty()
+        || !schema.table_comptes.trim().is_empty()
+        || !schema.table_tiers.trim().is_empty()
+        || !schema.table_journaux.trim().is_empty()
+}
+
+fn resolve_schema_from_selection(
+    requested_edition: &str,
+    custom_schema: Option<SageSchema>,
+    detection: Option<DetectionResult>,
+) -> SchemaResolutionOutcome {
+    let requested = requested_edition.trim().to_ascii_lowercase();
+    let custom_schema = custom_schema.filter(has_custom_mapping);
+
+    match requested.as_str() {
+        "sage100" => {
+            let schema = SageSchema::for_edition(&SageEdition::Sage100);
+            SchemaResolutionOutcome {
+                confidence: schema.confidence,
+                schema,
+                source: "manual",
+                evidence: vec!["manual:sage100".into()],
+            }
+        }
+        "sage1000" => {
+            let schema = SageSchema::for_edition(&SageEdition::Sage1000);
+            SchemaResolutionOutcome {
+                confidence: schema.confidence,
+                schema,
+                source: "manual",
+                evidence: vec!["manual:sage1000".into()],
+            }
+        }
+        "sagex3" => {
+            let schema = SageSchema::for_edition(&SageEdition::SageX3);
+            SchemaResolutionOutcome {
+                confidence: schema.confidence,
+                schema,
+                source: "manual",
+                evidence: vec!["manual:sagex3".into()],
+            }
+        }
+        "custom" => {
+            let schema =
+                custom_schema.unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic));
+            let confidence = schema.confidence;
+            SchemaResolutionOutcome {
+                schema,
+                confidence,
+                source: "custom",
+                evidence: vec!["manual:custom".into()],
+            }
+        }
+        _ => {
+            if let Some(detection) = detection
+                .as_ref()
+                .filter(|result| !result.schema.edition.is_generic())
+            {
+                return SchemaResolutionOutcome {
+                    schema: detection.schema.clone(),
+                    confidence: detection.confidence,
+                    source: "auto-detect",
+                    evidence: detection.evidence.clone(),
+                };
+            }
+
+            if let Some(schema) = custom_schema {
+                let confidence = schema.confidence;
+                return SchemaResolutionOutcome {
+                    schema,
+                    confidence,
+                    source: "custom-fallback",
+                    evidence: vec!["fallback:custom".into()],
+                };
+            }
+
+            let detection = detection.unwrap_or_else(|| DetectionResult {
+                edition: "generic".into(),
+                confidence: 0,
+                evidence: vec![],
+                schema: SageSchema::for_edition(&SageEdition::Generic),
+            });
+            SchemaResolutionOutcome {
+                schema: detection.schema.clone(),
+                confidence: detection.confidence,
+                source: "generic-fallback",
+                evidence: detection.evidence,
+            }
+        }
+    }
+}
+
+async fn resolve_schema_for_connection(
+    connection_id: &str,
+    connection: &ConnectionConfig,
+) -> SchemaResolutionOutcome {
+    let detection = if connection.sage_edition == "auto" {
+        match db::connect(connection).await {
+            Ok(mut client) => match detect_sage_schema(&mut client).await {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    eprintln!(
+                        "[sage] schema_detect_error connection_id={} profile=\"{}\" error={}",
+                        connection_id,
+                        connection_profile_summary(connection),
+                        error,
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "[sage] schema_probe_connect_error connection_id={} profile=\"{}\" error={}",
+                    connection_id,
+                    connection_profile_summary(connection),
+                    error,
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let outcome = resolve_schema_from_selection(
+        &connection.sage_edition,
+        connection.custom_schema.clone(),
+        detection,
+    );
+
+    eprintln!(
+        "[sage] schema_resolved connection_id={} profile=\"{}\" requested={} resolved={} source={} confidence={} evidence={:?}",
+        connection_id,
+        connection_profile_summary(connection),
+        connection.sage_edition,
+        outcome.schema.edition.as_str(),
+        outcome.source,
+        outcome.confidence,
+        outcome.evidence,
+    );
+
+    outcome
+}
+
 async fn probe_tables(
     client: &mut db::DbClient,
     candidates: &[&str],
@@ -377,28 +696,9 @@ async fn probe_column(
 async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult, String> {
     let sage100_candidates = ["F_ECRITUREC", "F_COMPTET", "F_TIERS", "F_JOURNAL"];
     let found100 = probe_tables(client, &sage100_candidates).await?;
-    if found100.len() >= 3 {
-        let schema = SageSchema::for_edition(&SageEdition::Sage100);
-        return Ok(DetectionResult {
-            edition: "sage100".into(),
-            confidence: 95,
-            evidence: found100,
-            schema,
-        });
-    }
 
     let sagex3_candidates = ["GACCENTRY", "GACCOUNT", "BPARTNER", "GJOURNAL"];
     let found_x3 = probe_tables(client, &sagex3_candidates).await?;
-    if found_x3.len() >= 3 {
-        let schema = SageSchema::for_edition(&SageEdition::SageX3);
-        return Ok(DetectionResult {
-            edition: "sagex3".into(),
-            confidence: 92,
-            evidence: found_x3,
-            schema,
-        });
-    }
-
     let sage1000_candidates = [
         "TECRITURE",
         "TCOMPTEGENERAL",
@@ -407,35 +707,17 @@ async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult
         "TPIECE",
     ];
     let found1000 = probe_tables(client, &sage1000_candidates).await?;
-    if found1000.len() >= 4 {
-        let mut confidence = 95;
-        let mut evidence = found1000;
-        if evidence
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("TECRITURE"))
-            && probe_column(client, "TECRITURE", "eDate").await?
-        {
-            confidence = 99;
-            evidence.push("TECRITURE.eDate".into());
-        }
+    let has_tecriture_edate = found1000
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("TECRITURE"))
+        && probe_column(client, "TECRITURE", "eDate").await?;
 
-        let mut schema = SageSchema::for_edition(&SageEdition::Sage1000);
-        schema.confidence = confidence;
-        return Ok(DetectionResult {
-            edition: "sage1000".into(),
-            confidence,
-            evidence,
-            schema,
-        });
-    }
-
-    let schema = SageSchema::for_edition(&SageEdition::Generic);
-    Ok(DetectionResult {
-        edition: "generic".into(),
-        confidence: 0,
-        evidence: vec![],
-        schema,
-    })
+    Ok(detect_sage_schema_from_probes(
+        found100,
+        found_x3,
+        found1000,
+        has_tecriture_edate,
+    ))
 }
 
 fn store_schema_for_connection(
@@ -512,6 +794,14 @@ pub async fn detect_sage_edition(
     let mut client = db::connect(&config).await?;
     let result = detect_sage_schema(&mut client).await?;
     store_schema_for_connection(&state, &connection_id, result.schema.clone())?;
+    eprintln!(
+        "[sage] schema_detected connection_id={} profile=\"{}\" detected={} confidence={} evidence={:?}",
+        connection_id,
+        connection_profile_summary(&config),
+        result.schema.edition.as_str(),
+        result.confidence,
+        result.evidence,
+    );
     Ok(result)
 }
 
@@ -537,8 +827,6 @@ pub fn get_active_schemas(state: State<AppState>) -> Result<HashMap<String, Sage
 pub async fn connect_db(state: State<'_, AppState>, id: String) -> Result<String, String> {
     // Get the config with real password
     let conn_config = load_connection_config(&state, &id)?;
-    let sage_edition = conn_config.sage_edition.clone();
-    let custom_schema = conn_config.custom_schema.clone();
 
     // Mark as connecting
     {
@@ -562,17 +850,9 @@ pub async fn connect_db(state: State<'_, AppState>, id: String) -> Result<String
                 }
             }
 
-            // Resolve and store schema
-            let schema = match sage_edition.as_str() {
-                "sage100" => SageSchema::for_edition(&SageEdition::Sage100),
-                "sage1000" => SageSchema::for_edition(&SageEdition::Sage1000),
-                "sagex3" => SageSchema::for_edition(&SageEdition::SageX3),
-                "custom" => {
-                    custom_schema.unwrap_or_else(|| SageSchema::for_edition(&SageEdition::Generic))
-                }
-                _ => SageSchema::for_edition(&SageEdition::Generic),
-            };
-
+            let schema = resolve_schema_for_connection(&id, &conn_config)
+                .await
+                .schema;
             {
                 let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
                 schemas.insert(id.clone(), schema);
@@ -636,13 +916,27 @@ pub async fn switch_database(
 
     match switch_result {
         Ok(_) => {
-            let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
-            active.insert(
+            {
+                let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
+                active.insert(
+                    connection_id.clone(),
+                    ActiveConnection {
+                        config: next_config.clone(),
+                        status: ConnectionStatus::Connected,
+                    },
+                );
+            }
+            let resolved_schema = resolve_schema_for_connection(&connection_id, &next_config).await;
+            let resolved_edition = resolved_schema.schema.edition.as_str().to_string();
+            let resolved_confidence = resolved_schema.confidence;
+            store_schema_for_connection(&state, &connection_id, resolved_schema.schema)?;
+            eprintln!(
+                "[sage] database_switched connection_id={} from_database={} to_database={} resolved={} confidence={}",
                 connection_id,
-                ActiveConnection {
-                    config: next_config,
-                    status: ConnectionStatus::Connected,
-                },
+                current_config.database,
+                next_database,
+                resolved_edition,
+                resolved_confidence,
             );
             Ok(())
         }
@@ -671,6 +965,9 @@ pub fn disconnect_db(state: State<AppState>, id: String) -> Result<(), String> {
     let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
     active.remove(&id);
     drop(active);
+    let mut schemas = state.active_schemas.lock().map_err(|e| e.to_string())?;
+    schemas.remove(&id);
+    drop(schemas);
     state.invalidate_client_cache(&id)
 }
 
@@ -897,6 +1194,130 @@ pub fn clear_query_history(
     }
     drop(config);
     state.save_config()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_sage1000_from_probe_fixture() {
+        let result = detect_sage_schema_from_probes(
+            vec![],
+            vec![],
+            vec![
+                "TECRITURE".into(),
+                "TCOMPTEGENERAL".into(),
+                "TTIERS".into(),
+                "TROLETIERS".into(),
+                "TPIECE".into(),
+            ],
+            true,
+        );
+
+        assert_eq!(result.edition, "sage1000");
+        assert_eq!(result.schema.edition, SageEdition::Sage1000);
+        assert_eq!(result.confidence, 99);
+        assert!(result.evidence.iter().any(|item| item == "TECRITURE.eDate"));
+    }
+
+    #[test]
+    fn detect_sage100_from_probe_fixture() {
+        let result = detect_sage_schema_from_probes(
+            vec!["F_ECRITUREC".into(), "F_COMPTET".into(), "F_TIERS".into()],
+            vec![],
+            vec![],
+            false,
+        );
+
+        assert_eq!(result.edition, "sage100");
+        assert_eq!(result.schema.edition, SageEdition::Sage100);
+        assert_eq!(result.confidence, 95);
+    }
+
+    #[test]
+    fn auto_selection_uses_detected_sage1000_schema() {
+        let detection = DetectionResult {
+            edition: "sage1000".into(),
+            confidence: 99,
+            evidence: vec!["TECRITURE".into(), "TCOMPTEGENERAL".into()],
+            schema: SageSchema::for_edition(&SageEdition::Sage1000),
+        };
+
+        let resolved = resolve_schema_from_selection("auto", None, Some(detection));
+
+        assert_eq!(resolved.schema.edition, SageEdition::Sage1000);
+        assert_eq!(resolved.source, "auto-detect");
+        assert_eq!(resolved.confidence, 99);
+    }
+
+    #[test]
+    fn manual_sage1000_override_wins_over_detection() {
+        let detection = DetectionResult {
+            edition: "sage100".into(),
+            confidence: 95,
+            evidence: vec!["F_ECRITUREC".into()],
+            schema: SageSchema::for_edition(&SageEdition::Sage100),
+        };
+
+        let resolved = resolve_schema_from_selection("sage1000", None, Some(detection));
+
+        assert_eq!(resolved.schema.edition, SageEdition::Sage1000);
+        assert_eq!(resolved.source, "manual");
+        assert!(resolved
+            .evidence
+            .iter()
+            .any(|item| item == "manual:sage1000"));
+    }
+
+    #[test]
+    fn auto_selection_uses_custom_mapping_when_probe_is_generic() {
+        let mut custom = SageSchema::for_edition(&SageEdition::Generic);
+        custom.table_ecritures = "CUSTOM_ECRITURES".into();
+        custom.table_comptes = "CUSTOM_COMPTES".into();
+        custom.table_tiers = "CUSTOM_TIERS".into();
+        custom.table_journaux = "CUSTOM_JOURNAUX".into();
+        custom.confidence = 61;
+
+        let detection = DetectionResult {
+            edition: "generic".into(),
+            confidence: 0,
+            evidence: vec!["sage1000:TECRITURE".into()],
+            schema: SageSchema::for_edition(&SageEdition::Generic),
+        };
+
+        let resolved = resolve_schema_from_selection("auto", Some(custom.clone()), Some(detection));
+
+        assert_eq!(resolved.schema.table_ecritures, custom.table_ecritures);
+        assert_eq!(resolved.source, "custom-fallback");
+        assert!(resolved
+            .evidence
+            .iter()
+            .any(|item| item == "fallback:custom"));
+    }
+
+    #[test]
+    fn auto_selection_refreshes_when_detection_changes_after_database_switch() {
+        let sage100 = DetectionResult {
+            edition: "sage100".into(),
+            confidence: 95,
+            evidence: vec!["F_ECRITUREC".into()],
+            schema: SageSchema::for_edition(&SageEdition::Sage100),
+        };
+        let sage1000 = DetectionResult {
+            edition: "sage1000".into(),
+            confidence: 99,
+            evidence: vec!["TECRITURE".into()],
+            schema: SageSchema::for_edition(&SageEdition::Sage1000),
+        };
+
+        let initial = resolve_schema_from_selection("auto", None, Some(sage100));
+        let after_switch = resolve_schema_from_selection("auto", None, Some(sage1000));
+
+        assert_eq!(initial.schema.edition, SageEdition::Sage100);
+        assert_eq!(after_switch.schema.edition, SageEdition::Sage1000);
+        assert_eq!(after_switch.source, "auto-detect");
+    }
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────

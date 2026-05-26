@@ -131,7 +131,7 @@ export default function Sidebar({
 
   return (
     <>
-      <aside className="sidebar">
+      <aside className={`sidebar ${disabled ? "disabled" : ""}`}>
         <div className="sidebar-header">
           <div className="sidebar-logo">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -141,7 +141,7 @@ export default function Sidebar({
             </svg>
             Sage Bridge
           </div>
-          <button className="panel-header-btn" onClick={onCollapse} title={t("panel_hide_connections")}>
+          <button className="panel-header-btn" onClick={onCollapse} title={t("panel_hide_connections")} disabled={disabled}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M15 18l-6-6 6-6" />
             </svg>
@@ -162,9 +162,10 @@ export default function Sidebar({
                 key={connection.id}
                 type="button"
                 className={`sidebar-item ${activeId === connection.id ? "active" : ""}`}
-                onClick={() => onSelectConnection(connection.id)}
-                onContextMenu={(event) => handleContextMenu(event, connection)}
+                onClick={() => !disabled && onSelectConnection(connection.id)}
+                onContextMenu={(event) => !disabled && handleContextMenu(event, connection)}
                 title={meta}
+                disabled={disabled}
               >
                 <span className={`dot ${status}`} />
                 <span className="sidebar-item-copy">
@@ -184,7 +185,7 @@ export default function Sidebar({
 
         <div className="sidebar-footer">
           {adminMode && activeId && activeDatabase ? (
-            <button className="sidebar-dashboard-btn" onClick={onOpenDashboard}>
+            <button className="sidebar-dashboard-btn" onClick={onOpenDashboard} disabled={disabled}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M3 3v18h18" />
                 <path d="M7 14l3-3 3 2 4-6" />
@@ -197,6 +198,7 @@ export default function Sidebar({
             <button
               className={`sidebar-dashboard-btn ${invoicingOpen ? "active" : ""}`}
               onClick={onOpenInvoicing}
+              disabled={disabled}
             >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M6 3h9l3 3v15H6z" />
@@ -212,6 +214,7 @@ export default function Sidebar({
               setEditingConn(null);
               setShowModal(true);
             }}
+            disabled={disabled}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
               <line x1="12" y1="5" x2="12" y2="19" />
@@ -220,7 +223,7 @@ export default function Sidebar({
             {t("sidebar_new")}
           </button>
 
-          <button className="sidebar-settings-btn" onClick={onOpenSettings}>
+          <button className="sidebar-settings-btn" onClick={onOpenSettings} disabled={disabled}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10.09 3H10a2 2 0 1 1 4 0h-.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01A1.65 1.65 0 0 0 21 10.09V10a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
@@ -246,6 +249,55 @@ export default function Sidebar({
             </svg>
             {t("refresh")}
           </div>
+
+          {getStatus(contextMenu.connection.id) === "connected" && (
+            <div
+              className={`context-menu-item ${dbSubmenu ? "active" : ""}`}
+              onMouseEnter={() => handleOpenDatabases(contextMenu.connection)}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenDatabases(contextMenu.connection);
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <ellipse cx="12" cy="5" rx="9" ry="3" />
+                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+              </svg>
+              {t("sidebar_databases")}
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginLeft: "auto", opacity: 0.5 }}>
+                <path d="M9 18l6-6-6-6" />
+              </svg>
+
+              {dbSubmenu?.connection?.id === contextMenu.connection.id && (
+                <div className="context-submenu">
+                  {dbSubmenu.loading ? (
+                    <div className="context-menu-item disabled">
+                      <div className="spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                      {t("loading")}
+                    </div>
+                  ) : dbSubmenu.databases.length === 0 ? (
+                    <div className="context-menu-item disabled">{t("sidebar_no_databases")}</div>
+                  ) : dbSubmenu.databases.map((db) => (
+                    <div
+                      key={db}
+                      className={`context-menu-item ${activeDatabase === db && activeId === contextMenu.connection.id ? "active" : ""}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setContextMenu(null);
+                        setDbSubmenu(null);
+                        onDuplicateWithDatabase(contextMenu.connection, db);
+                      }}
+                    >
+                      <span className={`dot ${activeDatabase === db && activeId === contextMenu.connection.id ? "connected" : ""}`} style={{ width: 6, height: 6 }} />
+                      {db}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="context-menu-sep" />
           <div
             className="context-menu-item"
