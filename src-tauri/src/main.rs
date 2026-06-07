@@ -73,6 +73,9 @@ fn main() {
             commands::connect_db,
             commands::get_databases,
             commands::switch_database,
+            commands::open_database_workspace,
+            commands::close_database_workspace,
+            commands::run_connection_diagnostics,
             commands::disconnect_db,
             commands::get_connection_statuses,
             // Sage edition detection

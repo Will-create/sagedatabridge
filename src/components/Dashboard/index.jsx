@@ -708,6 +708,16 @@ function DashboardLoader({ label }) {
   );
 }
 
+function DashboardRefreshing({ active, label }) {
+  if (!active) return null;
+  return (
+    <div className="dashboard-refreshing">
+      <span className="spinner" style={{ width: 12, height: 12 }} />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 function DashboardEmpty({ title, detail }) {
   return (
     <div className="dashboard-empty">
@@ -897,6 +907,7 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
 
       <div className="dashboard-section-toolbar">
         <div className="dashboard-section-caption">{t("dashboard_overview_export_hint")}</div>
@@ -1067,6 +1078,7 @@ function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, expor
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
 
       <div className="dashboard-section-toolbar">
         <input
@@ -1203,6 +1215,7 @@ function BalanceTab({
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
 
       <div className="dashboard-section-toolbar">
         <input
@@ -1342,6 +1355,7 @@ function AuxiliaireTab({
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
 
       <div className="dashboard-section-toolbar">
         <div className="dashboard-section-caption">{t("dashboard_aux_export_hint")}</div>
@@ -1533,6 +1547,16 @@ export default function Dashboard({
     !!connId && activeTab === TAB_IDS.CLIENTS,
   );
 
+  const activeTabLoading = activeTab === TAB_IDS.OVERVIEW
+    ? overviewState.loading
+    : activeTab === TAB_IDS.GRAND_LIVRE
+      ? grandLivreState.loading
+      : activeTab === TAB_IDS.BALANCE
+        ? balanceState.loading
+        : activeTab === TAB_IDS.FOURNISSEURS
+          ? fournisseursState.loading
+          : clientsState.loading;
+
   useEffect(() => {
     setActiveTab(TAB_IDS.OVERVIEW);
     setGrandLivreSearch("");
@@ -1696,12 +1720,16 @@ export default function Dashboard({
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10.09 3H10a2 2 0 1 1 4 0h-.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01A1.65 1.65 0 0 0 21 10.09V10a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
           </button>
-          <button className="btn btn-ghost dashboard-refresh-btn" onClick={handleRefresh} title={t("toolbar_refresh")}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-              <path d="M21 3v6h-6" />
-            </svg>
-            {t("refresh")}
+          <button className="btn btn-ghost dashboard-refresh-btn" onClick={handleRefresh} title={t("toolbar_refresh")} disabled={activeTabLoading}>
+            {activeTabLoading ? (
+              <span className="spinner" style={{ width: 12, height: 12 }} />
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+            )}
+            {activeTabLoading ? t("loading") : t("refresh")}
           </button>
           <button className="btn btn-accent dashboard-export-btn" onClick={exportDashboardWorkbook} disabled={exportingWorkbook}>
             {exportingWorkbook ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {t("dashboard_exporting")}</> : t("dashboard_export_dashboard")}

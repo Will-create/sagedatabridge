@@ -35,11 +35,31 @@ pub struct ArticleSummary {
     pub id: String,
     pub code: String,
     pub libelle: String,
+    #[serde(default)]
+    pub description: String,
     pub prix_ht: f64,
+    #[serde(default)]
+    pub currency: String,
     pub taux_tva: f64,
+    #[serde(default)]
+    pub taux_bic: f64,
     pub unite: String,
     pub reference: String,
+    #[serde(default)]
+    pub category: String,
     pub en_activite: bool,
+    #[serde(default)]
+    pub revenue_account: String,
+    #[serde(default)]
+    pub expense_account: String,
+    #[serde(default)]
+    pub vat_account: String,
+    #[serde(default)]
+    pub bic_account: String,
+    #[serde(default)]
+    pub tax_exempt: bool,
+    #[serde(default)]
+    pub custom_tax_rules: String,
 }
 
 #[derive(Debug, Clone)]

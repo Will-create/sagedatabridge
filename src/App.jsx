@@ -8,8 +8,9 @@ import {
   getTableData,
   getTables,
   listConnections,
-  saveConnection,
-  switchDatabase,
+  closeDatabaseWorkspace,
+  openDatabaseWorkspace,
+  runConnectionDiagnostics,
 } from "./hooks/useTauri";
 import { useT } from "./i18n";
 
@@ -52,6 +53,24 @@ function upsertConnection(currentConnections, savedConnection) {
   return nextConnections;
 }
 
+function isWorkspaceId(id) {
+  return typeof id === "string" && id.startsWith("workspace:");
+}
+
+function emptyWorkspaceState() {
+  return {
+    tables: [],
+    activeTable: null,
+    columns: [],
+    data: null,
+    page: 0,
+    pageSize: 100,
+    filters: [],
+    mainView: "dashboard",
+    invoicingOpen: false,
+  };
+}
+
 export default function App() {
   const { t, lang } = useT();
 
@@ -62,6 +81,8 @@ export default function App() {
   const [activeSchemas, setActiveSchemas] = useState({});
   const [activeConnId, setActiveConnId] = useState(null);
   const [activeDatabase, setActiveDatabase] = useState("");
+  const [workspaces, setWorkspaces] = useState([]);
+  const [workspaceStates, setWorkspaceStates] = useState({});
   const [databases, setDatabases] = useState([]);
   const [databasesLoading, setDatabasesLoading] = useState(false);
   const [globalLoading, setGlobalLoading] = useState(false);
@@ -93,9 +114,14 @@ export default function App() {
   const [elapsed, setElapsed] = useState(null);
   const [toast, setToast] = useState(null);
 
+  const activeWorkspace = useMemo(
+    () => workspaces.find((workspace) => workspace.id === activeConnId) ?? null,
+    [activeConnId, workspaces],
+  );
+
   const activeConnection = useMemo(
-    () => connections.find((connection) => connection.id === activeConnId) ?? null,
-    [connections, activeConnId],
+    () => activeWorkspace ?? connections.find((connection) => connection.id === activeConnId) ?? null,
+    [activeConnId, activeWorkspace, connections],
   );
 
   const showStatus = useCallback((message, type = "idle", ms = null) => {
@@ -104,6 +130,85 @@ export default function App() {
   }, []);
 
   const showToast = useCallback((nextToast) => setToast(nextToast), []);
+
+  const snapshotActiveWorkspace = useCallback(() => {
+    if (!isWorkspaceId(activeConnId)) return;
+    setWorkspaceStates((current) => ({
+      ...current,
+      [activeConnId]: {
+        tables,
+        activeTable,
+        columns,
+        data,
+        page,
+        pageSize,
+        filters,
+        mainView,
+        invoicingOpen,
+      },
+    }));
+  }, [
+    activeConnId,
+    activeTable,
+    columns,
+    data,
+    filters,
+    invoicingOpen,
+    mainView,
+    page,
+    pageSize,
+    tables,
+  ]);
+
+  useEffect(() => {
+    if (!isWorkspaceId(activeConnId)) return;
+    setWorkspaceStates((current) => {
+      const previous = current[activeConnId];
+      if (
+        previous?.tables === tables
+        && previous?.activeTable === activeTable
+        && previous?.columns === columns
+        && previous?.data === data
+        && previous?.page === page
+        && previous?.pageSize === pageSize
+        && previous?.filters === filters
+        && previous?.mainView === mainView
+        && previous?.invoicingOpen === invoicingOpen
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        [activeConnId]: {
+          tables,
+          activeTable,
+          columns,
+          data,
+          page,
+          pageSize,
+          filters,
+          mainView,
+          invoicingOpen,
+        },
+      };
+    });
+  }, [activeConnId, activeTable, columns, data, filters, invoicingOpen, mainView, page, pageSize, tables]);
+
+  const restoreWorkspaceState = useCallback((workspaceId) => {
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    const state = workspaceStates[workspaceId] ?? emptyWorkspaceState();
+    setActiveConnId(workspaceId);
+    setActiveDatabase(workspace?.database ?? "");
+    setTables(state.tables ?? []);
+    setActiveTable(state.activeTable ?? null);
+    setColumns(state.columns ?? []);
+    setData(state.data ?? null);
+    setPage(state.page ?? 0);
+    setPageSize(state.pageSize ?? 100);
+    setFilters(state.filters ?? []);
+    setMainView(state.mainView ?? "dashboard");
+    setInvoicingOpen(state.invoicingOpen ?? false);
+  }, [workspaceStates, workspaces]);
 
   useEffect(() => {
     localStorage.setItem(ADMIN_MODE_KEY, String(adminMode));
@@ -182,47 +287,15 @@ export default function App() {
     }
   }, []);
 
-  const openLoadedDatabase = useCallback(async (connId, database, nextAdminMode = adminMode) => {
-    if (!connId || !database) return;
-
-    setActiveTable(null);
-    setColumns([]);
-    setData(null);
-    setFilters([]);
-    setPage(0);
-
-    try {
-      const nextTables = await ensureTablesLoaded(connId);
-      setActiveDatabase(database);
-      setTablePanelCollapsed(false);
-      setMainView(nextAdminMode ? "tables" : "dashboard");
-      showStatus(t("status_database_ready", database, nextTables.length), "success");
-      return true;
-    } catch (err) {
-      showStatus(t("status_database_failed") + err, "error");
-      showToast({ type: "error", msg: String(err) });
-      return false;
-    }
-  }, [adminMode, ensureTablesLoaded, t]);
-
-  const activateDatabase = useCallback(async (connId, database, nextAdminMode = adminMode) => {
-    if (!connId || !database) return;
-
-    showStatus(t("status_switching_database", database), "idle");
-
-    try {
-      await switchDatabase(connId, database);
-      getActiveSchemas().then(setActiveSchemas).catch(() => {});
-      return openLoadedDatabase(connId, database, nextAdminMode);
-    } catch (err) {
-      showStatus(t("status_database_failed") + err, "error");
-      showToast({ type: "error", msg: String(err) });
-      return false;
-    }
-  }, [adminMode, openLoadedDatabase, t]);
-
   const handleSelectConn = useCallback(async (id, connectionOverride = null, forceReconnect = false) => {
+    if (isWorkspaceId(id)) {
+      snapshotActiveWorkspace();
+      restoreWorkspaceState(id);
+      return;
+    }
+
     if (!id) {
+      snapshotActiveWorkspace();
       setActiveConnId(null);
       setActiveDatabase("");
       setTables([]);
@@ -239,6 +312,7 @@ export default function App() {
       return;
     }
 
+    snapshotActiveWorkspace();
     const nextConnection = connectionOverride ?? connections.find((connection) => connection.id === id) ?? null;
     setActiveConnId(id);
     setActiveDatabase("");
@@ -274,11 +348,41 @@ export default function App() {
       setDatabasesLoading(false);
       setGlobalLoading(false);
     }
-  }, [activeConnId, activeDatabase, adminMode, connections, openLoadedDatabase, statuses, t]);
+  }, [
+    activeConnId,
+    activeDatabase,
+    adminMode,
+    connections,
+    restoreWorkspaceState,
+    snapshotActiveWorkspace,
+    statuses,
+    t,
+  ]);
 
   const handleRefreshConnection = useCallback(async (id, connectionOverride = null) => {
     await handleSelectConn(id, connectionOverride, true);
   }, [handleSelectConn]);
+
+  const handleRunDiagnostics = useCallback(async (id) => {
+    if (!id) return;
+    setGlobalLoading(true);
+    try {
+      const report = await runConnectionDiagnostics(id);
+      const failed = report.checks.filter((check) => check.status === "error");
+      const warnings = report.checks.filter((check) => check.status === "warning");
+      const summary = failed.length
+        ? `${failed.length} diagnostic error(s): ${failed.map((check) => check.name).join(", ")}`
+        : warnings.length
+          ? `${warnings.length} diagnostic warning(s): ${warnings.map((check) => check.name).join(", ")}`
+          : `Diagnostics OK: ${report.database}`;
+      showToast({ type: failed.length ? "error" : warnings.length ? "warning" : "success", msg: summary });
+      console.table(report.checks);
+    } catch (err) {
+      showToast({ type: "error", msg: String(err) });
+    } finally {
+      setGlobalLoading(false);
+    }
+  }, [showToast]);
 
   const handleSelectDatabase = useCallback(async (database) => {
     if (!activeConnId || !database) return;
@@ -288,31 +392,63 @@ export default function App() {
     }
 
     setGlobalLoading(true);
-    const activated = await activateDatabase(activeConnId, database, adminMode);
-    if (!activated) {
-      setGlobalLoading(false);
-      return;
-    }
-
-    if (!activeConnection) {
-      setGlobalLoading(false);
-      return;
-    }
-
     try {
-      const saved = await saveConnection({
-        ...activeConnection,
-        id: activeConnId, // Ensure ID is preserved
-        name: connectionDisplayName(activeConnection, database),
-        database,
+      snapshotActiveWorkspace();
+      const baseConnectionId = isWorkspaceId(activeConnId)
+        ? activeWorkspace?.baseConnectionId
+        : activeConnId;
+      if (!baseConnectionId) throw new Error("Base connection not found");
+
+      const existingWorkspace = workspaces.find(
+        (item) => item.baseConnectionId === baseConnectionId && item.database === database,
+      );
+      if (existingWorkspace) {
+        restoreWorkspaceState(existingWorkspace.id);
+        showStatus(t("status_database_ready", existingWorkspace.database, tables.length), "success");
+        return;
+      }
+
+      const workspace = await openDatabaseWorkspace(baseConnectionId, database);
+      setWorkspaces((current) => {
+        if (current.some((item) => item.id === workspace.id)) return current;
+        return [...current, workspace];
       });
-      setConnections((current) => upsertConnection(current, saved));
+      setStatuses((current) => ({ ...current, [workspace.id]: "connected" }));
+      setActiveSchemas((current) => ({ ...current, [workspace.id]: workspace.schema }));
+      setActiveConnId(workspace.id);
+      setActiveDatabase(workspace.database);
+      setWorkspaceStates((current) => ({
+        ...current,
+        [workspace.id]: {
+          ...emptyWorkspaceState(),
+          mainView: adminMode ? "tables" : "dashboard",
+        },
+      }));
+
+      const nextTables = await ensureTablesLoaded(workspace.id);
+      setTablePanelCollapsed(false);
+      setMainView(adminMode ? "tables" : "dashboard");
+      showStatus(t("status_database_ready", workspace.database, nextTables.length), "success");
     } catch (error) {
+      showStatus(t("status_database_failed") + error, "error");
       showToast({ type: "error", msg: String(error) });
     } finally {
       setGlobalLoading(false);
     }
-  }, [activeConnId, activeConnection, activeDatabase, activateDatabase, adminMode, showToast]);
+  }, [
+    activeConnId,
+    activeDatabase,
+    activeWorkspace,
+    adminMode,
+    ensureTablesLoaded,
+    restoreWorkspaceState,
+    showStatus,
+    showToast,
+    snapshotActiveWorkspace,
+    tables.length,
+    t,
+    workspaces,
+  ]);
 
   const handleDuplicateWithDatabase = useCallback(async (baseConnection, database) => {
     if (!baseConnection || !database) return;
@@ -321,33 +457,30 @@ export default function App() {
     showStatus(t("status_switching_database", database), "idle");
 
     try {
-      // 1. Create new connection object
-      const newConn = {
-        ...baseConnection,
-        id: "",
-        name: connectionDisplayName(baseConnection, database),
-        database,
-      };
-
-      // 2. Save it
-      const saved = await saveConnection(newConn);
-      setConnections((current) => upsertConnection(current, saved));
-
-      // 3. Connect and activate
-      await connectDb(saved.id);
-      setStatuses((current) => ({ ...current, [saved.id]: "connected" }));
-      
-      const activated = await activateDatabase(saved.id, database, adminMode);
-      if (activated) {
-        setActiveConnId(saved.id);
-      }
+      snapshotActiveWorkspace();
+      const workspace = await openDatabaseWorkspace(baseConnection.id, database);
+      setWorkspaces((current) => [...current, workspace]);
+      setStatuses((current) => ({ ...current, [workspace.id]: "connected" }));
+      setActiveSchemas((current) => ({ ...current, [workspace.id]: workspace.schema }));
+      setActiveConnId(workspace.id);
+      setActiveDatabase(workspace.database);
+      setWorkspaceStates((current) => ({
+        ...current,
+        [workspace.id]: {
+          ...emptyWorkspaceState(),
+          mainView: adminMode ? "tables" : "dashboard",
+        },
+      }));
+      const nextTables = await ensureTablesLoaded(workspace.id);
+      setMainView(adminMode ? "tables" : "dashboard");
+      showStatus(t("status_database_ready", workspace.database, nextTables.length), "success");
     } catch (err) {
       showStatus(t("status_database_failed") + err, "error");
       showToast({ type: "error", msg: String(err) });
     } finally {
       setGlobalLoading(false);
     }
-  }, [adminMode, activateDatabase, showStatus, showToast, t]);
+  }, [adminMode, ensureTablesLoaded, showStatus, showToast, snapshotActiveWorkspace, t]);
 
   const handleSelectTable = useCallback(async (table) => {
     setActiveTable(table);
@@ -386,6 +519,51 @@ export default function App() {
       loadTableData(activeConnId, activeTable, page, pageSize, filters);
     }
   }, [activeConnId, activeTable, filters, loadTableData, page, pageSize]);
+
+  const handleCloseWorkspace = useCallback(async (workspaceId) => {
+    const index = workspaces.findIndex((workspace) => workspace.id === workspaceId);
+    if (index === -1) return;
+
+    try {
+      await closeDatabaseWorkspace(workspaceId);
+    } catch (err) {
+      showToast({ type: "error", msg: String(err) });
+    }
+
+    setWorkspaces((current) => current.filter((workspace) => workspace.id !== workspaceId));
+    setWorkspaceStates((current) => {
+      const next = { ...current };
+      delete next[workspaceId];
+      return next;
+    });
+    setStatuses((current) => {
+      const next = { ...current };
+      delete next[workspaceId];
+      return next;
+    });
+    setActiveSchemas((current) => {
+      const next = { ...current };
+      delete next[workspaceId];
+      return next;
+    });
+
+    if (activeConnId === workspaceId) {
+      const nextWorkspace = workspaces[index + 1] ?? workspaces[index - 1] ?? null;
+      if (nextWorkspace) {
+        restoreWorkspaceState(nextWorkspace.id);
+      } else {
+        setActiveConnId(null);
+        setActiveDatabase("");
+        setTables([]);
+        setActiveTable(null);
+        setData(null);
+        setColumns([]);
+        setFilters([]);
+        setMainView("welcome");
+        setInvoicingOpen(false);
+      }
+    }
+  }, [activeConnId, restoreWorkspaceState, showToast, workspaces]);
 
   const handleBackToTables = useCallback(async () => {
     if (!activeConnId || !activeDatabase) return;
@@ -507,6 +685,7 @@ export default function App() {
             adminMode={adminMode}
             onSelectConnection={handleSelectConn}
             onRefreshConnection={handleRefreshConnection}
+            onRunDiagnostics={handleRunDiagnostics}
             onDuplicateWithDatabase={handleDuplicateWithDatabase}
             onConnectionSaved={handleConnectionSaved}
             onCollapse={() => setSidebarCollapsed(true)}
@@ -540,6 +719,15 @@ export default function App() {
         ) : null}
 
         <div className={`main-content ${mainView === "dashboard" ? "dashboard-main" : ""}`}>
+          {workspaces.length ? (
+            <WorkspaceTabs
+              workspaces={workspaces}
+              activeId={activeConnId}
+              onSelect={(workspaceId) => handleSelectConn(workspaceId)}
+              onClose={handleCloseWorkspace}
+            />
+          ) : null}
+
           {mainView === "about" ? (
             <AboutPage onBack={returnFromAbout} onOpenSettings={() => setSettingsOpen(true)} />
           ) : invoicingOpen && activeConnId && activeDatabase ? (
@@ -656,6 +844,44 @@ export default function App() {
       )}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
+    </div>
+  );
+}
+
+function WorkspaceTabs({ workspaces, activeId, onSelect, onClose }) {
+  return (
+    <div className="workspace-tabs">
+      {workspaces.map((workspace) => (
+        <button
+          key={workspace.id}
+          type="button"
+          className={`workspace-tab ${workspace.id === activeId ? "active" : ""}`}
+          onClick={() => onSelect(workspace.id)}
+          title={workspace.name}
+        >
+          <span className="workspace-tab-title">{workspace.database}</span>
+          <span className="workspace-tab-meta">{workspace.schema?.edition || "database"}</span>
+          <span
+            className="workspace-tab-close"
+            role="button"
+            tabIndex={0}
+            onClick={(event) => {
+              event.stopPropagation();
+              onClose(workspace.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onClose(workspace.id);
+              }
+            }}
+            aria-label="Close workspace"
+          >
+            x
+          </span>
+        </button>
+      ))}
     </div>
   );
 }

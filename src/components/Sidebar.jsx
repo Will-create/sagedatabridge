@@ -64,6 +64,7 @@ export default function Sidebar({
   invoicingOpen,
   onSelectConnection,
   onRefreshConnection,
+  onRunDiagnostics,
   onDuplicateWithDatabase,
   onConnectionSaved,
   onCollapse,
@@ -248,6 +249,23 @@ export default function Sidebar({
               <path d="M21 3v6h-6" />
             </svg>
             {t("refresh")}
+          </div>
+
+          <div
+            className="context-menu-item"
+            onClick={() => {
+              const target = contextMenu.connection;
+              setContextMenu(null);
+              onRunDiagnostics?.(target.id);
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M4 19h16" />
+              <path d="M7 16V8" />
+              <path d="M12 16V5" />
+              <path d="M17 16v-4" />
+            </svg>
+            Diagnostics
           </div>
 
           {getStatus(contextMenu.connection.id) === "connected" && (

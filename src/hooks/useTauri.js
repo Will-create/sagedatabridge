@@ -88,6 +88,18 @@ export const switchDatabase = (connectionId, database) =>
     timeoutMs: CONNECTION_TIMEOUT_MS,
     label: "Switch database",
   });
+export const openDatabaseWorkspace = (baseConnectionId, database) =>
+  invokeWithTimeout("open_database_workspace", { baseConnectionId, database }, {
+    timeoutMs: CONNECTION_TIMEOUT_MS,
+    label: "Open database workspace",
+  });
+export const closeDatabaseWorkspace = (workspaceId) =>
+  invoke("close_database_workspace", { workspaceId });
+export const runConnectionDiagnostics = (id) =>
+  invokeWithTimeout("run_connection_diagnostics", { id }, {
+    timeoutMs: CONNECTION_TIMEOUT_MS,
+    label: "Run connection diagnostics",
+  });
 export const disconnectDb = (id) => invoke("disconnect_db", { id });
 export const getConnectionStatuses = () => invoke("get_connection_statuses");
 export const detectSageEdition = (connectionId) => invoke("detect_sage_edition", { connectionId });
@@ -438,24 +450,48 @@ export const searchArticles = (id, query, { limit = 40 } = {}) => {
   });
 };
 
-export const createArticle = (id, article) => invoke("create_article", { id, article });
-export const updateArticle = (id, article) => invoke("update_article", { id, article });
+const normalizeArticlePayload = (article = {}) => ({
+  id: article.id ?? "",
+  code: article.code ?? "",
+  libelle: article.libelle ?? "",
+  description: article.description ?? "",
+  prix_ht: Number(article.prix_ht) || 0,
+  currency: (article.currency ?? article.devise ?? "").toString().toUpperCase(),
+  taux_tva: Number(article.taux_tva) || 0,
+  taux_bic: Number(article.taux_bic) || 0,
+  unite: article.unite ?? "",
+  reference: article.reference ?? "",
+  category: article.category ?? "",
+  en_activite: article.en_activite !== false,
+  revenue_account: article.revenue_account ?? "",
+  expense_account: article.expense_account ?? "",
+  vat_account: article.vat_account ?? "",
+  bic_account: article.bic_account ?? "",
+  tax_exempt: Boolean(article.tax_exempt),
+  custom_tax_rules: article.custom_tax_rules ?? "",
+});
+
+export const createArticle = (id, article) => invoke("create_article", { id, article: normalizeArticlePayload(article) });
+export const updateArticle = (id, article) => invoke("update_article", { id, article: normalizeArticlePayload(article) });
 export const deleteArticle = (id, articleId) => invoke("delete_article", { id, articleId });
 
-export const renderInvoiceHtml = (invoice, templateId = "") => invoke("render_invoice_html", {
+export const renderInvoiceHtml = (invoice, templateId = "", locale = "fr") => invoke("render_invoice_html", {
   invoice,
   templateId,
+  locale,
 });
 
-export const renderInvoiceHtmlPreview = (invoice, template) => invoke("render_invoice_html_preview", {
+export const renderInvoiceHtmlPreview = (invoice, template, locale = "fr") => invoke("render_invoice_html_preview", {
   invoice,
   template,
+  locale,
 });
 
-export const exportInvoicePdf = (invoice, templateId, filePath) => invoke("export_invoice_pdf", {
+export const exportInvoicePdf = (invoice, templateId, filePath, locale = "fr") => invoke("export_invoice_pdf", {
   invoice,
   templateId,
   filePath,
+  locale,
 });
 
 export const saveInvoiceTemplate = (connectionId, template) => invoke("save_invoice_template", {

@@ -21,6 +21,17 @@ function snippet(sql) {
   return sql.replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
+function cellToClipboardValue(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).replace(/\t/g, " ").replace(/\r?\n/g, " ");
+}
+
+function tableToTsv(columns, rows) {
+  const header = columns.map((column) => cellToClipboardValue(column.name)).join("\t");
+  const body = rows.map((row) => row.map(cellToClipboardValue).join("\t"));
+  return [header, ...body].join("\n");
+}
+
 export default function QueryStudioModal({ activeConn, activeTable, onClose, onToast }) {
   const { t, lang } = useT();
   const [savedQueries, setSavedQueries] = useState([]);
@@ -155,6 +166,18 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
     }
   };
 
+  const copyResults = async (scope) => {
+    if (!results) return;
+    const source = scope === "page" ? pagedResults : results;
+    const text = tableToTsv(source.columns, source.rows);
+    try {
+      await navigator.clipboard.writeText(text);
+      onToast({ type: "success", msg: t("copy") });
+    } catch (err) {
+      onToast({ type: "error", msg: String(err) });
+    }
+  };
+
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal query-studio-modal">
@@ -263,7 +286,16 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
 
               <div className="query-results-header">
                 <div>{t("sql_results")}</div>
-                {elapsed != null && <div className="query-results-meta">{t("sql_elapsed", elapsed)}</div>}
+                <div className="query-results-actions">
+                  {running ? <span className="query-results-meta"><span className="spinner" style={{ width: 12, height: 12 }} /> {t("sql_running")}</span> : null}
+                  {elapsed != null && <div className="query-results-meta">{t("sql_elapsed", elapsed)}</div>}
+                  <button className="btn btn-ghost btn-sm" onClick={() => copyResults("page")} disabled={!pagedResults || running}>
+                    {t("sql_copy_page")}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => copyResults("all")} disabled={!results || running}>
+                    {t("sql_copy_all")}
+                  </button>
+                </div>
               </div>
 
               {error && (

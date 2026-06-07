@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::db;
 use crate::invoice_compat::InvoiceSchema;
 use crate::sage_compat::{SageEdition, SageSchema};
-use crate::state::{AppState, ColumnInfo, ConnectionConfig};
+use crate::state::{AppState, ColumnInfo, ConnectionConfig, TableInfo};
 
 use crate::sage_entity_service::{
     self, br, parse_bool, parse_f64, parse_i32, parse_i64, parse_string, qualify, round2,
@@ -24,6 +24,7 @@ const LINE_META_TABLE: &str = "SDB_PIECE_LINE_META";
 const COMPTA_LOG_TABLE: &str = "SDB_COMPTA_ENTRY_LOG";
 const LOCAL_TIERS_TABLE: &str = "SDB_TIERS";
 const LOCAL_ARTICLE_TABLE: &str = "SDB_ARTICLE";
+const ARTICLE_META_TABLE: &str = "SDB_ARTICLE_META";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatusHistoryEntry {
@@ -45,10 +46,30 @@ pub struct InvoiceLine {
     pub unite: String,
     pub prix_ht: f64,
     pub remise_pct: f64,
+    #[serde(default)]
+    pub remise_type: String,
+    #[serde(default)]
+    pub remise_valeur: f64,
     pub montant_ht: f64,
     pub taux_tva: f64,
     pub montant_tva: f64,
+    #[serde(default)]
+    pub taux_bic: f64,
+    #[serde(default)]
+    pub montant_bic: f64,
     pub montant_ttc: f64,
+    #[serde(default)]
+    pub tax_exempt: bool,
+    #[serde(default)]
+    pub revenue_account: String,
+    #[serde(default)]
+    pub expense_account: String,
+    #[serde(default)]
+    pub vat_account: String,
+    #[serde(default)]
+    pub bic_account: String,
+    #[serde(default)]
+    pub custom_tax_rules: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -74,12 +95,18 @@ pub struct InvoiceHeader {
     pub devise: String,
     pub total_ht: f64,
     pub total_tva: f64,
+    #[serde(default)]
+    pub total_bic: f64,
     pub total_ttc: f64,
     pub lignes: Vec<InvoiceLine>,
     pub notes: String,
     pub conditions: String,
     #[serde(default)]
     pub remise_globale: f64,
+    #[serde(default)]
+    pub remise_globale_type: String,
+    #[serde(default)]
+    pub remise_globale_valeur: f64,
     #[serde(default)]
     pub is_supplier: bool,
     #[serde(default)]
@@ -175,6 +202,43 @@ fn load_connection_config(
 
 async fn get_active_client(state: &AppState, id: &str) -> Result<db::DbClient, String> {
     db::get_cached_client_snapshot(state, id).await
+}
+
+fn resolve_invoice_edition(
+    state: &State<'_, AppState>,
+    id: &str,
+    connection: &ConnectionConfig,
+    tables: &[TableInfo],
+) -> SageEdition {
+    if let Some(edition) = state
+        .get_connection_schema(id)
+        .map(|schema| schema.edition)
+        .filter(|edition| matches!(edition, SageEdition::Sage100 | SageEdition::Sage1000))
+    {
+        return edition;
+    }
+
+    let configured = SageEdition::from_edition_str(&connection.sage_edition);
+    if matches!(configured, SageEdition::Sage100 | SageEdition::Sage1000) {
+        return configured;
+    }
+
+    let has_table = |name: &str| {
+        tables
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case(name))
+    };
+    if has_table("TECRITURE") && has_table("TCOMPTEGENERAL") && has_table("TPIECE") {
+        return SageEdition::Sage1000;
+    }
+    if (has_table("F_PIECE") || has_table("F_DOCENTETE"))
+        && (has_table("F_TIERS") || has_table("F_COMPTET"))
+        && has_table("F_ARTICLE")
+    {
+        return SageEdition::Sage100;
+    }
+
+    configured
 }
 
 fn is_numeric_type(data_type: &str) -> bool {
@@ -347,6 +411,22 @@ fn default_prefix_for_nature(nature: &str) -> &'static str {
     }
 }
 
+fn normalize_discount_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fixed" | "amount" | "montant" => "fixed".to_string(),
+        _ => "percent".to_string(),
+    }
+}
+
+fn apply_discount(base: f64, discount_type: &str, value: f64) -> f64 {
+    let amount = value.max(0.0);
+    if normalize_discount_type(discount_type) == "fixed" {
+        (base - amount.min(base)).max(0.0)
+    } else {
+        base * (1.0 - amount.min(100.0) / 100.0)
+    }
+}
+
 fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
     invoice.nature = nature_to_label(&invoice.nature);
     invoice.statut = if invoice.statut.trim().is_empty() {
@@ -355,9 +435,19 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
         normalize_status(&invoice.statut)
     };
 
-    let discount_factor = 1.0 - (invoice.remise_globale.max(0.0).min(100.0) / 100.0);
+    invoice.remise_globale_type = normalize_discount_type(&invoice.remise_globale_type);
+    if invoice.remise_globale_valeur == 0.0 && invoice.remise_globale > 0.0 {
+        invoice.remise_globale_valeur = invoice.remise_globale;
+    }
+    invoice.remise_globale = if invoice.remise_globale_type == "percent" {
+        invoice.remise_globale_valeur.max(0.0).min(100.0)
+    } else {
+        invoice.remise_globale_valeur.max(0.0)
+    };
+
     let mut total_ht = 0.0;
     let mut total_tva = 0.0;
+    let mut total_bic = 0.0;
     for (index, line) in invoice.lignes.iter_mut().enumerate() {
         if line.id.trim().is_empty() {
             line.id = format!("line-{}", Uuid::new_v4());
@@ -367,19 +457,39 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
         } else {
             line.ordre
         };
-        let base_ht = round2(
-            line.quantite * line.prix_ht * (1.0 - line.remise_pct.max(0.0).min(100.0) / 100.0),
-        );
+        line.remise_type = normalize_discount_type(&line.remise_type);
+        if line.remise_valeur == 0.0 && line.remise_pct > 0.0 {
+            line.remise_valeur = line.remise_pct;
+        }
+        line.remise_pct = if line.remise_type == "percent" {
+            line.remise_valeur.max(0.0).min(100.0)
+        } else {
+            line.remise_valeur.max(0.0)
+        };
+        let gross_ht = round2(line.quantite * line.prix_ht);
+        let base_ht = round2(apply_discount(gross_ht, &line.remise_type, line.remise_valeur));
         line.montant_ht = base_ht;
-        line.montant_tva = round2(base_ht * (line.taux_tva / 100.0));
-        line.montant_ttc = round2(line.montant_ht + line.montant_tva);
+        if line.tax_exempt {
+            line.taux_tva = 0.0;
+            line.taux_bic = 0.0;
+            line.montant_tva = 0.0;
+            line.montant_bic = 0.0;
+        } else {
+            line.montant_tva = round2(base_ht * (line.taux_tva / 100.0));
+            line.montant_bic = round2(base_ht * (line.taux_bic / 100.0));
+        }
+        line.montant_ttc = round2(line.montant_ht + line.montant_tva + line.montant_bic);
         total_ht += line.montant_ht;
         total_tva += line.montant_tva;
+        total_bic += line.montant_bic;
     }
 
-    invoice.total_ht = round2(total_ht * discount_factor);
-    invoice.total_tva = round2(total_tva * discount_factor);
-    invoice.total_ttc = round2(invoice.total_ht + invoice.total_tva);
+    let discounted_ht = round2(apply_discount(total_ht, &invoice.remise_globale_type, invoice.remise_globale_valeur));
+    let ratio = if total_ht > 0.0 { discounted_ht / total_ht } else { 1.0 };
+    invoice.total_ht = discounted_ht;
+    invoice.total_tva = round2(total_tva * ratio);
+    invoice.total_bic = round2(total_bic * ratio);
+    invoice.total_ttc = round2(invoice.total_ht + invoice.total_tva + invoice.total_bic);
     invoice
 }
 
@@ -404,11 +514,8 @@ async fn resolve_invoice_schema(
     client: &mut db::DbClient,
 ) -> Result<ResolvedInvoiceSchema, String> {
     let connection = load_connection_config(state, id)?;
-    let edition = state
-        .get_connection_schema(id)
-        .map(|schema| schema.edition)
-        .filter(|edition| matches!(edition, SageEdition::Sage100 | SageEdition::Sage1000))
-        .unwrap_or_else(|| SageEdition::from_edition_str(&connection.sage_edition));
+    let tables = db::get_tables(client).await?;
+    let edition = resolve_invoice_edition(state, id, &connection, &tables);
 
     if !matches!(edition, SageEdition::Sage100 | SageEdition::Sage1000) {
         return Err("Invoicing is supported only for Sage 100 and Sage 1000".to_string());
@@ -420,7 +527,6 @@ async fn resolve_invoice_schema(
         return Err("Invoice schema is not available for this edition".to_string());
     }
 
-    let tables = db::get_tables(client).await?;
     let piece =
         sage_entity_service::load_table(client, &tables, &[native.table_piece.clone()]).await?;
     let line = sage_entity_service::load_table(
@@ -692,10 +798,16 @@ BEGIN
         [notes] NVARCHAR(MAX) NULL,
         [conditions] NVARCHAR(MAX) NULL,
         [remise_globale] FLOAT NOT NULL DEFAULT 0,
+        [remise_globale_type] NVARCHAR(20) NOT NULL DEFAULT N'percent',
+        [remise_globale_valeur] FLOAT NOT NULL DEFAULT 0,
+        [total_bic] FLOAT NOT NULL DEFAULT 0,
         [is_supplier] BIT NOT NULL DEFAULT 0,
         [updated_at] DATETIME NOT NULL DEFAULT GETDATE()
     );
 END;
+IF COL_LENGTH(N'dbo.{meta}', N'remise_globale_type') IS NULL ALTER TABLE [dbo].[{meta}] ADD [remise_globale_type] NVARCHAR(20) NOT NULL CONSTRAINT [DF_{meta}_remise_type] DEFAULT N'percent';
+IF COL_LENGTH(N'dbo.{meta}', N'remise_globale_valeur') IS NULL ALTER TABLE [dbo].[{meta}] ADD [remise_globale_valeur] FLOAT NOT NULL CONSTRAINT [DF_{meta}_remise_valeur] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{meta}', N'total_bic') IS NULL ALTER TABLE [dbo].[{meta}] ADD [total_bic] FLOAT NOT NULL CONSTRAINT [DF_{meta}_total_bic] DEFAULT 0;
 
 IF OBJECT_ID(N'dbo.{line_meta}', N'U') IS NULL
 BEGIN
@@ -705,9 +817,33 @@ BEGIN
         [ordre] INT NOT NULL,
         [article_code] NVARCHAR(100) NULL,
         [unite] NVARCHAR(50) NULL,
+        [remise_type] NVARCHAR(20) NOT NULL DEFAULT N'percent',
+        [remise_valeur] FLOAT NOT NULL DEFAULT 0,
+        [taux_tva] FLOAT NOT NULL DEFAULT 0,
+        [montant_tva] FLOAT NOT NULL DEFAULT 0,
+        [taux_bic] FLOAT NOT NULL DEFAULT 0,
+        [montant_bic] FLOAT NOT NULL DEFAULT 0,
+        [tax_exempt] BIT NOT NULL DEFAULT 0,
+        [revenue_account] NVARCHAR(100) NULL,
+        [expense_account] NVARCHAR(100) NULL,
+        [vat_account] NVARCHAR(100) NULL,
+        [bic_account] NVARCHAR(100) NULL,
+        [custom_tax_rules] NVARCHAR(MAX) NULL,
         [updated_at] DATETIME NOT NULL DEFAULT GETDATE()
     );
 END;
+IF COL_LENGTH(N'dbo.{line_meta}', N'remise_type') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [remise_type] NVARCHAR(20) NOT NULL CONSTRAINT [DF_{line_meta}_remise_type] DEFAULT N'percent';
+IF COL_LENGTH(N'dbo.{line_meta}', N'remise_valeur') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [remise_valeur] FLOAT NOT NULL CONSTRAINT [DF_{line_meta}_remise_valeur] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'taux_tva') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [taux_tva] FLOAT NOT NULL CONSTRAINT [DF_{line_meta}_taux_tva] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'montant_tva') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [montant_tva] FLOAT NOT NULL CONSTRAINT [DF_{line_meta}_montant_tva] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'taux_bic') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [taux_bic] FLOAT NOT NULL CONSTRAINT [DF_{line_meta}_taux_bic] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'montant_bic') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [montant_bic] FLOAT NOT NULL CONSTRAINT [DF_{line_meta}_montant_bic] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'tax_exempt') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [tax_exempt] BIT NOT NULL CONSTRAINT [DF_{line_meta}_tax_exempt] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{line_meta}', N'revenue_account') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [revenue_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{line_meta}', N'expense_account') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [expense_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{line_meta}', N'vat_account') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [vat_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{line_meta}', N'bic_account') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [bic_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{line_meta}', N'custom_tax_rules') IS NULL ALTER TABLE [dbo].[{line_meta}] ADD [custom_tax_rules] NVARCHAR(MAX) NULL;
 
 IF OBJECT_ID(N'dbo.{compta_log}', N'U') IS NULL
 BEGIN
@@ -758,18 +894,55 @@ BEGIN
         [id]          NVARCHAR(50)   NOT NULL PRIMARY KEY,
         [code]        NVARCHAR(100)  NOT NULL,
         [libelle]     NVARCHAR(255)  NULL,
+        [description] NVARCHAR(MAX)  NULL,
         [prix_ht]     DECIMAL(18, 6) NULL DEFAULT 0,
+        [currency]    NVARCHAR(10)   NULL,
         [taux_tva]    DECIMAL(18, 6) NULL DEFAULT 0,
+        [taux_bic]    DECIMAL(18, 6) NULL DEFAULT 0,
         [unite]       NVARCHAR(50)   NULL,
         [reference]   NVARCHAR(100)  NULL,
+        [category]    NVARCHAR(100)  NULL,
         [en_activite] BIT            NOT NULL DEFAULT 1,
+        [revenue_account] NVARCHAR(100) NULL,
+        [expense_account] NVARCHAR(100) NULL,
+        [vat_account] NVARCHAR(100) NULL,
+        [bic_account] NVARCHAR(100) NULL,
+        [tax_exempt] BIT NOT NULL DEFAULT 0,
+        [custom_tax_rules] NVARCHAR(MAX) NULL,
         [created_at]  NVARCHAR(50)   NULL,
         [updated_at]  NVARCHAR(50)   NULL
+    );
+END;
+IF COL_LENGTH(N'dbo.{article}', N'description') IS NULL ALTER TABLE [dbo].[{article}] ADD [description] NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'currency') IS NULL ALTER TABLE [dbo].[{article}] ADD [currency] NVARCHAR(10) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'category') IS NULL ALTER TABLE [dbo].[{article}] ADD [category] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'taux_bic') IS NULL ALTER TABLE [dbo].[{article}] ADD [taux_bic] DECIMAL(18, 6) NULL DEFAULT 0;
+IF COL_LENGTH(N'dbo.{article}', N'revenue_account') IS NULL ALTER TABLE [dbo].[{article}] ADD [revenue_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'expense_account') IS NULL ALTER TABLE [dbo].[{article}] ADD [expense_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'vat_account') IS NULL ALTER TABLE [dbo].[{article}] ADD [vat_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'bic_account') IS NULL ALTER TABLE [dbo].[{article}] ADD [bic_account] NVARCHAR(100) NULL;
+IF COL_LENGTH(N'dbo.{article}', N'tax_exempt') IS NULL ALTER TABLE [dbo].[{article}] ADD [tax_exempt] BIT NOT NULL CONSTRAINT [DF_{article}_tax_exempt] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{article}', N'custom_tax_rules') IS NULL ALTER TABLE [dbo].[{article}] ADD [custom_tax_rules] NVARCHAR(MAX) NULL;
+
+IF OBJECT_ID(N'dbo.{article_meta}', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[{article_meta}] (
+        [article_key] NVARCHAR(100) NOT NULL PRIMARY KEY,
+        [revenue_account] NVARCHAR(100) NULL,
+        [expense_account] NVARCHAR(100) NULL,
+        [vat_account] NVARCHAR(100) NULL,
+        [bic_account] NVARCHAR(100) NULL,
+        [taux_tva] FLOAT NOT NULL DEFAULT 0,
+        [taux_bic] FLOAT NOT NULL DEFAULT 0,
+        [tax_exempt] BIT NOT NULL DEFAULT 0,
+        [custom_tax_rules] NVARCHAR(MAX) NULL,
+        [updated_at] DATETIME NOT NULL DEFAULT GETDATE()
     );
 END;
 ",
         tiers = LOCAL_TIERS_TABLE,
         article = LOCAL_ARTICLE_TABLE,
+        article_meta = ARTICLE_META_TABLE,
     );
     db::execute_raw_query(client, &sql2).await?;
     Ok(())
@@ -881,6 +1054,9 @@ fn meta_join_sql(has_meta: bool, piece_oid_expr: &str) -> String {
         CAST(NULL AS NVARCHAR(MAX)) AS [notes],
         CAST(NULL AS NVARCHAR(MAX)) AS [conditions],
         CAST(NULL AS FLOAT) AS [remise_globale],
+        CAST(NULL AS NVARCHAR(20)) AS [remise_globale_type],
+        CAST(NULL AS FLOAT) AS [remise_globale_valeur],
+        CAST(NULL AS FLOAT) AS [total_bic],
         CAST(NULL AS BIT) AS [is_supplier]
     WHERE 1 = 0
 ) m ON 1 = 0"
@@ -905,7 +1081,19 @@ fn line_meta_join_sql(has_line_meta: bool, piece_id_sql: &str, ordre_expr: &str)
         CAST(NULL AS NVARCHAR(50)) AS [piece_id],
         CAST(NULL AS INT) AS [ordre],
         CAST(NULL AS NVARCHAR(100)) AS [article_code],
-        CAST(NULL AS NVARCHAR(50)) AS [unite]
+        CAST(NULL AS NVARCHAR(50)) AS [unite],
+        CAST(NULL AS NVARCHAR(20)) AS [remise_type],
+        CAST(NULL AS FLOAT) AS [remise_valeur],
+        CAST(NULL AS FLOAT) AS [taux_tva],
+        CAST(NULL AS FLOAT) AS [montant_tva],
+        CAST(NULL AS FLOAT) AS [taux_bic],
+        CAST(NULL AS FLOAT) AS [montant_bic],
+        CAST(NULL AS BIT) AS [tax_exempt],
+        CAST(NULL AS NVARCHAR(100)) AS [revenue_account],
+        CAST(NULL AS NVARCHAR(100)) AS [expense_account],
+        CAST(NULL AS NVARCHAR(100)) AS [vat_account],
+        CAST(NULL AS NVARCHAR(100)) AS [bic_account],
+        CAST(NULL AS NVARCHAR(MAX)) AS [custom_tax_rules]
     WHERE 1 = 0
 ) lm ON 1 = 0"
             .to_string()
@@ -1210,12 +1398,15 @@ SELECT
     {devise_expr} AS devise,
     COALESCE(tot.[total_ht], 0) AS total_ht,
     COALESCE(tot.[total_tva], 0) AS total_tva,
+    COALESCE(m.[total_bic], 0) AS total_bic,
     COALESCE(tot.[total_ttc], 0) AS total_ttc,
     COALESCE(m.[notes], N'') AS notes,
     COALESCE(m.[conditions], N'') AS conditions,
     COALESCE(m.[tiers_pays], N'') AS tiers_pays,
     COALESCE(m.[tiers_tva], N'') AS tiers_tva_intra,
     COALESCE(m.[remise_globale], 0) AS remise_globale,
+    COALESCE(m.[remise_globale_type], N'percent') AS remise_globale_type,
+    COALESCE(m.[remise_globale_valeur], COALESCE(m.[remise_globale], 0)) AS remise_globale_valeur,
     COALESCE(m.[is_supplier], 0) AS is_supplier
 FROM {piece_table} p
 LEFT JOIN {tiers_table} t
@@ -1287,14 +1478,17 @@ fn map_invoice_row(row: &[Value]) -> InvoiceHeader {
         devise: parse_string(row.get(14)),
         total_ht: round2(parse_f64(row.get(15))),
         total_tva: round2(parse_f64(row.get(16))),
-        total_ttc: round2(parse_f64(row.get(17))),
+        total_bic: round2(parse_f64(row.get(17))),
+        total_ttc: round2(parse_f64(row.get(18))),
         lignes: Vec::new(),
-        notes: parse_string(row.get(18)),
-        conditions: parse_string(row.get(19)),
-        tiers_pays: parse_string(row.get(20)),
-        tiers_tva_intra: parse_string(row.get(21)),
-        remise_globale: round2(parse_f64(row.get(22))),
-        is_supplier: parse_bool(row.get(23)),
+        notes: parse_string(row.get(19)),
+        conditions: parse_string(row.get(20)),
+        tiers_pays: parse_string(row.get(21)),
+        tiers_tva_intra: parse_string(row.get(22)),
+        remise_globale: round2(parse_f64(row.get(23))),
+        remise_globale_type: parse_string(row.get(24)),
+        remise_globale_valeur: round2(parse_f64(row.get(25))),
+        is_supplier: parse_bool(row.get(26)),
         statut_history: Vec::new(),
     }
 }
@@ -1306,6 +1500,7 @@ async fn fetch_invoice_internal(
 ) -> Result<InvoiceHeader, String> {
     let _connection = load_connection_config(state, id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
+    ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let resolved = resolve_invoice_schema(state, id, &mut client).await?;
     let database_name = client.config.database.clone();
@@ -1383,14 +1578,24 @@ SELECT
     COALESCE(lm.[unite], CAST({unite_expr} AS NVARCHAR(50)), N'') AS unite,
     COALESCE(TRY_CAST({pu_expr} AS DECIMAL(18, 6)), 0) AS prix_ht,
     COALESCE(TRY_CAST({remise_expr} AS DECIMAL(18, 6)), 0) AS remise_pct,
+    COALESCE(lm.[remise_type], N'percent') AS remise_type,
+    COALESCE(lm.[remise_valeur], COALESCE(TRY_CAST({remise_expr} AS DECIMAL(18, 6)), 0)) AS remise_valeur,
     COALESCE(TRY_CAST({ht_expr} AS DECIMAL(18, 6)), 0) AS montant_ht,
-    COALESCE(TRY_CAST({tva_expr} AS DECIMAL(18, 6)), 0) AS taux_tva,
-    ROUND(
+    COALESCE(NULLIF(lm.[taux_tva], 0), TRY_CAST({tva_expr} AS DECIMAL(18, 6)), 0) AS taux_tva,
+    COALESCE(NULLIF(lm.[montant_tva], 0), ROUND(
         COALESCE(TRY_CAST({ht_expr} AS DECIMAL(18, 6)), 0)
-        * COALESCE(TRY_CAST({tva_expr} AS DECIMAL(18, 6)), 0) / 100.0,
+        * COALESCE(NULLIF(lm.[taux_tva], 0), TRY_CAST({tva_expr} AS DECIMAL(18, 6)), 0) / 100.0,
         2
-    ) AS montant_tva,
-    COALESCE(TRY_CAST({ttc_expr} AS DECIMAL(18, 6)), 0) AS montant_ttc
+    )) AS montant_tva,
+    COALESCE(lm.[taux_bic], 0) AS taux_bic,
+    COALESCE(lm.[montant_bic], 0) AS montant_bic,
+    COALESCE(TRY_CAST({ttc_expr} AS DECIMAL(18, 6)), 0) AS montant_ttc,
+    COALESCE(lm.[tax_exempt], 0) AS tax_exempt,
+    COALESCE(lm.[revenue_account], N'') AS revenue_account,
+    COALESCE(lm.[expense_account], N'') AS expense_account,
+    COALESCE(lm.[vat_account], N'') AS vat_account,
+    COALESCE(lm.[bic_account], N'') AS bic_account,
+    COALESCE(lm.[custom_tax_rules], N'') AS custom_tax_rules
 FROM {line_table} l
 {article_join}
 {line_meta_join}
@@ -1509,10 +1714,20 @@ ORDER BY ordre ASC
             unite: parse_string(row.get(6)),
             prix_ht: round2(parse_f64(row.get(7))),
             remise_pct: round2(parse_f64(row.get(8))),
-            montant_ht: round2(parse_f64(row.get(9))),
-            taux_tva: round2(parse_f64(row.get(10))),
-            montant_tva: round2(parse_f64(row.get(11))),
-            montant_ttc: round2(parse_f64(row.get(12))),
+            remise_type: parse_string(row.get(9)),
+            remise_valeur: round2(parse_f64(row.get(10))),
+            montant_ht: round2(parse_f64(row.get(11))),
+            taux_tva: round2(parse_f64(row.get(12))),
+            montant_tva: round2(parse_f64(row.get(13))),
+            taux_bic: round2(parse_f64(row.get(14))),
+            montant_bic: round2(parse_f64(row.get(15))),
+            montant_ttc: round2(parse_f64(row.get(16))),
+            tax_exempt: parse_bool(row.get(17)),
+            revenue_account: parse_string(row.get(18)),
+            expense_account: parse_string(row.get(19)),
+            vat_account: parse_string(row.get(20)),
+            bic_account: parse_string(row.get(21)),
+            custom_tax_rules: parse_string(row.get(22)),
         })
         .collect();
     invoice.statut_history = fetch_status_history(&mut client, support_tables, piece_id).await?;
@@ -1532,6 +1747,7 @@ pub async fn list_invoices(
 ) -> Result<Vec<InvoiceHeader>, String> {
     let _connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
+    ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
     let database_name = client.config.database.clone();
@@ -1841,14 +2057,30 @@ pub async fn create_invoice(
              USING (SELECT CONCAT(@piece_id_text, N':', {ordre}) AS [line_key]) AS src
              ON target.[line_key] = src.[line_key]
              WHEN MATCHED THEN
-                 UPDATE SET [piece_id] = @piece_id_text, [ordre] = {ordre}, [article_code] = {article_code}, [unite] = {unite}, [updated_at] = GETDATE()
+                 UPDATE SET [piece_id] = @piece_id_text, [ordre] = {ordre}, [article_code] = {article_code}, [unite] = {unite},
+                     [remise_type] = {remise_type}, [remise_valeur] = {remise_valeur}, [taux_tva] = {taux_tva}, [montant_tva] = {montant_tva},
+                     [taux_bic] = {taux_bic}, [montant_bic] = {montant_bic}, [tax_exempt] = {tax_exempt},
+                     [revenue_account] = {revenue_account}, [expense_account] = {expense_account}, [vat_account] = {vat_account},
+                     [bic_account] = {bic_account}, [custom_tax_rules] = {custom_tax_rules}, [updated_at] = GETDATE()
              WHEN NOT MATCHED THEN
-                 INSERT ([line_key], [piece_id], [ordre], [article_code], [unite], [updated_at])
-                 VALUES (src.[line_key], @piece_id_text, {ordre}, {article_code}, {unite}, GETDATE());",
+                 INSERT ([line_key], [piece_id], [ordre], [article_code], [unite], [remise_type], [remise_valeur], [taux_tva], [montant_tva], [taux_bic], [montant_bic], [tax_exempt], [revenue_account], [expense_account], [vat_account], [bic_account], [custom_tax_rules], [updated_at])
+                 VALUES (src.[line_key], @piece_id_text, {ordre}, {article_code}, {unite}, {remise_type}, {remise_valeur}, {taux_tva}, {montant_tva}, {taux_bic}, {montant_bic}, {tax_exempt}, {revenue_account}, {expense_account}, {vat_account}, {bic_account}, {custom_tax_rules}, GETDATE());",
             line_meta = LINE_META_TABLE,
             ordre = line.ordre,
             article_code = sql_opt_string(&line.article_code),
             unite = sql_opt_string(&line.unite),
+            remise_type = sql_string(&normalize_discount_type(&line.remise_type)),
+            remise_valeur = sql_number(line.remise_valeur),
+            taux_tva = sql_number(line.taux_tva),
+            montant_tva = sql_number(line.montant_tva),
+            taux_bic = sql_number(line.taux_bic),
+            montant_bic = sql_number(line.montant_bic),
+            tax_exempt = if line.tax_exempt { "1" } else { "0" },
+            revenue_account = sql_opt_string(&line.revenue_account),
+            expense_account = sql_opt_string(&line.expense_account),
+            vat_account = sql_opt_string(&line.vat_account),
+            bic_account = sql_opt_string(&line.bic_account),
+            custom_tax_rules = sql_opt_string(&line.custom_tax_rules),
         ));
     }
 
@@ -1882,11 +2114,14 @@ BEGIN TRY
             [notes] = {notes},
             [conditions] = {conditions},
             [remise_globale] = {remise_globale},
+            [remise_globale_type] = {remise_globale_type},
+            [remise_globale_valeur] = {remise_globale_valeur},
+            [total_bic] = {total_bic},
             [is_supplier] = {is_supplier},
             [updated_at] = GETDATE()
     WHEN NOT MATCHED THEN
-        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [is_supplier], [updated_at])
-        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {is_supplier}, GETDATE());
+        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_bic], [is_supplier], [updated_at])
+        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_bic}, {is_supplier}, GETDATE());
 
     IF EXISTS (SELECT 1 FROM [dbo].[{status_table}] WHERE [piece_id] = @piece_id_text)
     BEGIN
@@ -1943,6 +2178,9 @@ END CATCH
         notes = sql_opt_string(&invoice.notes),
         conditions = sql_opt_string(&invoice.conditions),
         remise_globale = sql_number(invoice.remise_globale),
+        remise_globale_type = sql_string(&invoice.remise_globale_type),
+        remise_globale_valeur = sql_number(invoice.remise_globale_valeur),
+        total_bic = sql_number(invoice.total_bic),
         is_supplier = if invoice.is_supplier { "1" } else { "0" },
         status_table = STATUS_TABLE,
         status = sql_string(&status),
@@ -2145,12 +2383,24 @@ pub async fn update_invoice(
             values.join(", ")
         ));
         line_sql_chunks.push(format!(
-            "INSERT INTO [dbo].[{line_meta}] ([line_key], [piece_id], [ordre], [article_code], [unite], [updated_at])
-             VALUES (CONCAT(@piece_id_text, N':', {ordre}), @piece_id_text, {ordre}, {article_code}, {unite}, GETDATE());",
+            "INSERT INTO [dbo].[{line_meta}] ([line_key], [piece_id], [ordre], [article_code], [unite], [remise_type], [remise_valeur], [taux_tva], [montant_tva], [taux_bic], [montant_bic], [tax_exempt], [revenue_account], [expense_account], [vat_account], [bic_account], [custom_tax_rules], [updated_at])
+             VALUES (CONCAT(@piece_id_text, N':', {ordre}), @piece_id_text, {ordre}, {article_code}, {unite}, {remise_type}, {remise_valeur}, {taux_tva}, {montant_tva}, {taux_bic}, {montant_bic}, {tax_exempt}, {revenue_account}, {expense_account}, {vat_account}, {bic_account}, {custom_tax_rules}, GETDATE());",
             line_meta = LINE_META_TABLE,
             ordre = line.ordre,
             article_code = sql_opt_string(&line.article_code),
             unite = sql_opt_string(&line.unite),
+            remise_type = sql_string(&normalize_discount_type(&line.remise_type)),
+            remise_valeur = sql_number(line.remise_valeur),
+            taux_tva = sql_number(line.taux_tva),
+            montant_tva = sql_number(line.montant_tva),
+            taux_bic = sql_number(line.taux_bic),
+            montant_bic = sql_number(line.montant_bic),
+            tax_exempt = if line.tax_exempt { "1" } else { "0" },
+            revenue_account = sql_opt_string(&line.revenue_account),
+            expense_account = sql_opt_string(&line.expense_account),
+            vat_account = sql_opt_string(&line.vat_account),
+            bic_account = sql_opt_string(&line.bic_account),
+            custom_tax_rules = sql_opt_string(&line.custom_tax_rules),
         ));
     }
 
@@ -2183,11 +2433,14 @@ BEGIN TRY
             [notes] = {notes},
             [conditions] = {conditions},
             [remise_globale] = {remise_globale},
+            [remise_globale_type] = {remise_globale_type},
+            [remise_globale_valeur] = {remise_globale_valeur},
+            [total_bic] = {total_bic},
             [is_supplier] = {is_supplier},
             [updated_at] = GETDATE()
     WHEN NOT MATCHED THEN
-        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [is_supplier], [updated_at])
-        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {is_supplier}, GETDATE());
+        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_bic], [is_supplier], [updated_at])
+        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_bic}, {is_supplier}, GETDATE());
 
     COMMIT TRANSACTION;
 END TRY
@@ -2219,6 +2472,9 @@ END CATCH
         notes = sql_opt_string(&invoice.notes),
         conditions = sql_opt_string(&invoice.conditions),
         remise_globale = sql_number(invoice.remise_globale),
+        remise_globale_type = sql_string(&invoice.remise_globale_type),
+        remise_globale_valeur = sql_number(invoice.remise_globale_valeur),
+        total_bic = sql_number(invoice.total_bic),
         is_supplier = if invoice.is_supplier { "1" } else { "0" },
     );
     db::execute_logged_query(
@@ -2509,12 +2765,19 @@ pub async fn comptabiliser_invoice(
     let account_table = resolve_account_table(&mut client, &resolved).await?;
     let database_name = client.config.database.clone();
 
-    let (cfg_ar, cfg_sales, cfg_vat) = {
+    let (cfg_ar, cfg_sales, cfg_vat, cfg_bic) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
+        let bic_account = config
+            .tax_types
+            .iter()
+            .find(|tax| tax.id.eq_ignore_ascii_case("bic") || tax.name.eq_ignore_ascii_case("bic"))
+            .map(|tax| tax.account.clone())
+            .unwrap_or_default();
         (
             config.account_ar.clone(),
             config.account_sales.clone(),
             config.account_vat.clone(),
+            bic_account,
         )
     };
 
@@ -2533,6 +2796,11 @@ pub async fn comptabiliser_invoice(
     } else {
         &cfg_vat
     };
+    let bic_account_code = if cfg_bic.trim().is_empty() {
+        "447000"
+    } else {
+        &cfg_bic
+    };
 
     let tiers_account_value = lookup_account_value(
         &mut client,
@@ -2543,7 +2811,7 @@ pub async fn comptabiliser_invoice(
         tiers_account_code,
     )
     .await?;
-    let sales_account_value = lookup_account_value(
+    let _sales_account_value = lookup_account_value(
         &mut client,
         &account_table,
         &resolved,
@@ -2552,7 +2820,7 @@ pub async fn comptabiliser_invoice(
         sales_account_code,
     )
     .await?;
-    let vat_account_value = lookup_account_value(
+    let _vat_account_value = lookup_account_value(
         &mut client,
         &account_table,
         &resolved,
@@ -2561,14 +2829,50 @@ pub async fn comptabiliser_invoice(
         vat_account_code,
     )
     .await?;
+    let _bic_account_value = lookup_account_value(
+        &mut client,
+        &account_table,
+        &resolved,
+        &id,
+        &database_name,
+        bic_account_code,
+    )
+    .await?;
     let role_value =
         resolve_tiers_role_for_entry(&mut client, &resolved, &id, &database_name, &invoice).await?;
 
-    let mut tva_breakdown = BTreeMap::<String, f64>::new();
+    let mut sales_breakdown = BTreeMap::<String, f64>::new();
+    let mut vat_breakdown = BTreeMap::<String, f64>::new();
+    let mut bic_breakdown = BTreeMap::<String, f64>::new();
     for line in &invoice.lignes {
-        let key = format!("{:.2}", line.taux_tva);
-        let amount = tva_breakdown.entry(key).or_insert(0.0);
-        *amount = round2(*amount + line.montant_ht);
+        let sales_key = if invoice.is_supplier {
+            line.expense_account.trim()
+        } else {
+            line.revenue_account.trim()
+        };
+        let sales_key = if sales_key.is_empty() {
+            sales_account_code.to_string()
+        } else {
+            sales_key.to_string()
+        };
+        let sales_amount = sales_breakdown.entry(sales_key).or_insert(0.0);
+        *sales_amount = round2(*sales_amount + line.montant_ht);
+
+        let vat_key = if line.vat_account.trim().is_empty() {
+            vat_account_code.to_string()
+        } else {
+            line.vat_account.trim().to_string()
+        };
+        let vat_amount = vat_breakdown.entry(vat_key).or_insert(0.0);
+        *vat_amount = round2(*vat_amount + line.montant_tva);
+
+        let bic_key = if line.bic_account.trim().is_empty() {
+            bic_account_code.to_string()
+        } else {
+            line.bic_account.trim().to_string()
+        };
+        let bic_amount = bic_breakdown.entry(bic_key).or_insert(0.0);
+        *bic_amount = round2(*bic_amount + line.montant_bic);
     }
 
     let entry_columns = {
@@ -2677,38 +2981,98 @@ pub async fn comptabiliser_invoice(
     };
 
     if invoice.is_supplier {
+        let mut order = 1;
+        for (account_code, amount) in &sales_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
+            add_entry(
+                &mut inserts,
+                &mut entry_ids,
+                order,
+                "achat",
+                *amount,
+                build_entry_values(
+                    &account_value,
+                    &format!("Achat {}", invoice.numero),
+                    *amount,
+                    0.0,
+                    None,
+                ),
+            );
+            order += 1;
+        }
+        for (account_code, amount) in &vat_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
+            add_entry(
+                &mut inserts,
+                &mut entry_ids,
+                order,
+                "tva_deductible",
+                *amount,
+                build_entry_values(
+                    &account_value,
+                    &format!("TVA {}", invoice.numero),
+                    *amount,
+                    0.0,
+                    None,
+                ),
+            );
+            order += 1;
+        }
+        for (account_code, amount) in &bic_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
+            add_entry(
+                &mut inserts,
+                &mut entry_ids,
+                order,
+                "bic_deductible",
+                *amount,
+                build_entry_values(
+                    &account_value,
+                    &format!("BIC {}", invoice.numero),
+                    *amount,
+                    0.0,
+                    None,
+                ),
+            );
+            order += 1;
+        }
         add_entry(
             &mut inserts,
             &mut entry_ids,
-            1,
-            "achat",
-            invoice.total_ht,
-            build_entry_values(
-                &sales_account_value,
-                &format!("Achat {}", invoice.numero),
-                invoice.total_ht,
-                0.0,
-                None,
-            ),
-        );
-        add_entry(
-            &mut inserts,
-            &mut entry_ids,
-            2,
-            "tva_deductible",
-            invoice.total_tva,
-            build_entry_values(
-                &vat_account_value,
-                &format!("TVA {}", invoice.numero),
-                invoice.total_tva,
-                0.0,
-                None,
-            ),
-        );
-        add_entry(
-            &mut inserts,
-            &mut entry_ids,
-            3,
+            order,
             "fournisseur",
             invoice.total_ttc,
             build_entry_values(
@@ -2735,7 +3099,19 @@ pub async fn comptabiliser_invoice(
             ),
         );
         let mut order = 2;
-        for amount in tva_breakdown.values() {
+        for (account_code, amount) in &sales_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
             add_entry(
                 &mut inserts,
                 &mut entry_ids,
@@ -2743,7 +3119,7 @@ pub async fn comptabiliser_invoice(
                 "vente",
                 *amount,
                 build_entry_values(
-                    &sales_account_value,
+                    &account_value,
                     &format!("Vente {}", invoice.numero),
                     0.0,
                     *amount,
@@ -2752,20 +3128,64 @@ pub async fn comptabiliser_invoice(
             );
             order += 1;
         }
-        add_entry(
-            &mut inserts,
-            &mut entry_ids,
-            order,
-            "tva_collectee",
-            invoice.total_tva,
-            build_entry_values(
-                &vat_account_value,
-                &format!("TVA {}", invoice.numero),
-                0.0,
-                invoice.total_tva,
-                None,
-            ),
-        );
+        for (account_code, amount) in &vat_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
+            add_entry(
+                &mut inserts,
+                &mut entry_ids,
+                order,
+                "tva_collectee",
+                *amount,
+                build_entry_values(
+                    &account_value,
+                    &format!("TVA {}", invoice.numero),
+                    0.0,
+                    *amount,
+                    None,
+                ),
+            );
+            order += 1;
+        }
+        for (account_code, amount) in &bic_breakdown {
+            if *amount <= 0.0 {
+                continue;
+            }
+            let account_value = lookup_account_value(
+                &mut client,
+                &account_table,
+                &resolved,
+                &id,
+                &database_name,
+                account_code,
+            )
+            .await?;
+            add_entry(
+                &mut inserts,
+                &mut entry_ids,
+                order,
+                "bic_collecte",
+                *amount,
+                build_entry_values(
+                    &account_value,
+                    &format!("BIC {}", invoice.numero),
+                    0.0,
+                    *amount,
+                    None,
+                ),
+            );
+            order += 1;
+        }
     }
 
     let sql = format!(
@@ -2836,6 +3256,7 @@ pub async fn list_tiers(
 ) -> Result<Vec<TiersSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
+    ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let type_filter = type_tiers.unwrap_or_else(|| "all".to_string());
     let limit = limit.unwrap_or(40).clamp(1, 100);
@@ -3200,6 +3621,7 @@ pub async fn list_articles(
 ) -> Result<Vec<ArticleSummary>, String> {
     let connection = load_connection_config(&state, &id)?;
     let mut client = get_active_client(state.inner(), &id).await?;
+    ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
     let limit = limit.unwrap_or(40).clamp(1, 100);
     let normalized_search = search
@@ -3235,11 +3657,21 @@ pub async fn list_articles(
                 id: sage_entity_service::parse_string(row.first()),
                 code: sage_entity_service::parse_string(row.get(1)),
                 libelle: sage_entity_service::parse_string(row.get(2)),
-                prix_ht: sage_entity_service::parse_f64(row.get(3)),
-                taux_tva: sage_entity_service::parse_f64(row.get(4)),
-                unite: sage_entity_service::parse_string(row.get(5)),
-                reference: sage_entity_service::parse_string(row.get(6)),
-                en_activite: sage_entity_service::parse_bool(row.get(7)),
+                description: sage_entity_service::parse_string(row.get(3)),
+                prix_ht: sage_entity_service::parse_f64(row.get(4)),
+                currency: sage_entity_service::parse_string(row.get(5)),
+                taux_tva: sage_entity_service::parse_f64(row.get(6)),
+                taux_bic: sage_entity_service::parse_f64(row.get(7)),
+                unite: sage_entity_service::parse_string(row.get(8)),
+                reference: sage_entity_service::parse_string(row.get(9)),
+                category: sage_entity_service::parse_string(row.get(10)),
+                en_activite: sage_entity_service::parse_bool(row.get(11)),
+                revenue_account: sage_entity_service::parse_string(row.get(12)),
+                expense_account: sage_entity_service::parse_string(row.get(13)),
+                vat_account: sage_entity_service::parse_string(row.get(14)),
+                bic_account: sage_entity_service::parse_string(row.get(15)),
+                tax_exempt: sage_entity_service::parse_bool(row.get(16)),
+                custom_tax_rules: sage_entity_service::parse_string(row.get(17)),
             })
             .collect());
     }
@@ -3251,10 +3683,14 @@ SELECT TOP ({limit})
     CAST({id_expr} AS NVARCHAR(50)) AS id,
     CAST({code_expr} AS NVARCHAR(100)) AS code,
     CAST({label_expr} AS NVARCHAR(255)) AS libelle,
+    N'' AS description,
     COALESCE(TRY_CAST({pu_expr} AS DECIMAL(18, 6)), 0) AS prix_ht,
+    N'' AS currency,
     COALESCE(TRY_CAST({tva_expr} AS DECIMAL(18, 6)), 0) AS taux_tva,
+    0 AS taux_bic,
     COALESCE(CAST({unite_expr} AS NVARCHAR(50)), N'') AS unite,
     COALESCE(CAST({ref_expr} AS NVARCHAR(100)), N'') AS reference,
+    N'' AS category,
     CASE
         WHEN {active_expr} IS NULL THEN CAST(1 AS BIT)
         WHEN CAST({active_expr} AS NVARCHAR(50)) IN (N'1', N'true', N'TRUE', N'oui') THEN CAST(1 AS BIT)
@@ -3341,11 +3777,21 @@ WHERE 1=1
             id: sage_entity_service::parse_string(row.first()),
             code: sage_entity_service::parse_string(row.get(1)),
             libelle: sage_entity_service::parse_string(row.get(2)),
-            prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
-            taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
-            unite: sage_entity_service::parse_string(row.get(5)),
-            reference: sage_entity_service::parse_string(row.get(6)),
-            en_activite: sage_entity_service::parse_bool(row.get(7)),
+            description: sage_entity_service::parse_string(row.get(3)),
+            prix_ht: round2(sage_entity_service::parse_f64(row.get(4))),
+            currency: sage_entity_service::parse_string(row.get(5)),
+            taux_tva: round2(sage_entity_service::parse_f64(row.get(6))),
+            taux_bic: round2(sage_entity_service::parse_f64(row.get(7))),
+            unite: sage_entity_service::parse_string(row.get(8)),
+            reference: sage_entity_service::parse_string(row.get(9)),
+            category: sage_entity_service::parse_string(row.get(10)),
+            en_activite: sage_entity_service::parse_bool(row.get(11)),
+            revenue_account: String::new(),
+            expense_account: String::new(),
+            vat_account: String::new(),
+            bic_account: String::new(),
+            tax_exempt: false,
+            custom_tax_rules: String::new(),
         })
         .collect();
 
@@ -3370,11 +3816,21 @@ WHERE 1=1
                     id: sage_entity_service::parse_string(row.first()),
                     code: sage_entity_service::parse_string(row.get(1)),
                     libelle: sage_entity_service::parse_string(row.get(2)),
-                    prix_ht: round2(sage_entity_service::parse_f64(row.get(3))),
-                    taux_tva: round2(sage_entity_service::parse_f64(row.get(4))),
-                    unite: sage_entity_service::parse_string(row.get(5)),
-                    reference: sage_entity_service::parse_string(row.get(6)),
-                    en_activite: sage_entity_service::parse_bool(row.get(7)),
+                    description: sage_entity_service::parse_string(row.get(3)),
+                    prix_ht: round2(sage_entity_service::parse_f64(row.get(4))),
+                    currency: sage_entity_service::parse_string(row.get(5)),
+                    taux_tva: round2(sage_entity_service::parse_f64(row.get(6))),
+                    taux_bic: round2(sage_entity_service::parse_f64(row.get(7))),
+                    unite: sage_entity_service::parse_string(row.get(8)),
+                    reference: sage_entity_service::parse_string(row.get(9)),
+                    category: sage_entity_service::parse_string(row.get(10)),
+                    en_activite: sage_entity_service::parse_bool(row.get(11)),
+                    revenue_account: sage_entity_service::parse_string(row.get(12)),
+                    expense_account: sage_entity_service::parse_string(row.get(13)),
+                    vat_account: sage_entity_service::parse_string(row.get(14)),
+                    bic_account: sage_entity_service::parse_string(row.get(15)),
+                    tax_exempt: sage_entity_service::parse_bool(row.get(16)),
+                    custom_tax_rules: sage_entity_service::parse_string(row.get(17)),
                 };
                 if !native_ids.contains(&entry.code.to_lowercase()) {
                     result.push(entry);
@@ -3389,15 +3845,15 @@ WHERE 1=1
 
 fn build_local_article_sql(search: Option<&str>, limit: u32) -> String {
     let mut sql = format!(
-        "SELECT TOP ({limit}) [id],[code],COALESCE([libelle],N'') AS libelle,COALESCE([prix_ht],0) AS prix_ht,COALESCE([taux_tva],0) AS taux_tva,COALESCE([unite],N'') AS unite,COALESCE([reference],N'') AS reference,[en_activite] FROM [dbo].[{table}] WHERE 1=1",
+        "SELECT TOP ({limit}) [id],[code],COALESCE([libelle],N'') AS libelle,COALESCE([description],N'') AS description,COALESCE([prix_ht],0) AS prix_ht,COALESCE([currency],N'') AS currency,COALESCE([taux_tva],0) AS taux_tva,COALESCE([taux_bic],0) AS taux_bic,COALESCE([unite],N'') AS unite,COALESCE([reference],N'') AS reference,COALESCE([category],N'') AS category,[en_activite],COALESCE([revenue_account],N'') AS revenue_account,COALESCE([expense_account],N'') AS expense_account,COALESCE([vat_account],N'') AS vat_account,COALESCE([bic_account],N'') AS bic_account,COALESCE([tax_exempt],0) AS tax_exempt,COALESCE([custom_tax_rules],N'') AS custom_tax_rules FROM [dbo].[{table}] WHERE 1=1",
         limit = limit,
         table = LOCAL_ARTICLE_TABLE
     );
     if let Some(s) = search.filter(|s| !s.trim().is_empty()) {
         let val = format!("%{}%", s.trim().replace('\'', "''"));
         sql.push_str(&format!(
-            " AND ([code] LIKE N'{}' OR [libelle] LIKE N'{}' OR [reference] LIKE N'{}')",
-            val, val, val
+            " AND ([code] LIKE N'{}' OR [libelle] LIKE N'{}' OR [description] LIKE N'{}' OR [reference] LIKE N'{}' OR [category] LIKE N'{}' OR CAST([prix_ht] AS NVARCHAR(50)) LIKE N'{}')",
+            val, val, val, val, val, val
         ));
     }
     sql.push_str(" ORDER BY [code] ASC");
@@ -3541,16 +3997,26 @@ pub async fn create_article(
     article.id = format!("sdb-{}", Uuid::new_v4());
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sql = format!(
-        "INSERT INTO [dbo].[{table}] ([id],[code],[libelle],[prix_ht],[taux_tva],[unite],[reference],[en_activite],[created_at],[updated_at]) VALUES ({id},{code},{libelle},{prix_ht},{taux_tva},{unite},{reference},{active},{now},{now})",
+        "INSERT INTO [dbo].[{table}] ([id],[code],[libelle],[description],[prix_ht],[currency],[taux_tva],[taux_bic],[unite],[reference],[category],[en_activite],[revenue_account],[expense_account],[vat_account],[bic_account],[tax_exempt],[custom_tax_rules],[created_at],[updated_at]) VALUES ({id},{code},{libelle},{description},{prix_ht},{currency},{taux_tva},{taux_bic},{unite},{reference},{category},{active},{revenue_account},{expense_account},{vat_account},{bic_account},{tax_exempt},{custom_tax_rules},{now},{now})",
         table = LOCAL_ARTICLE_TABLE,
         id = sql_string(&article.id),
         code = sql_string(&article.code),
         libelle = sql_opt_string(&article.libelle),
+        description = sql_opt_string(&article.description),
         prix_ht = article.prix_ht,
+        currency = sql_opt_string(&article.currency),
         taux_tva = article.taux_tva,
+        taux_bic = article.taux_bic,
         unite = sql_opt_string(&article.unite),
         reference = sql_opt_string(&article.reference),
+        category = sql_opt_string(&article.category),
         active = if article.en_activite { 1 } else { 0 },
+        revenue_account = sql_opt_string(&article.revenue_account),
+        expense_account = sql_opt_string(&article.expense_account),
+        vat_account = sql_opt_string(&article.vat_account),
+        bic_account = sql_opt_string(&article.bic_account),
+        tax_exempt = if article.tax_exempt { 1 } else { 0 },
+        custom_tax_rules = sql_opt_string(&article.custom_tax_rules),
         now = sql_string(&now),
     );
     db::execute_raw_query(&mut client, &sql).await?;
@@ -3568,15 +4034,25 @@ pub async fn update_article(
     ensure_invoice_support_tables(&mut client).await?;
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sql = format!(
-        "UPDATE [dbo].[{table}] SET [code]={code},[libelle]={libelle},[prix_ht]={prix_ht},[taux_tva]={taux_tva},[unite]={unite},[reference]={reference},[en_activite]={active},[updated_at]={now} WHERE [id]={id}",
+        "UPDATE [dbo].[{table}] SET [code]={code},[libelle]={libelle},[description]={description},[prix_ht]={prix_ht},[currency]={currency},[taux_tva]={taux_tva},[taux_bic]={taux_bic},[unite]={unite},[reference]={reference},[category]={category},[en_activite]={active},[revenue_account]={revenue_account},[expense_account]={expense_account},[vat_account]={vat_account},[bic_account]={bic_account},[tax_exempt]={tax_exempt},[custom_tax_rules]={custom_tax_rules},[updated_at]={now} WHERE [id]={id}",
         table = LOCAL_ARTICLE_TABLE,
         code = sql_string(&article.code),
         libelle = sql_opt_string(&article.libelle),
+        description = sql_opt_string(&article.description),
         prix_ht = article.prix_ht,
+        currency = sql_opt_string(&article.currency),
         taux_tva = article.taux_tva,
+        taux_bic = article.taux_bic,
         unite = sql_opt_string(&article.unite),
         reference = sql_opt_string(&article.reference),
+        category = sql_opt_string(&article.category),
         active = if article.en_activite { 1 } else { 0 },
+        revenue_account = sql_opt_string(&article.revenue_account),
+        expense_account = sql_opt_string(&article.expense_account),
+        vat_account = sql_opt_string(&article.vat_account),
+        bic_account = sql_opt_string(&article.bic_account),
+        tax_exempt = if article.tax_exempt { 1 } else { 0 },
+        custom_tax_rules = sql_opt_string(&article.custom_tax_rules),
         now = sql_string(&now),
         id = sql_string(&article.id),
     );

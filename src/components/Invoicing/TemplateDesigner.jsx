@@ -19,40 +19,76 @@ const COLOR_PRESETS = [
 
 const THEME_PRESETS = [
   {
-    id: "modern",
-    name: "Moderne",
-    primary_color: "#1e3a5f",
-    secondary_color: "#2563eb",
+    id: "modern-clean",
+    name: "Modern Clean",
+    primary_color: "#1f4f46",
+    secondary_color: "#3b82f6",
     font_family: "Inter",
-    font_size_px: 10,
+    font_size_px: 8,
     footer_text: "Merci de votre confiance",
   },
   {
-    id: "classic",
-    name: "Classique",
-    primary_color: "#21486a",
-    secondary_color: "#6b7280",
-    font_family: "Georgia",
-    font_size_px: 10,
+    id: "modern-bold",
+    name: "Modern Bold",
+    primary_color: "#172554",
+    secondary_color: "#0f766e",
+    font_family: "Inter",
+    font_size_px: 8,
+    footer_text: "Document professionnel genere par Sage Data Bridge",
+  },
+  {
+    id: "modern-soft",
+    name: "Modern Soft",
+    primary_color: "#334155",
+    secondary_color: "#14b8a6",
+    font_family: "Inter",
+    font_size_px: 8,
+    footer_text: "Merci de votre confiance",
+  },
+  {
+    id: "modern-borderless",
+    name: "Modern Borderless",
+    primary_color: "#111827",
+    secondary_color: "#64748b",
+    font_family: "Helvetica",
+    font_size_px: 8,
+    footer_text: "Merci de votre confiance",
+  },
+  {
+    id: "modern-accent",
+    name: "Modern Accent",
+    primary_color: "#7c2d12",
+    secondary_color: "#0f766e",
+    font_family: "Inter",
+    font_size_px: 8,
+    footer_text: "Votre partenaire de gestion",
+  },
+  {
+    id: "modern-watermark",
+    name: "Modern Watermark",
+    primary_color: "#1e293b",
+    secondary_color: "#2563eb",
+    font_family: "Inter",
+    font_size_px: 8,
+    footer_text: "Merci de votre confiance",
+  },
+  {
+    id: "modern-compact",
+    name: "Modern Compact",
+    primary_color: "#0f172a",
+    secondary_color: "#059669",
+    font_family: "Helvetica",
+    font_size_px: 7,
     footer_text: "Document genere par Sage Data Bridge",
   },
   {
-    id: "minimal",
-    name: "Minimaliste",
-    primary_color: "#111827",
-    secondary_color: "#d1d5db",
-    font_family: "Arial",
-    font_size_px: 10,
+    id: "modern-premium",
+    name: "Modern Premium",
+    primary_color: "#312e81",
+    secondary_color: "#b45309",
+    font_family: "Inter",
+    font_size_px: 8,
     footer_text: "Merci de votre confiance",
-  },
-  {
-    id: "corporate",
-    name: "Corporate",
-    primary_color: "#0f8f7c",
-    secondary_color: "#1de8c8",
-    font_family: "Helvetica",
-    font_size_px: 10,
-    footer_text: "Votre partenaire de gestion",
   },
 ];
 
@@ -197,7 +233,7 @@ function TemplateField({ label, children }) {
 }
 
 export default function TemplateDesigner({ open, connectionId, onClose }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const iframeRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -207,7 +243,7 @@ export default function TemplateDesigner({ open, connectionId, onClose }) {
   const [previewHtml, setPreviewHtml] = useState("");
   const [message, setMessage] = useState({ type: "", text: "" });
   const [templates, setTemplates] = useState([]);
-  const [selectedTemplateId, setSelectedTemplateId] = useState("builtin-modern");
+  const [selectedTemplateId, setSelectedTemplateId] = useState("builtin-modern-clean");
   const [draft, setDraft] = useState(() => createDraft());
 
   const selectedTemplate = useMemo(
@@ -227,7 +263,7 @@ export default function TemplateDesigner({ open, connectionId, onClose }) {
         if (cancelled) return;
         setTemplates(items);
         const initial = items[0] ?? createDraft();
-        setSelectedTemplateId(initial.id || "builtin-modern");
+        setSelectedTemplateId(initial.id || "builtin-modern-clean");
         setDraft(createDraft(initial));
       })
       .catch((error) => {
@@ -249,7 +285,7 @@ export default function TemplateDesigner({ open, connectionId, onClose }) {
 
     let cancelled = false;
     setPreviewLoading(true);
-    renderInvoiceHtmlPreview(SAMPLE_INVOICE, draft)
+    renderInvoiceHtmlPreview(SAMPLE_INVOICE, draft, lang)
       .then((html) => {
         if (!cancelled) setPreviewHtml(html);
       })
@@ -266,7 +302,7 @@ export default function TemplateDesigner({ open, connectionId, onClose }) {
     return () => {
       cancelled = true;
     };
-  }, [draft, open]);
+  }, [draft, lang, open]);
 
   if (!open) return null;
 
@@ -444,8 +480,8 @@ export default function TemplateDesigner({ open, connectionId, onClose }) {
                 <TemplateField label={t("invoice_template_font_size")}>
                   <input
                     type="range"
-                    min="9"
-                    max="12"
+                    min="7"
+                    max="10"
                     value={draft.font_size_px}
                     onChange={(event) => updateDraft({ font_size_px: Number(event.target.value) })}
                   />

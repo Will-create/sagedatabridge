@@ -207,6 +207,19 @@ fn is_sage1000_schema(schema: Option<&SageSchema>) -> bool {
     matches!(schema, Some(value) if value.edition == SageEdition::Sage1000)
 }
 
+fn sage1000_route_source(
+    schema: Option<&SageSchema>,
+    has_sage1000_tables: bool,
+) -> Option<&'static str> {
+    if is_sage1000_schema(schema) {
+        Some("schema_hint")
+    } else if has_sage1000_tables {
+        Some("database_probe")
+    } else {
+        None
+    }
+}
+
 fn pick_column(columns: &ColumnMap, candidates: &[&str]) -> Option<String> {
     candidates
         .iter()
@@ -389,6 +402,34 @@ async fn resolve_sage1000_context(
         role_tiers: detect_table(client, &["TROLETIERS"]).await,
         pieces: detect_table(client, &["TPIECE"]).await,
     }))
+}
+
+async fn should_use_sage1000_analytics(
+    client: &mut db::DbClient,
+    schema: Option<&SageSchema>,
+    endpoint: &str,
+) -> Result<bool, String> {
+    if let Some(source) = sage1000_route_source(schema, is_sage1000_schema(schema)) {
+        eprintln!(
+            "[analytics] sage1000_route endpoint={} source={} database={}",
+            endpoint, source, client.config.database
+        );
+        return Ok(true);
+    }
+
+    let has_sage1000_tables = resolve_sage1000_context(client).await?.is_some();
+    if let Some(source) = sage1000_route_source(schema, has_sage1000_tables) {
+        eprintln!(
+            "[analytics] sage1000_route endpoint={} source={} hint_schema={} database={}",
+            endpoint,
+            source,
+            schema.map(|value| value.edition.as_str()).unwrap_or("none"),
+            client.config.database
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn resolve_amount_exprs(alias: &str, columns: &ColumnMap) -> Option<(String, String)> {
@@ -915,8 +956,6 @@ async fn get_balance_sage1000(
 
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = text_or_empty(&qualify("cg", "Caption"), 255);
-    let opening_debit_expr = decimal_or_zero(&qualify("cg", "soldeDO"));
-    let opening_credit_expr = decimal_or_zero(&qualify("cg", "soldeDV"));
     let movement_debit_expr = format!(
         "COALESCE(SUM(CASE WHEN TRY_CAST({} AS DATE) BETWEEN {} AND {} THEN {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
         qualify("e", "eDate"),
@@ -931,6 +970,14 @@ async fn get_balance_sage1000(
         sql_literal(date_to),
         decimal_or_zero(&qualify("e", "credit"))
     );
+    let opening_net_expr = format!(
+        "COALESCE(SUM(CASE WHEN TRY_CAST({} AS DATE) < {} THEN {} - {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+        qualify("e", "eDate"),
+        sql_literal(date_from),
+        decimal_or_zero(&qualify("e", "debit")),
+        decimal_or_zero(&qualify("e", "credit"))
+    );
+    let movement_net_expr = format!("({movement_debit_expr} - {movement_credit_expr})");
     let account_filter_sql = account_prefix
         .filter(|prefix| !prefix.trim().is_empty())
         .map(|prefix| {
@@ -944,34 +991,46 @@ async fn get_balance_sage1000(
 
     let sql = format!(
         r#"
+        WITH account_base AS (
+            SELECT
+                account_pk = {account_pk},
+                account_no = {account_no_expr},
+                account_label = {account_label_expr},
+                opening_net = {opening_net_expr},
+                mvt_debit = {movement_debit_expr},
+                mvt_credit = {movement_credit_expr},
+                movement_net = {movement_net_expr}
+            FROM {accounts_table} cg
+            LEFT JOIN {entries_table} e ON {entry_account_fk} = {account_pk}
+            WHERE COALESCE(TRY_CAST({is_active_col} AS INT), 1) = 1
+              AND {account_no_expr} <> ''
+              {account_filter_sql}
+            GROUP BY
+                {account_pk},
+                {account_no_col},
+                {account_label_col}
+        )
         SELECT
-            account_no = {account_no_expr},
-            account_label = {account_label_expr},
-            ouverture_debit = {opening_debit_expr},
-            ouverture_credit = {opening_credit_expr},
-            mvt_debit = {movement_debit_expr},
-            mvt_credit = {movement_credit_expr},
-            cloture_debit = {opening_debit_expr} + {movement_debit_expr},
-            cloture_credit = {opening_credit_expr} + {movement_credit_expr}
-        FROM {accounts_table} cg
-        LEFT JOIN {entries_table} e ON {entry_account_fk} = {account_pk}
-        WHERE COALESCE(TRY_CAST({is_active_col} AS INT), 1) = 1
-          AND {account_no_expr} <> ''
-          {account_filter_sql}
-        GROUP BY
-            {account_pk},
-            {account_no_col},
-            {account_label_col},
-            {opening_debit_col},
-            {opening_credit_col}
+            account_no,
+            account_label,
+            ouverture_debit = CASE WHEN opening_net > 0 THEN opening_net ELSE CAST(0 AS DECIMAL(38, 6)) END,
+            ouverture_credit = CASE WHEN opening_net < 0 THEN ABS(opening_net) ELSE CAST(0 AS DECIMAL(38, 6)) END,
+            mvt_debit,
+            mvt_credit,
+            cloture_debit = CASE WHEN opening_net + movement_net > 0 THEN opening_net + movement_net ELSE CAST(0 AS DECIMAL(38, 6)) END,
+            cloture_credit = CASE WHEN opening_net + movement_net < 0 THEN ABS(opening_net + movement_net) ELSE CAST(0 AS DECIMAL(38, 6)) END
+        FROM account_base
+        WHERE opening_net <> 0
+           OR mvt_debit <> 0
+           OR mvt_credit <> 0
         ORDER BY account_no
         "#,
         account_no_expr = account_no_expr,
         account_label_expr = account_label_expr,
-        opening_debit_expr = opening_debit_expr,
-        opening_credit_expr = opening_credit_expr,
+        opening_net_expr = opening_net_expr,
         movement_debit_expr = movement_debit_expr,
         movement_credit_expr = movement_credit_expr,
+        movement_net_expr = movement_net_expr,
         accounts_table = context.accounts.sql_name(),
         entries_table = context.entries.sql_name(),
         entry_account_fk = qualify("e", "oidcompteGeneral"),
@@ -979,9 +1038,7 @@ async fn get_balance_sage1000(
         is_active_col = qualify("cg", "enActivite"),
         account_filter_sql = account_filter_sql,
         account_no_col = qualify("cg", "codeCompte"),
-        account_label_col = qualify("cg", "Caption"),
-        opening_debit_col = qualify("cg", "soldeDO"),
-        opening_credit_col = qualify("cg", "soldeDV")
+        account_label_col = qualify("cg", "Caption")
     );
 
     let data = db::execute_raw_query(client, &sql).await?;
@@ -1549,7 +1606,7 @@ pub async fn get_grand_livre(
     let config = load_connection_config(&state, &id)?;
     let hint_schema = state.get_connection_schema(&id);
     let mut client = get_active_client(state.inner(), &id).await?;
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "get_grand_livre").await? {
         return get_grand_livre_sage1000(
             &mut client,
             &date_from,
@@ -1873,7 +1930,7 @@ pub async fn get_balance(
     let config = load_connection_config(&state, &id)?;
     let hint_schema = state.get_connection_schema(&id);
     let mut client = get_active_client(state.inner(), &id).await?;
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "get_balance").await? {
         return get_balance_sage1000(&mut client, &date_from, &date_to, account_prefix.as_deref())
             .await;
     }
@@ -2119,7 +2176,13 @@ pub async fn get_grand_livre_auxiliaire(
     let config = load_connection_config(&state, &id)?;
     let hint_schema = state.get_connection_schema(&id);
     let mut client = get_active_client(state.inner(), &id).await?;
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(
+        &mut client,
+        hint_schema.as_ref(),
+        "get_grand_livre_auxiliaire",
+    )
+    .await?
+    {
         return get_grand_livre_auxiliaire_sage1000(
             &mut client,
             &date_from,
@@ -2625,7 +2688,9 @@ async fn do_stream_grand_livre(
     let _config = state.resolve_connection_config(id)?;
     let hint_schema = state.get_connection_schema(id);
     let mut client = get_active_client(state, id).await?;
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "stream_grand_livre")
+        .await?
+    {
         stream_gl_sage1000(
             window,
             &mut client,
@@ -3017,7 +3082,13 @@ async fn do_stream_balance(
     let mut client = get_active_client(state, id).await?;
 
     // Balance is an aggregated query (one row per account) — run it fully, then chunk-emit
-    let result = if is_sage1000_schema(hint_schema.as_ref()) {
+    let result = if should_use_sage1000_analytics(
+        &mut client,
+        hint_schema.as_ref(),
+        "stream_balance",
+    )
+    .await?
+    {
         get_balance_sage1000(&mut client, date_from, date_to, account_prefix.as_deref()).await?
     } else {
         // Build inline via the existing get_balance logic reused here
@@ -3269,7 +3340,8 @@ async fn do_stream_aux(
     let hint_schema = state.get_connection_schema(id);
     let mut client = get_active_client(state, id).await?;
 
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "stream_auxiliaire").await?
+    {
         stream_aux_sage1000(
             window,
             &mut client,
@@ -3841,7 +3913,9 @@ pub async fn get_dashboard_kpis(
     let config = load_connection_config(&state, &id)?;
     let hint_schema = state.get_connection_schema(&id);
     let mut client = get_active_client(state.inner(), &id).await?;
-    if is_sage1000_schema(hint_schema.as_ref()) {
+    if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "get_dashboard_kpis")
+        .await?
+    {
         return get_dashboard_kpis_sage1000(
             &mut client,
             &date_from,
@@ -4166,4 +4240,39 @@ pub async fn get_dashboard_kpis(
         data: kpis,
         warning: join_warnings(warnings),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sage1000_route_uses_schema_hint_first() {
+        let schema = SageSchema::for_edition(&SageEdition::Sage1000);
+
+        assert_eq!(
+            sage1000_route_source(Some(&schema), false),
+            Some("schema_hint")
+        );
+    }
+
+    #[test]
+    fn sage1000_route_uses_database_probe_without_hint() {
+        assert_eq!(sage1000_route_source(None, true), Some("database_probe"));
+    }
+
+    #[test]
+    fn sage1000_route_uses_database_probe_for_generic_hint() {
+        let schema = SageSchema::for_edition(&SageEdition::Generic);
+
+        assert_eq!(
+            sage1000_route_source(Some(&schema), true),
+            Some("database_probe")
+        );
+    }
+
+    #[test]
+    fn sage1000_route_falls_back_when_no_hint_or_tables() {
+        assert_eq!(sage1000_route_source(None, false), None);
+    }
 }

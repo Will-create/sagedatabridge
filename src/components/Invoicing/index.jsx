@@ -37,6 +37,7 @@ import {
   exportInvoicePdf,
   getInvoice,
   getInvoiceTemplates,
+  getSettings,
   listInvoices,
   searchArticles,
   searchTiers,
@@ -79,7 +80,23 @@ const STATUS_TRANSITIONS = {
   Avoir: [],
 };
 
-const EMPTY_TEMPLATE_ID = "builtin-modern";
+const EMPTY_TEMPLATE_ID = "builtin-modern-clean";
+const LOCAL_DRAFT_PREFIX = "sdb_invoice_drafts:";
+const SYNC_QUEUE_PREFIX = "sdb_sync_queue:";
+const LOCAL_ITEMS_PREFIX = "sdb_invoice_items:";
+const DEFAULT_INVOICE_SETTINGS = {
+  invoice_units: ["Pce", "Kg", "L", "H", "Jour"],
+  invoice_vat_rates: [18, 20, 10, 5.5, 0],
+  invoice_default_unit: "Pce",
+  invoice_default_vat_rate: 20,
+  invoice_default_currency: "XOF",
+  invoice_default_payment_terms: "",
+  invoice_extra_taxes: [],
+  tax_types: [
+    { id: "vat", name: "VAT", rate: 20, account: "445710", active: true },
+    { id: "bic", name: "BIC", rate: 0, account: "", active: false },
+  ],
+};
 
 function round2(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
@@ -91,7 +108,8 @@ function todayIso() {
 
 function formatCurrency(value, devise = "XOF") {
   const isXof = (devise || "XOF").toUpperCase() === "XOF";
-  return new Intl.NumberFormat("fr-FR", {
+  const locale = (localStorage.getItem("sdb_lang") || "en") === "fr" ? "fr-FR" : "en-US";
+  return new Intl.NumberFormat(locale, {
     style: "currency",
     currency: devise || "XOF",
     minimumFractionDigits: isXof ? 0 : 2,
@@ -114,7 +132,122 @@ function sanitizeNumber(value) {
   return Number(String(value).replace(",", ".")) || 0;
 }
 
-function buildBlankLine(ordre = 1) {
+function normalizeDiscountType(value) {
+  return value === "fixed" ? "fixed" : "percent";
+}
+
+function applyDiscount(base, type, value) {
+  const amount = Math.max(sanitizeNumber(value), 0);
+  if (normalizeDiscountType(type) === "fixed") {
+    return Math.max(base - Math.min(amount, base), 0);
+  }
+  return base * (1 - Math.min(amount, 100) / 100);
+}
+
+function normalizeInvoiceSettings(settings = {}) {
+  const merged = { ...DEFAULT_INVOICE_SETTINGS, ...(settings || {}) };
+  const units = Array.isArray(merged.invoice_units)
+    ? merged.invoice_units.map((unit) => String(unit).trim()).filter(Boolean)
+    : DEFAULT_INVOICE_SETTINGS.invoice_units;
+  const rates = Array.isArray(merged.invoice_vat_rates)
+    ? merged.invoice_vat_rates.map((rate) => Number(rate)).filter((rate) => Number.isFinite(rate))
+    : DEFAULT_INVOICE_SETTINGS.invoice_vat_rates;
+  return {
+    ...merged,
+    invoice_units: units.length ? units : DEFAULT_INVOICE_SETTINGS.invoice_units,
+    invoice_vat_rates: rates.length ? rates : DEFAULT_INVOICE_SETTINGS.invoice_vat_rates,
+    invoice_default_unit: String(merged.invoice_default_unit || units[0] || "Pce"),
+    invoice_default_vat_rate: Number.isFinite(Number(merged.invoice_default_vat_rate))
+      ? Number(merged.invoice_default_vat_rate)
+      : 20,
+    invoice_default_currency: String(merged.invoice_default_currency || "XOF").toUpperCase(),
+    tax_types: Array.isArray(merged.tax_types) && merged.tax_types.length
+      ? merged.tax_types
+      : DEFAULT_INVOICE_SETTINGS.tax_types,
+  };
+}
+
+function localDraftKey(connId) {
+  return `${LOCAL_DRAFT_PREFIX}${connId || "default"}`;
+}
+
+function readLocalDrafts(connId) {
+  try {
+    const raw = localStorage.getItem(localDraftKey(connId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalDrafts(connId, drafts) {
+  localStorage.setItem(localDraftKey(connId), JSON.stringify(drafts));
+}
+
+function syncQueueKey(connId) {
+  return `${SYNC_QUEUE_PREFIX}${connId || "default"}`;
+}
+
+function readSyncQueue(connId) {
+  try {
+    const raw = localStorage.getItem(syncQueueKey(connId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSyncQueue(connId, queue) {
+  localStorage.setItem(syncQueueKey(connId), JSON.stringify(queue));
+}
+
+function localItemsKey(connId) {
+  return `${LOCAL_ITEMS_PREFIX}${connId || "default"}`;
+}
+
+function readLocalItems(connId) {
+  try {
+    const raw = localStorage.getItem(localItemsKey(connId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalItems(connId, items) {
+  localStorage.setItem(localItemsKey(connId), JSON.stringify(items));
+}
+
+function makeSyncQueueItem(type, payload, error = "") {
+  return {
+    id: `sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    payload,
+    error: String(error || ""),
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function makeLocalDraft(invoice, error = "") {
+  return computeInvoice({
+    ...invoice,
+    id: invoice.id && String(invoice.id).startsWith("local-")
+      ? invoice.id
+      : `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    numero: invoice.numero || "Brouillon local",
+    is_local_draft: true,
+    sync_error: String(error || ""),
+    updated_at: new Date().toISOString(),
+  });
+}
+
+function buildBlankLine(ordre = 1, settings = DEFAULT_INVOICE_SETTINGS) {
+  const normalized = normalizeInvoiceSettings(settings);
+  const bicTax = normalized.tax_types.find((tax) => String(tax.id || tax.name).toLowerCase() === "bic" && tax.active);
   return {
     id: `line-${Date.now()}-${ordre}`,
     ordre,
@@ -122,17 +255,28 @@ function buildBlankLine(ordre = 1) {
     article_code: "",
     libelle: "",
     quantite: 1,
-    unite: "",
+    unite: normalized.invoice_default_unit,
     prix_ht: 0,
     remise_pct: 0,
+    remise_type: "percent",
+    remise_valeur: 0,
     montant_ht: 0,
-    taux_tva: 20,
+    taux_tva: normalized.invoice_default_vat_rate,
     montant_tva: 0,
+    taux_bic: bicTax ? Number(bicTax.rate) || 0 : 0,
+    montant_bic: 0,
     montant_ttc: 0,
+    tax_exempt: false,
+    revenue_account: "",
+    expense_account: "",
+    vat_account: "",
+    bic_account: "",
+    custom_tax_rules: "",
   };
 }
 
-function buildBlankInvoice(nature = "Facture", template = null) {
+function buildBlankInvoice(nature = "Facture", template = null, settings = DEFAULT_INVOICE_SETTINGS) {
+  const normalized = normalizeInvoiceSettings(settings);
   return computeInvoice({
     id: "",
     numero: "",
@@ -150,29 +294,38 @@ function buildBlankInvoice(nature = "Facture", template = null) {
     nature,
     statut: nature === "Proforma" ? "Proforma" : nature === "Commande" ? "Bon_Commande" : "Brouillon",
     reference: "",
-    devise: "XOF",
+    devise: normalized.invoice_default_currency,
     total_ht: 0,
     total_tva: 0,
+    total_bic: 0,
     total_ttc: 0,
     remise_globale: 0,
+    remise_globale_type: "percent",
+    remise_globale_valeur: 0,
     is_supplier: false,
-    lignes: [buildBlankLine(1)],
+    lignes: [buildBlankLine(1, normalized)],
     notes: "",
-    conditions: template?.conditions_paiement || "",
+    conditions: template?.conditions_paiement || normalized.invoice_default_payment_terms || "",
     statut_history: [],
   });
 }
 
 function computeInvoice(invoice) {
-  const remiseGlobale = Math.min(Math.max(sanitizeNumber(invoice.remise_globale), 0), 100);
+  const globalDiscountType = normalizeDiscountType(invoice.remise_globale_type);
+  const legacyGlobalDiscount = sanitizeNumber(invoice.remise_globale);
+  const globalDiscountValue = sanitizeNumber(invoice.remise_globale_valeur || legacyGlobalDiscount);
   const lignes = (invoice.lignes || []).map((line, index) => {
     const quantite = sanitizeNumber(line.quantite);
     const prixHt = sanitizeNumber(line.prix_ht);
-    const remisePct = Math.min(Math.max(sanitizeNumber(line.remise_pct), 0), 100);
-    const tauxTva = sanitizeNumber(line.taux_tva);
-    const montantHt = round2(quantite * prixHt * (1 - remisePct / 100));
-    const montantTva = round2(montantHt * tauxTva / 100);
-    const montantTtc = round2(montantHt + montantTva);
+    const remiseType = normalizeDiscountType(line.remise_type);
+    const remiseValeur = sanitizeNumber(line.remise_valeur || line.remise_pct);
+    const remisePct = remiseType === "percent" ? Math.min(Math.max(remiseValeur, 0), 100) : Math.max(remiseValeur, 0);
+    const tauxTva = line.tax_exempt ? 0 : sanitizeNumber(line.taux_tva);
+    const tauxBic = line.tax_exempt ? 0 : sanitizeNumber(line.taux_bic);
+    const montantHt = round2(applyDiscount(round2(quantite * prixHt), remiseType, remiseValeur));
+    const montantTva = line.tax_exempt ? 0 : round2(montantHt * tauxTva / 100);
+    const montantBic = line.tax_exempt ? 0 : round2(montantHt * tauxBic / 100);
+    const montantTtc = round2(montantHt + montantTva + montantBic);
 
     return {
       ...line,
@@ -180,27 +333,42 @@ function computeInvoice(invoice) {
       quantite,
       prix_ht: prixHt,
       remise_pct: remisePct,
+      remise_type: remiseType,
+      remise_valeur: remiseValeur,
       taux_tva: tauxTva,
+      taux_bic: tauxBic,
       montant_ht: montantHt,
       montant_tva: montantTva,
+      montant_bic: montantBic,
       montant_ttc: montantTtc,
     };
   });
 
   const subtotalHt = round2(lignes.reduce((sum, line) => sum + line.montant_ht, 0));
+  const subtotalBeforeDiscount = round2(lignes.reduce((sum, line) => sum + round2(line.quantite * line.prix_ht), 0));
+  const totalLineDiscount = round2(subtotalBeforeDiscount - subtotalHt);
   const subtotalTva = round2(lignes.reduce((sum, line) => sum + line.montant_tva, 0));
-  const factor = 1 - remiseGlobale / 100;
-  const totalHt = round2(subtotalHt * factor);
+  const subtotalBic = round2(lignes.reduce((sum, line) => sum + line.montant_bic, 0));
+  const totalHt = round2(applyDiscount(subtotalHt, globalDiscountType, globalDiscountValue));
+  const totalGlobalDiscount = round2(subtotalHt - totalHt);
+  const factor = subtotalHt > 0 ? totalHt / subtotalHt : 1;
   const totalTva = round2(subtotalTva * factor);
-  const totalTtc = round2(totalHt + totalTva);
+  const totalBic = round2(subtotalBic * factor);
+  const totalTtc = round2(totalHt + totalTva + totalBic);
 
   return {
     ...invoice,
     devise: invoice.devise || "XOF",
-    remise_globale: remiseGlobale,
+    remise_globale: globalDiscountType === "percent" ? Math.min(Math.max(globalDiscountValue, 0), 100) : Math.max(globalDiscountValue, 0),
+    remise_globale_type: globalDiscountType,
+    remise_globale_valeur: globalDiscountValue,
     lignes,
     total_ht: totalHt,
+    subtotal_ht_before_discount: subtotalBeforeDiscount,
+    total_line_discount: totalLineDiscount,
+    total_global_discount: totalGlobalDiscount,
     total_tva: totalTva,
+    total_bic: totalBic,
     total_ttc: totalTtc,
   };
 }
@@ -238,8 +406,94 @@ function getTvaBreakdown(invoice) {
     .sort((left, right) => right.rate - left.rate);
 }
 
+function getBicBreakdown(invoice) {
+  const breakdown = new Map();
+  for (const line of invoice.lignes || []) {
+    const rate = round2(line.taux_bic);
+    if (!rate) continue;
+    const current = breakdown.get(rate) || { base: 0, tax: 0 };
+    breakdown.set(rate, {
+      base: round2(current.base + line.montant_ht),
+      tax: round2(current.tax + line.montant_bic),
+    });
+  }
+  return Array.from(breakdown.entries())
+    .map(([rate, values]) => ({ rate, ...values }))
+    .sort((left, right) => right.rate - left.rate);
+}
+
 function matchesSearch(haystack, needle) {
   return `${haystack || ""}`.toLowerCase().includes((needle || "").toLowerCase());
+}
+
+function itemKey(item) {
+  return String(item.code || item.reference || item.id || "").trim().toLowerCase();
+}
+
+function normalizeItem(item = {}, invoiceSettings = DEFAULT_INVOICE_SETTINGS) {
+  const currency = String(item.currency || item.devise || invoiceSettings.invoice_default_currency || "XOF").toUpperCase();
+  const libelle = String(item.libelle || item.name || "").trim();
+  const reference = String(item.reference || item.sku || "").trim();
+  const code = String(item.code || reference || (libelle ? libelle.toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) : "")).trim();
+  const status = item.status || (!code || !libelle ? "invalid" : item.is_local_draft || item.source === "local_draft" ? "unsynced" : "synced");
+
+  return {
+    id: item.id || `local-item-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    code,
+    libelle,
+    description: item.description || "",
+    prix_ht: sanitizeNumber(item.prix_ht),
+    currency,
+    taux_tva: sanitizeNumber(item.taux_tva),
+    taux_bic: sanitizeNumber(item.taux_bic),
+    unite: item.unite || invoiceSettings.invoice_default_unit || "",
+    reference,
+    category: item.category || "",
+    en_activite: item.en_activite !== false,
+    revenue_account: item.revenue_account || item.accounting_account || "",
+    expense_account: item.expense_account || "",
+    vat_account: item.vat_account || item.tax_account || "",
+    bic_account: item.bic_account || "",
+    tax_exempt: Boolean(item.tax_exempt),
+    custom_tax_rules: item.custom_tax_rules || "",
+    source: item.source || (item.is_local_draft ? "local_draft" : "database"),
+    status,
+    sync_error: item.sync_error || "",
+    updated_at: item.updated_at || new Date().toISOString(),
+  };
+}
+
+function itemMatchesSearch(item, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return true;
+  return [
+    item.code,
+    item.libelle,
+    item.description,
+    item.reference,
+    item.category,
+    item.prix_ht,
+    item.currency,
+  ].some((value) => String(value || "").toLowerCase().includes(needle));
+}
+
+function mergeCatalogItems(remoteItems = [], localItems = [], query = "", invoiceSettings = DEFAULT_INVOICE_SETTINGS) {
+  const merged = [];
+  const seen = new Set();
+  for (const item of localItems.map((entry) => normalizeItem({ ...entry, source: "local_draft", is_local_draft: true }, invoiceSettings))) {
+    if (!itemMatchesSearch(item, query)) continue;
+    const key = itemKey(item) || item.id;
+    seen.add(key);
+    merged.push(item);
+  }
+  for (const item of remoteItems.map((entry) => normalizeItem({ ...entry, source: "database", status: "synced" }, invoiceSettings))) {
+    const key = itemKey(item) || item.id;
+    if (seen.has(key)) continue;
+    if (!itemMatchesSearch(item, query)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged.sort((left, right) => String(left.libelle || left.code).localeCompare(String(right.libelle || right.code)));
 }
 
 function useDebouncedValue(value, delay = 300) {
@@ -377,7 +631,7 @@ function InvoiceCard({ invoice, active, onClick }) {
     <button type="button" className={`invoice-card ${active ? "active" : ""}`} onClick={onClick}>
       <div className="invoice-card-top">
         <strong>{invoice.numero || "—"}</strong>
-        <StatusBadge statut={invoice.statut} />
+        {invoice.is_local_draft ? <span className="invoice-status-badge warning">Local</span> : <StatusBadge statut={invoice.statut} />}
       </div>
       <div className="invoice-card-meta">{formatDate(invoice.date)}</div>
       <div className="invoice-card-title">{invoice.tiers_nom || invoice.tiers_code || "Tiers inconnu"}</div>
@@ -537,8 +791,12 @@ function ArticlesPanel({ article }) {
           <div className="invoice-detail-card">
             <DetailRow label={t("invoice_unit_price")} value={formatCurrency(article.prix_ht)} />
             <DetailRow label={t("invoice_vat_rate")} value={`${round2(article.taux_tva)}%`} />
+            <DetailRow label={t("invoice_bic_rate")} value={`${round2(article.taux_bic)}%`} />
             <DetailRow label={t("invoice_unit")} value={article.unite} />
             <DetailRow label={t("invoice_reference")} value={article.reference} />
+            <DetailRow label={t("invoice_revenue_account")} value={article.revenue_account} mono />
+            <DetailRow label={t("invoice_expense_account")} value={article.expense_account} mono />
+            <DetailRow label={t("invoice_tax_exempt")} value={article.tax_exempt ? t("yes") || "Yes" : t("no") || "No"} />
           </div>
         </>
       )}
@@ -563,7 +821,26 @@ const BLANK_TIERS = {
   nb_factures: 0,
   is_local: false,
 };
-const BLANK_ARTICLE = { id: "", code: "", libelle: "", prix_ht: 0, taux_tva: 20, unite: "", reference: "", en_activite: true };
+const BLANK_ARTICLE = {
+  id: "",
+  code: "",
+  libelle: "",
+  description: "",
+  prix_ht: 0,
+  currency: "XOF",
+  taux_tva: 20,
+  taux_bic: 0,
+  unite: "",
+  reference: "",
+  category: "",
+  en_activite: true,
+  revenue_account: "",
+  expense_account: "",
+  vat_account: "",
+  bic_account: "",
+  tax_exempt: false,
+  custom_tax_rules: "",
+};
 
 function TiersFormModal({ initial, onSave, onClose, t }) {
   const [form, setForm] = useState({ ...BLANK_TIERS, ...initial });
@@ -662,16 +939,17 @@ function TiersFormModal({ initial, onSave, onClose, t }) {
   );
 }
 
-function ArticleFormModal({ initial, onSave, onClose, t }) {
+function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_INVOICE_SETTINGS.invoice_units }) {
   const [form, setForm] = useState({ ...BLANK_ARTICLE, ...initial });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const up = (patch) => setForm((f) => ({ ...f, ...patch }));
 
   async function handleSave() {
-    if (!form.code.trim()) { setError(t("invoice_code_required")); return; }
+    const normalized = normalizeItem(form);
+    if (!normalized.libelle.trim()) { setError(t("invoice_item_name_required")); return; }
     setSaving(true); setError("");
-    try { await onSave(form); onClose(); }
+    try { await onSave(normalized); onClose(); }
     catch (e) { setError(String(e)); setSaving(false); }
   }
 
@@ -692,7 +970,7 @@ function ArticleFormModal({ initial, onSave, onClose, t }) {
             <div className="invoice-form-section">
               <div className="invoice-editor-grid invoice-form-grid">
                 <label>
-                  <span>{t("invoice_code")} *</span>
+                  <span>{t("invoice_sku")}</span>
                   <input value={form.code} onChange={(e) => up({ code: e.target.value })} />
                 </label>
                 <label>
@@ -700,8 +978,12 @@ function ArticleFormModal({ initial, onSave, onClose, t }) {
                   <input value={form.reference} onChange={(e) => up({ reference: e.target.value })} />
                 </label>
                 <label className="span-2">
-                  <span>{t("invoice_label")}</span>
+                  <span>{t("invoice_item_name")} *</span>
                   <input value={form.libelle} onChange={(e) => up({ libelle: e.target.value })} />
+                </label>
+                <label className="span-2">
+                  <span>{t("invoice_item_description")}</span>
+                  <textarea rows="2" value={form.description} onChange={(e) => up({ description: e.target.value })} />
                 </label>
               </div>
             </div>
@@ -712,16 +994,65 @@ function ArticleFormModal({ initial, onSave, onClose, t }) {
                   <input type="number" step="0.01" value={form.prix_ht} onChange={(e) => up({ prix_ht: parseFloat(e.target.value) || 0 })} />
                 </label>
                 <label>
+                  <span>{t("invoice_currency")}</span>
+                  <select value={form.currency || "XOF"} onChange={(e) => up({ currency: e.target.value })}>
+                    <option value="XOF">XOF</option>
+                    <option value="EUR">EUR</option>
+                    <option value="USD">USD</option>
+                  </select>
+                </label>
+                <label>
                   <span>{t("invoice_vat_rate")} %</span>
                   <input type="number" step="0.1" value={form.taux_tva} onChange={(e) => up({ taux_tva: parseFloat(e.target.value) || 0 })} />
                 </label>
                 <label>
+                  <span>{t("invoice_bic_rate")} %</span>
+                  <input type="number" step="0.1" value={form.taux_bic} onChange={(e) => up({ taux_bic: parseFloat(e.target.value) || 0 })} />
+                </label>
+                <label>
                   <span>{t("invoice_unit")}</span>
-                  <input value={form.unite} onChange={(e) => up({ unite: e.target.value })} />
+                  <select value={form.unite || ""} onChange={(e) => up({ unite: e.target.value })}>
+                    <option value="">—</option>
+                    {unitOptions.map((unit) => (
+                      <option key={unit} value={unit}>{unit}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t("invoice_category")}</span>
+                  <input value={form.category} onChange={(e) => up({ category: e.target.value })} />
                 </label>
                 <label className="invoice-form-toggle">
                   <input type="checkbox" checked={form.en_activite} onChange={(e) => up({ en_activite: e.target.checked })} />
                   <span>{t("invoice_active")}</span>
+                </label>
+                <label className="invoice-form-toggle">
+                  <input type="checkbox" checked={form.tax_exempt} onChange={(e) => up({ tax_exempt: e.target.checked })} />
+                  <span>{t("invoice_tax_exempt")}</span>
+                </label>
+              </div>
+            </div>
+            <div className="invoice-form-section">
+              <div className="invoice-editor-grid invoice-form-grid">
+                <label>
+                  <span>{t("invoice_revenue_account")}</span>
+                  <input value={form.revenue_account} onChange={(e) => up({ revenue_account: e.target.value })} />
+                </label>
+                <label>
+                  <span>{t("invoice_expense_account")}</span>
+                  <input value={form.expense_account} onChange={(e) => up({ expense_account: e.target.value })} />
+                </label>
+                <label>
+                  <span>{t("invoice_vat_account")}</span>
+                  <input value={form.vat_account} onChange={(e) => up({ vat_account: e.target.value })} />
+                </label>
+                <label>
+                  <span>{t("invoice_bic_account")}</span>
+                  <input value={form.bic_account} onChange={(e) => up({ bic_account: e.target.value })} />
+                </label>
+                <label className="span-2">
+                  <span>{t("invoice_custom_tax_rules")}</span>
+                  <textarea rows="2" value={form.custom_tax_rules} onChange={(e) => up({ custom_tax_rules: e.target.value })} />
                 </label>
               </div>
             </div>
@@ -740,11 +1071,15 @@ function ArticleFormModal({ initial, onSave, onClose, t }) {
 }
 
 export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesigner }) {
-  const { t } = useT();
+  const { t, lang } = useT();
 
   const [activeTab, setActiveTab] = useState("factures");
   const [listCollapsed, setListCollapsed] = useState(false);
   const [documents, setDocuments] = useState([]);
+  const [localDrafts, setLocalDrafts] = useState([]);
+  const [localItems, setLocalItems] = useState([]);
+  const [syncQueue, setSyncQueue] = useState([]);
+  const [draftNotice, setDraftNotice] = useState("");
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [documentsError, setDocumentsError] = useState("");
   const [selectedId, setSelectedId] = useState("");
@@ -776,29 +1111,57 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [articlesError, setArticlesError] = useState("");
   const [selectedArticle, setSelectedArticle] = useState(null);
   const [articleSearch, setArticleSearch] = useState("");
+  const [itemSourceFilter, setItemSourceFilter] = useState("");
+  const [itemStatusFilter, setItemStatusFilter] = useState("");
   const [tiersModal, setTiersModal] = useState(null); // null | { initial }
   const [articleModal, setArticleModal] = useState(null); // null | { initial }
+  const [invoiceSettings, setInvoiceSettings] = useState(DEFAULT_INVOICE_SETTINGS);
 
   const debouncedSearch = useDebouncedValue(search, 300);
   const debouncedTierSearch = useDebouncedValue(tierSearch, 300);
   const debouncedArticleSearch = useDebouncedValue(articleSearch, 300);
+  const isItemsTab = activeTab === "items";
   const documentTab = DOCUMENT_TABS.find((tab) => tab.id === activeTab) ?? null;
+  const documentDrafts = useMemo(() => (
+    localDrafts.filter((invoice) => invoice.nature === documentTab?.nature)
+  ), [documentTab, localDrafts]);
+  const visibleDocuments = useMemo(() => {
+    const remoteIds = new Set(documents.map((invoice) => invoice.id));
+    return [...documentDrafts.filter((invoice) => !remoteIds.has(invoice.id)), ...documents];
+  }, [documentDrafts, documents]);
+  const unitOptions = useMemo(() => {
+    const units = [...invoiceSettings.invoice_units];
+    for (const line of editorInvoice?.lignes || []) {
+      if (line.unite && !units.includes(line.unite)) units.push(line.unite);
+    }
+    return units;
+  }, [editorInvoice, invoiceSettings.invoice_units]);
 
   const loadEditorTiers = useCallback(
     async (query = "") => searchTiers(connId, query, "all", { limit: 20 }),
     [connId],
   );
   const loadEditorArticles = useCallback(
-    async (query = "") => searchArticles(connId, query, { limit: 20 }),
-    [connId],
+    async (query = "") => {
+      const remote = await searchArticles(connId, query, { limit: 40 }).catch(() => []);
+      return mergeCatalogItems(remote, localItems, query, invoiceSettings).slice(0, 20);
+    },
+    [connId, invoiceSettings, localItems],
   );
 
   useEffect(() => {
     if (!connId) return;
+    setLocalDrafts(readLocalDrafts(connId));
+    setLocalItems(readLocalItems(connId));
+    setSyncQueue(readSyncQueue(connId));
+    setDraftNotice("");
     console.debug("[invoice] active connection", {
       connectionId: connId,
       schemaEdition: schema?.edition || null,
     });
+    getSettings()
+      .then((settings) => setInvoiceSettings(normalizeInvoiceSettings(settings)))
+      .catch(() => setInvoiceSettings(DEFAULT_INVOICE_SETTINGS));
     getInvoiceTemplates(connId)
       .then((items) => {
         setTemplates(items);
@@ -833,16 +1196,24 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     setArticlesError("");
     return searchArticles(connId, debouncedArticleSearch, { limit: 60 })
       .then((items) => {
-        setArticles(items);
-        return items;
+        const merged = mergeCatalogItems(items, localItems, debouncedArticleSearch, invoiceSettings);
+        setArticles(merged);
+        return merged;
       })
       .catch((error) => {
-        setArticles([]);
+        const localOnly = mergeCatalogItems([], localItems, debouncedArticleSearch, invoiceSettings);
+        setArticles(localOnly);
         setArticlesError(String(error));
-        return [];
+        return localOnly;
       })
       .finally(() => setArticlesLoading(false));
-  }, [connId, debouncedArticleSearch]);
+  }, [connId, debouncedArticleSearch, invoiceSettings, localItems]);
+
+  useEffect(() => {
+    if (isItemsTab) {
+      refreshArticles();
+    }
+  }, [isItemsTab, refreshArticles]);
 
   useEffect(() => {
     if (!connId || !documentTab) return;
@@ -859,10 +1230,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       .then((items) => {
         if (cancelled) return;
         setDocuments(items);
-        if (!selectedId && items[0] && mode !== "edit") {
-          setSelectedId(items[0].id);
-        } else if (selectedId && !items.some((item) => item.id === selectedId) && mode !== "edit") {
-          setSelectedId(items[0]?.id || "");
+        const nextVisible = [...documentDrafts, ...items];
+        if (!selectedId && nextVisible[0] && mode !== "edit") {
+          setSelectedId(nextVisible[0].id);
+        } else if (selectedId && !nextVisible.some((item) => item.id === selectedId) && mode !== "edit") {
+          setSelectedId(nextVisible[0]?.id || "");
           setSelectedInvoice(null);
         }
       })
@@ -877,10 +1249,17 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     return () => {
       cancelled = true;
     };
-  }, [connId, dateFrom, dateTo, debouncedSearch, documentTab, mode, selectedId, statutFilter]);
+  }, [connId, dateFrom, dateTo, debouncedSearch, documentDrafts, documentTab, mode, selectedId, statutFilter]);
 
   useEffect(() => {
     if (!connId || !selectedId || !documentTab || mode === "edit") return;
+    const localDraft = localDrafts.find((invoice) => invoice.id === selectedId);
+    if (localDraft) {
+      setSelectedInvoice(localDraft);
+      setDetailError("");
+      setDetailLoading(false);
+      return undefined;
+    }
     let cancelled = false;
     setDetailLoading(true);
     setDetailError("");
@@ -897,7 +1276,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     return () => {
       cancelled = true;
     };
-  }, [connId, documentTab, mode, selectedId]);
+  }, [connId, documentTab, localDrafts, mode, selectedId]);
 
   useEffect(() => {
     if (!connId || !selectedTier?.id) return;
@@ -936,7 +1315,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     setPreviewLoading(true);
     setMode("preview");
     try {
-      const html = await renderInvoiceHtml(invoice, nextTemplateId);
+      const html = await renderInvoiceHtml(invoice, nextTemplateId, lang);
       setPreviewHtml(html);
     } finally {
       setPreviewLoading(false);
@@ -950,27 +1329,141 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     return invoice;
   };
 
+  const persistLocalDraft = useCallback((invoice, error = "") => {
+    const draft = makeLocalDraft(invoice, error);
+    setLocalDrafts((current) => {
+      const next = [draft, ...current.filter((item) => item.id !== draft.id)];
+      writeLocalDrafts(connId, next);
+      return next;
+    });
+    setDraftNotice(
+      t("invoice_local_saved_message"),
+    );
+    setSyncQueue((current) => {
+      if (!error) return current;
+      const next = [makeSyncQueueItem("invoice", draft, error), ...current].slice(0, 100);
+      writeSyncQueue(connId, next);
+      return next;
+    });
+    return draft;
+  }, [connId, t]);
+
+  const enqueueLocalSave = useCallback((type, payload, error = "") => {
+    setSyncQueue((current) => {
+      const next = [makeSyncQueueItem(type, payload, error), ...current].slice(0, 100);
+      writeSyncQueue(connId, next);
+      return next;
+    });
+    setDraftNotice(t("invoice_local_saved_message"));
+  }, [connId, t]);
+
+  const persistLocalItem = useCallback((item, error = "") => {
+    const localItem = normalizeItem({
+      ...item,
+      id: item.id && String(item.id).startsWith("local-item-") ? item.id : `local-item-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      source: "local_draft",
+      status: error ? "unsynced" : "draft",
+      is_local_draft: true,
+      sync_error: String(error || ""),
+      updated_at: new Date().toISOString(),
+    }, invoiceSettings);
+    setLocalItems((current) => {
+      const key = itemKey(localItem);
+      const next = [localItem, ...current.filter((entry) => entry.id !== localItem.id && itemKey(entry) !== key)];
+      writeLocalItems(connId, next);
+      return next;
+    });
+    setSyncQueue((current) => {
+      const next = [makeSyncQueueItem("article", localItem, error), ...current.filter((entry) => entry.payload?.id !== localItem.id)].slice(0, 100);
+      writeSyncQueue(connId, next);
+      return next;
+    });
+    setDraftNotice(t("invoice_local_item_saved"));
+    return localItem;
+  }, [connId, invoiceSettings, t]);
+
+  const syncQueuedRecords = async () => {
+    if (!syncQueue.length || actionPending) return;
+    setActionBusy("sync");
+    const remaining = [];
+    const syncedArticleKeys = new Set();
+    for (const item of syncQueue) {
+      try {
+        if (item.type === "invoice") {
+          const payload = computeInvoice({ ...item.payload, id: String(item.payload?.id || "").startsWith("local-") ? "" : item.payload?.id });
+          await (payload.id ? updateInvoice(connId, payload) : createInvoice(connId, payload));
+        } else if (item.type === "article") {
+          const payload = item.payload || {};
+          await (payload.id && String(payload.id).startsWith("sdb-") ? updateArticle(connId, payload) : createArticle(connId, payload));
+          syncedArticleKeys.add(itemKey(payload) || payload.id);
+        } else if (item.type === "tiers") {
+          const payload = item.payload || {};
+          await (payload.id && String(payload.id).startsWith("sdb-") ? updateTiers(connId, payload) : createTiers(connId, payload));
+        }
+      } catch (error) {
+        remaining.push({ ...item, error: String(error), updated_at: new Date().toISOString() });
+      }
+    }
+    setSyncQueue(remaining);
+    writeSyncQueue(connId, remaining);
+    if (syncedArticleKeys.size) {
+      setLocalItems((current) => {
+        const next = current.filter((entry) => !syncedArticleKeys.has(itemKey(entry) || entry.id));
+        writeLocalItems(connId, next);
+        return next;
+      });
+      await refreshArticles();
+    }
+    if (!remaining.length) {
+      setLocalDrafts([]);
+      writeLocalDrafts(connId, []);
+      setDraftNotice(t("invoice_sync_complete"));
+      await listInvoices(connId, { nature: documentTab?.nature }).then(setDocuments).catch(() => {});
+    } else {
+      setDraftNotice(t("invoice_sync_partial", remaining.length));
+    }
+    setActionBusy("");
+  };
+
   const saveCurrentInvoice = async (openPreviewAfter = false) => {
     if (!editorInvoice) return;
 
-    // Basic validation
     if (!editorInvoice.tiers_id) {
-      alert(t("invoice_validation_client_required") || "Veuillez sélectionner un tiers.");
+      persistLocalDraft(editorInvoice, "client-required");
       return;
     }
     if (!editorInvoice.lignes || editorInvoice.lignes.length === 0) {
-      alert(t("invoice_validation_lines_required") || "L'invoice doit comporter au moins une ligne.");
+      persistLocalDraft(editorInvoice, "lines-required");
       return;
     }
 
     setSaving(true);
     try {
       const payload = computeInvoice(editorInvoice);
+      if (payload.id && String(payload.id).startsWith("local-")) {
+        const localDraft = persistLocalDraft(payload);
+        setSelectedId(localDraft.id);
+        setSelectedInvoice(localDraft);
+        setEditorInvoice(localDraft);
+        if (openPreviewAfter) {
+          await openPreview(localDraft);
+        } else {
+          setMode("view");
+        }
+        return;
+      }
+
       const saved = payload.id ? await updateInvoice(connId, payload) : await createInvoice(connId, payload);
 
       setSelectedId(saved.id);
       setSelectedInvoice(saved);
       setEditorInvoice(saved);
+      setDraftNotice("");
+      setLocalDrafts((current) => {
+        const next = current.filter((item) => item.id !== payload.id);
+        writeLocalDrafts(connId, next);
+        return next;
+      });
 
       if (openPreviewAfter) {
         await openPreview(saved);
@@ -987,7 +1480,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       }).then(setDocuments);
     } catch (error) {
       console.error("[invoice] Save error:", error);
-      alert(t("error") + ": " + error);
+      const localDraft = persistLocalDraft(editorInvoice, error);
+      setSelectedId(localDraft.id);
+      setSelectedInvoice(localDraft);
+      setEditorInvoice(localDraft);
+      if (openPreviewAfter) {
+        await openPreview(localDraft);
+      } else {
+        setMode("view");
+      }
     } finally {
       setSaving(false);
     }
@@ -995,6 +1496,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const handleStatusChange = async (newStatus) => {
     if (!selectedInvoice?.id || actionPending) return;
+    if (selectedInvoice.is_local_draft) {
+      const updated = persistLocalDraft({ ...selectedInvoice, statut: newStatus });
+      setSelectedInvoice(updated);
+      setSelectedId(updated.id);
+      return;
+    }
     setActionBusy("status");
     try {
       await updateStatut(connId, selectedInvoice.id, newStatus, "SDB");
@@ -1020,6 +1527,14 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     if (!window.confirm(t("invoice_delete_confirm", selectedInvoice.numero || selectedInvoice.id))) return;
     setActionBusy("delete");
     try {
+      if (selectedInvoice.is_local_draft) {
+        const next = localDrafts.filter((invoice) => invoice.id !== selectedInvoice.id);
+        setLocalDrafts(next);
+        writeLocalDrafts(connId, next);
+        setSelectedId(visibleDocuments.find((invoice) => invoice.id !== selectedInvoice.id)?.id || "");
+        setSelectedInvoice(null);
+        return;
+      }
       await deleteInvoice(connId, selectedInvoice.id);
       const items = await listInvoices(connId, { nature: documentTab?.nature });
       setDocuments(items);
@@ -1035,6 +1550,10 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const handleComptabiliser = async () => {
     if (!selectedInvoice?.id || actionPending) return;
+    if (selectedInvoice.is_local_draft) {
+      setDraftNotice(t("invoice_sync_before_post"));
+      return;
+    }
     setActionBusy("post");
     try {
       await comptabiliserInvoice(connId, selectedInvoice.id);
@@ -1051,13 +1570,18 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const handleExportPdf = async () => {
     const invoice = workingInvoice;
-    if (!invoice) return;
-    const filePath = await save({
-      defaultPath: `${invoice.numero || "invoice"}.pdf`,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (!filePath) return;
-    await exportInvoicePdf(invoice, templateId, filePath);
+    if (!invoice || actionPending) return;
+    setActionBusy("export");
+    try {
+      const filePath = await save({
+        defaultPath: `${invoice.numero || "invoice"}.pdf`,
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (!filePath) return;
+      await exportInvoicePdf(invoice, templateId, filePath, lang);
+    } finally {
+      setActionBusy("");
+    }
   };
 
   const updateEditor = (patch) => {
@@ -1074,7 +1598,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const addLine = () => {
     setEditorInvoice((current) => computeInvoice({
       ...current,
-      lignes: [...current.lignes, buildBlankLine(current.lignes.length + 1)],
+      lignes: [...current.lignes, buildBlankLine(current.lignes.length + 1, invoiceSettings)],
     }));
   };
 
@@ -1124,10 +1648,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
     if (mode === "edit" && editorInvoice) {
       const breakdown = getTvaBreakdown(editorInvoice);
+      const bicBreakdown = getBicBreakdown(editorInvoice);
 
       return (
         <div className="invoice-editor compact">
           <div className="invoice-action-bar">
+            {draftNotice ? <span className="invoice-draft-notice">{draftNotice}</span> : null}
             <button type="button" className="btn btn-sm" onClick={() => {
               setMode("view");
               setEditorInvoice(selectedInvoice);
@@ -1135,11 +1661,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
               {t("cancel")}
             </button>
             <button type="button" className="btn btn-sm" onClick={() => saveCurrentInvoice(false)} disabled={saving}>
-              <SaveIcon />
+              {saving ? <span className="mini-spinner" /> : <SaveIcon />}
               {t("invoice_save_draft")}
             </button>
             <button type="button" className="btn btn-sm btn-accent" onClick={() => saveCurrentInvoice(true)} disabled={saving}>
-              <Eye size={14} />
+              {saving ? <span className="mini-spinner" /> : <Eye size={14} />}
               {t("invoice_save_and_preview")}
             </button>
           </div>
@@ -1252,10 +1778,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     <th>{t("invoice_qty")}</th>
                     <th>{t("invoice_unit")}</th>
                     <th>{t("invoice_unit_price")}</th>
-                    <th>{t("invoice_discount_pct")}</th>
-                    <th>HT</th>
+                    <th>{t("invoice_discount")}</th>
+                    <th>{t("invoice_line_total_ht")}</th>
                     <th>{t("invoice_vat_rate")}</th>
-                    <th>TTC</th>
+                    <th>{t("invoice_vat_amount")}</th>
+                    <th>{t("invoice_bic_rate")}</th>
+                    <th>{t("invoice_bic_amount")}</th>
+                    <th>{t("invoice_line_total_ttc")}</th>
                     <th />
                   </tr>
                 </thead>
@@ -1282,28 +1811,53 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                           searchFn={loadEditorArticles}
                           emptyLabel={t("invoice_no_article_found")}
                           onSelect={(article) => {
+                            if (article.currency && article.currency !== editorInvoice.devise) {
+                              setDraftNotice(t("invoice_currency_mismatch", article.currency, editorInvoice.devise));
+                            }
                             updateLine(index, {
                               article_id: article.id,
                               article_code: article.code,
-                              libelle: article.libelle,
+                              libelle: article.description ? `${article.libelle} - ${article.description}` : article.libelle,
                               prix_ht: article.prix_ht,
                               taux_tva: article.taux_tva,
+                              taux_bic: article.taux_bic,
                               unite: article.unite,
+                              tax_exempt: article.tax_exempt,
+                              revenue_account: article.revenue_account,
+                              expense_account: article.expense_account,
+                              vat_account: article.vat_account,
+                              bic_account: article.bic_account,
+                              custom_tax_rules: article.custom_tax_rules,
                             });
                           }}
                           renderOption={(article) => (
                             <div className="invoice-search-option-copy">
-                              <strong>{article.code}</strong>
-                              <span>{article.libelle}</span>
+                              <strong>{article.code} · {formatCurrency(article.prix_ht, article.currency || editorInvoice.devise)}</strong>
+                              <span>{[article.libelle, article.reference, article.category, article.status === "unsynced" ? t("invoice_status_unsynced") : ""].filter(Boolean).join(" · ")}</span>
                             </div>
                           )}
                         />
                       </td>
                       <td><input value={line.libelle} onChange={(event) => updateLine(index, { libelle: event.target.value })} /></td>
                       <td><input type="number" step="0.01" value={line.quantite} onChange={(event) => updateLine(index, { quantite: event.target.value })} /></td>
-                      <td><input value={line.unite} onChange={(event) => updateLine(index, { unite: event.target.value })} /></td>
+                      <td>
+                        <select value={line.unite || ""} onChange={(event) => updateLine(index, { unite: event.target.value })}>
+                          <option value="">—</option>
+                          {unitOptions.map((unit) => (
+                            <option key={unit} value={unit}>{unit}</option>
+                          ))}
+                        </select>
+                      </td>
                       <td><input type="number" step="0.01" value={line.prix_ht} onChange={(event) => updateLine(index, { prix_ht: event.target.value })} /></td>
-                      <td><input type="number" step="0.01" value={line.remise_pct} onChange={(event) => updateLine(index, { remise_pct: event.target.value })} /></td>
+                      <td>
+                        <div style={{ display: "grid", gap: 4, minWidth: 96 }}>
+                          <select value={line.remise_type || "percent"} onChange={(event) => updateLine(index, { remise_type: event.target.value })}>
+                            <option value="percent">%</option>
+                            <option value="fixed">{editorInvoice.devise}</option>
+                          </select>
+                          <input type="number" step="0.01" value={line.remise_valeur ?? line.remise_pct} onChange={(event) => updateLine(index, { remise_valeur: event.target.value })} />
+                        </div>
+                      </td>
                       <td className="num">{formatCurrency(line.montant_ht, editorInvoice.devise)}</td>
                       <td>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -1317,14 +1871,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                             }}
                           >
                             <option value="">⋯</option>
-                            <option value="18">18%</option>
-                            <option value="20">20%</option>
-                            <option value="10">10%</option>
-                            <option value="5.5">5.5%</option>
-                            <option value="0">0%</option>
+                            {invoiceSettings.invoice_vat_rates.map((rate) => (
+                              <option key={rate} value={rate}>{rate}%</option>
+                            ))}
                           </select>
                         </div>
                       </td>
+                      <td className="num">{formatCurrency(line.montant_tva, editorInvoice.devise)}</td>
+                      <td><input type="number" step="0.01" value={line.taux_bic} onChange={(event) => updateLine(index, { taux_bic: event.target.value })} /></td>
+                      <td className="num">{formatCurrency(line.montant_bic, editorInvoice.devise)}</td>
                       <td className="num">{formatCurrency(line.montant_ttc, editorInvoice.devise)}</td>
                       <td>
                         <button type="button" className="btn btn-icon btn-sm" onClick={() => removeLine(index)}>
@@ -1349,10 +1904,18 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 </label>
               </div>
               <div className="invoice-editor-card totals">
+                <DetailRow label={t("invoice_subtotal_before_discount")} value={formatCurrency(editorInvoice.subtotal_ht_before_discount, editorInvoice.devise)} />
+                <DetailRow label={t("invoice_line_discounts")} value={formatCurrency(editorInvoice.total_line_discount, editorInvoice.devise)} />
                 <DetailRow label={t("invoice_total_ht")} value={formatCurrency(editorInvoice.total_ht, editorInvoice.devise)} />
                 <label className="invoice-inline-label">
                   <span>{t("invoice_global_discount")}</span>
-                  <input type="number" step="0.01" value={editorInvoice.remise_globale} onChange={(event) => updateEditor({ remise_globale: event.target.value })} />
+                  <div style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8 }}>
+                    <select value={editorInvoice.remise_globale_type || "percent"} onChange={(event) => updateEditor({ remise_globale_type: event.target.value })}>
+                      <option value="percent">%</option>
+                      <option value="fixed">{editorInvoice.devise}</option>
+                    </select>
+                    <input type="number" step="0.01" value={editorInvoice.remise_globale_valeur ?? editorInvoice.remise_globale} onChange={(event) => updateEditor({ remise_globale_valeur: event.target.value })} />
+                  </div>
                 </label>
                 <div className="invoice-tva-breakdown">
                   {breakdown.map((row) => (
@@ -1361,8 +1924,15 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                       <strong>{formatCurrency(row.tax, editorInvoice.devise)}</strong>
                     </div>
                   ))}
+                  {bicBreakdown.map((row) => (
+                    <div key={`bic-${row.rate}`} className="invoice-detail-row">
+                      <span>{t("invoice_bic_row", row.rate)}</span>
+                      <strong>{formatCurrency(row.tax, editorInvoice.devise)}</strong>
+                    </div>
+                  ))}
                 </div>
                 <DetailRow label={t("invoice_total_vat")} value={formatCurrency(editorInvoice.total_tva, editorInvoice.devise)} />
+                <DetailRow label={t("invoice_total_bic")} value={formatCurrency(editorInvoice.total_bic, editorInvoice.devise)} />
                 <div className="invoice-grand-total">
                   <span>{t("invoice_total_ttc")}</span>
                   <strong>{formatCurrency(editorInvoice.total_ttc, editorInvoice.devise)}</strong>
@@ -1379,6 +1949,11 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     return (
       <div className="invoice-view">
         <div className="invoice-action-bar">
+          {selectedInvoice.is_local_draft ? (
+            <span className="invoice-draft-notice">
+              {t("invoice_local_draft_notice")}
+            </span>
+          ) : null}
           <button
             type="button"
             className="btn btn-sm"
@@ -1414,13 +1989,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             {t("invoice_preview")}
           </button>
           <button type="button" className="btn btn-sm" onClick={handleExportPdf} disabled={actionPending}>
-            <BadgeEuro size={14} />
+            {actionBusy === "export" ? <span className="mini-spinner" /> : <BadgeEuro size={14} />}
             {t("invoice_export_pdf")}
           </button>
           <button
             type="button"
             className="btn btn-sm"
-            disabled={actionPending || selectedInvoice.nature !== "Facture" || displayStatus(selectedInvoice.statut) === "Comptabilisé"}
+            disabled={actionPending || selectedInvoice.is_local_draft || selectedInvoice.nature !== "Facture" || displayStatus(selectedInvoice.statut) === "Comptabilisé"}
             onClick={handleComptabiliser}
           >
             <BadgeEuro size={14} />
@@ -1443,7 +2018,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           <button
             type="button"
             className="btn btn-sm btn-danger"
-            disabled={actionPending || selectedInvoice.statut !== "Brouillon"}
+            disabled={actionPending || (!selectedInvoice.is_local_draft && selectedInvoice.statut !== "Brouillon")}
             onClick={handleDelete}
           >
             <Trash2 size={14} />
@@ -1458,7 +2033,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <h2>{selectedInvoice.numero || "Document"}</h2>
                 <p>{selectedInvoice.tiers_nom}</p>
               </div>
-              <StatusBadge statut={selectedInvoice.statut} />
+              {selectedInvoice.is_local_draft ? <span className="invoice-status-badge warning">Local</span> : <StatusBadge statut={selectedInvoice.statut} />}
             </div>
             <DetailRow label={t("invoice_nature")} value={selectedInvoice.nature} />
             <DetailRow label={t("invoice_date")} value={formatDate(selectedInvoice.date)} />
@@ -1495,10 +2070,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   <th>{t("invoice_qty")}</th>
                   <th>{t("invoice_unit")}</th>
                   <th>{t("invoice_unit_price")}</th>
-                  <th>{t("invoice_discount_pct")}</th>
-                  <th>HT</th>
+                  <th>{t("invoice_discount")}</th>
+                  <th>{t("invoice_line_total_ht")}</th>
                   <th>{t("invoice_vat_rate")}</th>
-                  <th>TTC</th>
+                  <th>{t("invoice_vat_amount")}</th>
+                  <th>{t("invoice_bic_rate")}</th>
+                  <th>{t("invoice_bic_amount")}</th>
+                  <th>{t("invoice_line_total_ttc")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1510,9 +2088,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     <td className="num">{line.quantite}</td>
                     <td>{line.unite}</td>
                     <td className="num">{formatCurrency(line.prix_ht, selectedInvoice.devise)}</td>
-                    <td className="num">{round2(line.remise_pct)}%</td>
+                    <td className="num">{line.remise_type === "fixed" ? formatCurrency(line.remise_valeur, selectedInvoice.devise) : `${round2(line.remise_pct)}%`}</td>
                     <td className="num">{formatCurrency(line.montant_ht, selectedInvoice.devise)}</td>
                     <td className="num">{round2(line.taux_tva)}%</td>
+                    <td className="num">{formatCurrency(line.montant_tva, selectedInvoice.devise)}</td>
+                    <td className="num">{round2(line.taux_bic)}%</td>
+                    <td className="num">{formatCurrency(line.montant_bic, selectedInvoice.devise)}</td>
                     <td className="num">{formatCurrency(line.montant_ttc, selectedInvoice.devise)}</td>
                   </tr>
                 ))}
@@ -1530,7 +2111,10 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </section>
           <section className="invoice-editor-card totals">
             <DetailRow label={t("invoice_total_ht")} value={formatCurrency(selectedInvoice.total_ht, selectedInvoice.devise)} />
+            <DetailRow label={t("invoice_line_discounts")} value={formatCurrency(selectedInvoice.total_line_discount, selectedInvoice.devise)} />
+            <DetailRow label={t("invoice_global_discount")} value={formatCurrency(selectedInvoice.total_global_discount, selectedInvoice.devise)} />
             <DetailRow label={t("invoice_total_vat")} value={formatCurrency(selectedInvoice.total_tva, selectedInvoice.devise)} />
+            <DetailRow label={t("invoice_total_bic")} value={formatCurrency(selectedInvoice.total_bic, selectedInvoice.devise)} />
             <div className="invoice-grand-total">
               <span>{t("invoice_total_ttc")}</span>
               <strong>{formatCurrency(selectedInvoice.total_ttc, selectedInvoice.devise)}</strong>
@@ -1560,6 +2144,106 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     );
   };
 
+  const filteredItems = useMemo(() => {
+    return articles.filter((item) => {
+      if (itemSourceFilter && item.source !== itemSourceFilter) return false;
+      if (itemStatusFilter && item.status !== itemStatusFilter) return false;
+      return true;
+    });
+  }, [articles, itemSourceFilter, itemStatusFilter]);
+
+  const renderItemsView = () => (
+    <div className="invoice-items-view">
+      <section className="invoice-editor-card">
+        <div className="invoice-editor-section-head">
+          <strong>{t("invoice_items_catalog")}</strong>
+          <button type="button" className="btn btn-sm btn-accent" onClick={() => setArticleModal({ initial: { ...BLANK_ARTICLE, currency: invoiceSettings.invoice_default_currency } })}>
+            <FilePlus2 size={13} />
+            {t("invoice_new_article")}
+          </button>
+        </div>
+        <div className="invoice-items-toolbar">
+          <div className="invoice-searchbox">
+            <Search size={14} />
+            <input value={articleSearch} onChange={(event) => setArticleSearch(event.target.value)} placeholder={t("invoice_articles_search")} />
+          </div>
+          <select value={itemSourceFilter} onChange={(event) => setItemSourceFilter(event.target.value)}>
+            <option value="">{t("invoice_filter_source_all")}</option>
+            <option value="database">{t("invoice_source_database")}</option>
+            <option value="local_draft">{t("invoice_source_local")}</option>
+          </select>
+          <select value={itemStatusFilter} onChange={(event) => setItemStatusFilter(event.target.value)}>
+            <option value="">{t("invoice_filter_status_all")}</option>
+            <option value="synced">{t("invoice_status_synced")}</option>
+            <option value="unsynced">{t("invoice_status_unsynced")}</option>
+            <option value="invalid">{t("invoice_status_invalid")}</option>
+            <option value="draft">{t("invoice_status_draft")}</option>
+          </select>
+        </div>
+      </section>
+
+      <section className="invoice-editor-card">
+        {articlesLoading ? (
+          <div className="empty-state"><div className="spinner" /><p>{t("loading")}</p></div>
+        ) : null}
+        {!articlesLoading && articlesError && !filteredItems.length ? (
+          <div className="invoice-form-error">{articlesError}</div>
+        ) : null}
+        {!articlesLoading && filteredItems.length ? (
+          <div className="invoice-items-table-wrap">
+            <table className="invoice-lines-table invoice-items-table">
+              <thead>
+                <tr>
+                  <th>{t("invoice_item_name")}</th>
+                  <th>{t("invoice_item_description")}</th>
+                  <th>{t("invoice_unit_price")}</th>
+                  <th>{t("invoice_currency")}</th>
+                  <th>{t("invoice_vat_rate")}</th>
+                  <th>{t("invoice_bic_rate")}</th>
+                  <th>{t("invoice_revenue_account")}</th>
+                  <th>{t("invoice_tax_account")}</th>
+                  <th>{t("invoice_source")}</th>
+                  <th>{t("invoice_status")}</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {filteredItems.map((item) => (
+                  <tr key={item.id || item.code}>
+                    <td>
+                      <strong>{item.libelle || item.code}</strong>
+                      <div className="invoice-item-subline">{[item.code, item.reference, item.category].filter(Boolean).join(" · ")}</div>
+                    </td>
+                    <td>{item.description || "—"}</td>
+                    <td className="num">{formatCurrency(item.prix_ht, item.currency || invoiceSettings.invoice_default_currency)}</td>
+                    <td>{item.currency || invoiceSettings.invoice_default_currency}</td>
+                    <td className="num">{round2(item.taux_tva)}%</td>
+                    <td className="num">{round2(item.taux_bic)}%</td>
+                    <td>{item.revenue_account || item.expense_account || "—"}</td>
+                    <td>{item.vat_account || item.bic_account || "—"}</td>
+                    <td><span className="invoice-status-badge info">{item.source === "local_draft" ? t("invoice_source_local") : t("invoice_source_database")}</span></td>
+                    <td><span className={`invoice-status-badge ${item.status === "synced" ? "success" : item.status === "invalid" ? "orange" : "warning"}`}>{t(`invoice_status_${item.status || "draft"}`)}</span></td>
+                    <td>
+                      <button type="button" className="btn btn-icon btn-sm" onClick={() => setArticleModal({ initial: item })} title={t("edit")}>
+                        <PencilLine size={13} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+        {!articlesLoading && !filteredItems.length && !articlesError ? (
+          <div className="empty-state">
+            <Package2 size={28} />
+            <p>{t("invoice_items_empty")}</p>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+
   return (
     <div className="invoicing-shell">
       <header className="invoicing-header">
@@ -1574,6 +2258,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </div>
         </div>
         <div className="invoicing-header-actions">
+          {syncQueue.length ? (
+            <button type="button" className="btn btn-sm" onClick={syncQueuedRecords} disabled={actionPending}>
+              {actionBusy === "sync" ? <span className="mini-spinner" /> : null}
+              {t("invoice_sync_queue", syncQueue.length)}
+            </button>
+          ) : null}
           <button type="button" className="btn btn-sm" onClick={onOpenTemplateDesigner}>
             <Printer size={14} />
             {t("invoice_template_appearance")}
@@ -1583,7 +2273,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       </header>
 
       <div className="invoice-tabbar">
-        {DOCUMENT_TABS.map((tab) => (
+        {[...DOCUMENT_TABS, { id: "items", icon: Package2, labelKey: "invoice_tab_articles" }].map((tab) => (
           <TabButton
             key={tab.id}
             active={activeTab === tab.id}
@@ -1596,12 +2286,18 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 setSelectedInvoice(null);
                 setSelectedTier(null);
                 setSelectedArticle(null);
+                if (tab.id === "items") refreshArticles();
               });
             }}
           />
         ))}
       </div>
 
+      {isItemsTab ? (
+        <div className="invoicing-items-layout">
+          {renderItemsView()}
+        </div>
+      ) : (
       <div className={`invoicing-layout ${listCollapsed ? "list-collapsed" : ""}`}>
         <aside className="invoice-list-panel">
           <div className="invoice-list-header">
@@ -1651,7 +2347,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <FileText size={28} />
                 <p>{documentsError}</p>
               </div>
-            ) : documents.length ? documents.map((invoice) => (
+            ) : visibleDocuments.length ? visibleDocuments.map((invoice) => (
               <InvoiceCard
                 key={invoice.id}
                 invoice={invoice}
@@ -1673,7 +2369,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             type="button"
             className="btn btn-accent invoice-new-btn"
             onClick={() => {
-              const fresh = buildBlankInvoice(documentTab.nature, selectedTemplate);
+              if (!documentTab) return;
+              const fresh = buildBlankInvoice(documentTab.nature, selectedTemplate, invoiceSettings);
               setSelectedId("");
               setSelectedInvoice(fresh);
               setEditorInvoice(fresh);
@@ -1681,7 +2378,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             }}
           >
             <FilePlus2 size={14} />
-            {t("invoice_new_document", t(documentTab.labelKey))}
+            {documentTab ? t("invoice_new_document", t(documentTab.labelKey)) : t("invoice_new_document", "")}
           </button>
         </aside>
 
@@ -1700,6 +2397,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           {renderDocumentView()}
         </main>
       </div>
+      )}
 
       {mode === "preview" ? (
         <PreviewModal
@@ -1721,12 +2419,16 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           t={t}
           initial={tiersModal.initial}
           onSave={async (form) => {
-            if (form.id && form.id.startsWith("sdb-")) {
-              await updateTiers(connId, form);
-            } else {
-              await createTiers(connId, form);
+            try {
+              if (form.id && form.id.startsWith("sdb-")) {
+                await updateTiers(connId, form);
+              } else {
+                await createTiers(connId, form);
+              }
+              refreshTiers();
+            } catch (error) {
+              enqueueLocalSave("tiers", form, error);
             }
-            refreshTiers();
           }}
           onClose={() => setTiersModal(null)}
         />
@@ -1736,13 +2438,20 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         <ArticleFormModal
           t={t}
           initial={articleModal.initial}
+          unitOptions={unitOptions}
           onSave={async (form) => {
-            if (form.id && form.id.startsWith("sdb-")) {
-              await updateArticle(connId, form);
-            } else {
-              await createArticle(connId, form);
+            try {
+              if (form.source === "local_draft" || String(form.id || "").startsWith("local-item-")) {
+                persistLocalItem(form);
+              } else if (form.id && form.id.startsWith("sdb-")) {
+                await updateArticle(connId, form);
+              } else {
+                await createArticle(connId, form);
+              }
+              refreshArticles();
+            } catch (error) {
+              persistLocalItem(form, error);
             }
-            refreshArticles();
           }}
           onClose={() => setArticleModal(null)}
         />

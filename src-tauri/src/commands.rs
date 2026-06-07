@@ -155,6 +155,15 @@ pub struct AppSettings {
     pub account_ar: String,
     pub account_sales: String,
     pub account_vat: String,
+    pub invoice_units: Vec<String>,
+    pub invoice_vat_rates: Vec<f64>,
+    pub invoice_default_unit: String,
+    pub invoice_default_vat_rate: f64,
+    pub invoice_default_currency: String,
+    pub invoice_default_payment_terms: String,
+    pub invoice_extra_taxes: Vec<crate::state::InvoiceExtraTaxSetting>,
+    #[serde(default)]
+    pub tax_types: Vec<crate::state::TaxTypeSetting>,
 }
 
 #[tauri::command]
@@ -167,6 +176,33 @@ pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
         account_ar: config.account_ar.clone(),
         account_sales: config.account_sales.clone(),
         account_vat: config.account_vat.clone(),
+        invoice_units: config.invoice_units.clone(),
+        invoice_vat_rates: config.invoice_vat_rates.clone(),
+        invoice_default_unit: config.invoice_default_unit.clone(),
+        invoice_default_vat_rate: config.invoice_default_vat_rate,
+        invoice_default_currency: config.invoice_default_currency.clone(),
+        invoice_default_payment_terms: config.invoice_default_payment_terms.clone(),
+        invoice_extra_taxes: config.invoice_extra_taxes.clone(),
+        tax_types: if config.tax_types.is_empty() {
+            vec![
+                crate::state::TaxTypeSetting {
+                    id: "vat".to_string(),
+                    name: "VAT".to_string(),
+                    rate: config.invoice_default_vat_rate,
+                    account: config.account_vat.clone(),
+                    active: true,
+                },
+                crate::state::TaxTypeSetting {
+                    id: "bic".to_string(),
+                    name: "BIC".to_string(),
+                    rate: 0.0,
+                    account: String::new(),
+                    active: false,
+                },
+            ]
+        } else {
+            config.tax_types.clone()
+        },
     })
 }
 
@@ -179,6 +215,14 @@ pub fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<()
     config.account_ar = settings.account_ar;
     config.account_sales = settings.account_sales;
     config.account_vat = settings.account_vat;
+    config.invoice_units = settings.invoice_units;
+    config.invoice_vat_rates = settings.invoice_vat_rates;
+    config.invoice_default_unit = settings.invoice_default_unit;
+    config.invoice_default_vat_rate = settings.invoice_default_vat_rate;
+    config.invoice_default_currency = settings.invoice_default_currency;
+    config.invoice_default_payment_terms = settings.invoice_default_payment_terms;
+    config.invoice_extra_taxes = settings.invoice_extra_taxes;
+    config.tax_types = settings.tax_types;
     drop(config);
     state.save_config()
 }
@@ -387,6 +431,30 @@ struct SchemaResolutionOutcome {
     source: &'static str,
     evidence: Vec<String>,
     confidence: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub base_connection_id: String,
+    pub name: String,
+    pub database: String,
+    pub schema: SageSchema,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DiagnosticCheck {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ConnectionDiagnostics {
+    pub connection_id: String,
+    pub database: String,
+    pub checks: Vec<DiagnosticCheck>,
 }
 
 fn explicit_schema_for_connection(connection: &ConnectionConfig) -> Option<SageSchema> {
@@ -730,6 +798,34 @@ fn store_schema_for_connection(
     Ok(())
 }
 
+fn diagnostic_check(
+    name: impl Into<String>,
+    status: impl Into<String>,
+    detail: impl Into<String>,
+    started: std::time::Instant,
+) -> DiagnosticCheck {
+    DiagnosticCheck {
+        name: name.into(),
+        status: status.into(),
+        detail: detail.into(),
+        duration_ms: started.elapsed().as_millis(),
+    }
+}
+
+fn table_data_string(data: &TableData, row_index: usize, col_index: usize) -> String {
+    data.rows
+        .get(row_index)
+        .and_then(|row| row.get(col_index))
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 pub async fn test_mapping(
     connection: ConnectionConfig,
@@ -957,6 +1053,194 @@ pub async fn switch_database(
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+pub async fn open_database_workspace(
+    state: State<'_, AppState>,
+    base_connection_id: String,
+    database: String,
+) -> Result<WorkspaceInfo, String> {
+    let next_database = database.trim();
+    if next_database.is_empty() {
+        return Err("Database name is required".to_string());
+    }
+
+    let base_config = load_connection_config(&state, &base_connection_id)?;
+    let mut workspace_config = base_config.clone();
+    workspace_config.id = format!("workspace:{}:{}", base_connection_id, uuid::Uuid::new_v4());
+    workspace_config.database = next_database.to_string();
+    workspace_config.name = if base_config.name.trim().is_empty() {
+        format!("{} / {}", base_config.host, next_database)
+    } else {
+        format!("{} / {}", base_config.name, next_database)
+    };
+
+    {
+        let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
+        active.insert(
+            workspace_config.id.clone(),
+            ActiveConnection {
+                config: workspace_config.clone(),
+                status: ConnectionStatus::Connecting,
+            },
+        );
+    }
+
+    match db::test_connection(&workspace_config).await {
+        Ok(_) => {
+            {
+                let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
+                active.insert(
+                    workspace_config.id.clone(),
+                    ActiveConnection {
+                        config: workspace_config.clone(),
+                        status: ConnectionStatus::Connected,
+                    },
+                );
+            }
+
+            let resolved_schema =
+                resolve_schema_for_connection(&workspace_config.id, &workspace_config).await;
+            let schema = resolved_schema.schema;
+            store_schema_for_connection(&state, &workspace_config.id, schema.clone())?;
+            eprintln!(
+                "[workspace] opened id={} base_connection_id={} database={} resolved={} confidence={}",
+                workspace_config.id,
+                base_connection_id,
+                workspace_config.database,
+                schema.edition.as_str(),
+                resolved_schema.confidence,
+            );
+
+            Ok(WorkspaceInfo {
+                id: workspace_config.id,
+                base_connection_id,
+                name: workspace_config.name,
+                database: workspace_config.database,
+                schema,
+            })
+        }
+        Err(error) => {
+            let mut active = state.active_connections.lock().map_err(|e| e.to_string())?;
+            active.remove(&workspace_config.id);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn close_database_workspace(
+    state: State<AppState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    disconnect_db(state, workspace_id)
+}
+
+#[tauri::command]
+pub async fn run_connection_diagnostics(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ConnectionDiagnostics, String> {
+    let conn_config = load_connection_config(&state, &id)?;
+    let mut checks = Vec::new();
+
+    let started = std::time::Instant::now();
+    let mut client = match db::connect(&conn_config).await {
+        Ok(client) => {
+            checks.push(diagnostic_check(
+                "connect",
+                "ok",
+                format!(
+                    "{}:{} database={}",
+                    conn_config.host, conn_config.port, conn_config.database
+                ),
+                started,
+            ));
+            client
+        }
+        Err(error) => {
+            checks.push(diagnostic_check("connect", "error", error.clone(), started));
+            return Ok(ConnectionDiagnostics {
+                connection_id: id,
+                database: conn_config.database,
+                checks,
+            });
+        }
+    };
+
+    let started = std::time::Instant::now();
+    match db::execute_raw_query(&mut client, "SELECT DB_NAME() AS current_database").await {
+        Ok(data) => checks.push(diagnostic_check(
+            "database",
+            "ok",
+            table_data_string(&data, 0, 0),
+            started,
+        )),
+        Err(error) => checks.push(diagnostic_check("database", "error", error, started)),
+    }
+
+    let started = std::time::Instant::now();
+    let sage_sql = "
+SELECT
+    t.name AS table_name,
+    SUM(p.rows) AS approx_rows
+FROM sys.tables t
+LEFT JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+WHERE t.name IN (N'TECRITURE', N'TCOMPTEGENERAL', N'TTIERS', N'TROLETIERS', N'TPIECE')
+GROUP BY t.name
+ORDER BY t.name";
+    match db::execute_raw_query(&mut client, sage_sql).await {
+        Ok(data) => {
+            let found: Vec<String> = data
+                .rows
+                .iter()
+                .map(|row| {
+                    let name = row
+                        .first()
+                        .map(|value| match value {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    let rows = row
+                        .get(1)
+                        .map(|value| match value {
+                            Value::Number(number) => number.to_string(),
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    format!("{} ({})", name, rows)
+                })
+                .collect();
+            let has_core = found.iter().any(|item| item.starts_with("TECRITURE "))
+                && found.iter().any(|item| item.starts_with("TCOMPTEGENERAL "));
+            checks.push(diagnostic_check(
+                "sage1000_tables",
+                if has_core { "ok" } else { "warning" },
+                if found.is_empty() {
+                    "No Sage 1000 core tables detected".to_string()
+                } else {
+                    found.join(", ")
+                },
+                started,
+            ));
+        }
+        Err(error) => checks.push(diagnostic_check("sage1000_tables", "error", error, started)),
+    }
+
+    let started = std::time::Instant::now();
+    match db::execute_raw_query(&mut client, "SELECT 1 AS latency_probe").await {
+        Ok(_) => checks.push(diagnostic_check("latency", "ok", "SELECT 1", started)),
+        Err(error) => checks.push(diagnostic_check("latency", "error", error, started)),
+    }
+
+    Ok(ConnectionDiagnostics {
+        connection_id: id,
+        database: conn_config.database,
+        checks,
+    })
 }
 
 /// Disconnect from a database

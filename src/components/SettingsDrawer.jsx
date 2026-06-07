@@ -102,6 +102,17 @@ export default function SettingsDrawer({
     account_ar: "411000",
     account_sales: "701000",
     account_vat: "445710",
+    invoice_units: ["Pce", "Kg", "L", "H", "Jour"],
+    invoice_vat_rates: [18, 20, 10, 5.5, 0],
+    invoice_default_unit: "Pce",
+    invoice_default_vat_rate: 20,
+    invoice_default_currency: "XOF",
+    invoice_default_payment_terms: "",
+    invoice_extra_taxes: [],
+    tax_types: [
+      { id: "vat", name: "VAT", rate: 20, account: "445710", active: true },
+      { id: "bic", name: "BIC", rate: 0, account: "", active: false },
+    ],
   });
 
   useEffect(() => {
@@ -287,6 +298,32 @@ export default function SettingsDrawer({
     setSettingsLoading(true);
     setSettingsStatus({ error: "", success: "" });
     try {
+      const parseList = (value) => Array.isArray(value)
+        ? value.map((item) => String(item).trim()).filter(Boolean)
+        : String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+      const parseRates = (value) => (Array.isArray(value) ? value : String(value || "").split(","))
+        .map((item) => Number(String(item).trim().replace(",", ".")))
+        .filter((item) => Number.isFinite(item));
+      const parseExtraTaxes = (value, fallback) => {
+        if (!value) return Array.isArray(fallback) ? fallback : [];
+        return String(value).split(",").map((item) => {
+          const [name, rate, enabled] = item.split(":").map((part) => part.trim());
+          return { name, rate: Number(String(rate || 0).replace(",", ".")), account: "", enabled: enabled !== "off" };
+        }).filter((tax) => tax.name && Number.isFinite(tax.rate));
+      };
+      const parseTaxTypes = (value, fallback) => {
+        if (!value) return Array.isArray(fallback) ? fallback : [];
+        return String(value).split(",").map((item) => {
+          const [id, name, rate, account, active] = item.split(":").map((part) => part.trim());
+          return {
+            id: id || name,
+            name: name || id,
+            rate: Number(String(rate || 0).replace(",", ".")),
+            account: account || "",
+            active: active !== "off",
+          };
+        }).filter((tax) => tax.id && tax.name && Number.isFinite(tax.rate));
+      };
       await saveSettings({
         query_timeout_secs: Number(settingsForm.query_timeout_secs),
         dashboard_timeout_secs: Number(settingsForm.dashboard_timeout_secs),
@@ -294,6 +331,14 @@ export default function SettingsDrawer({
         account_ar: String(settingsForm.account_ar),
         account_sales: String(settingsForm.account_sales),
         account_vat: String(settingsForm.account_vat),
+        invoice_units: parseList(settingsForm.invoice_units),
+        invoice_vat_rates: parseRates(settingsForm.invoice_vat_rates),
+        invoice_default_unit: String(settingsForm.invoice_default_unit || ""),
+        invoice_default_vat_rate: Number(settingsForm.invoice_default_vat_rate),
+        invoice_default_currency: String(settingsForm.invoice_default_currency || "XOF").toUpperCase(),
+        invoice_default_payment_terms: String(settingsForm.invoice_default_payment_terms || ""),
+        invoice_extra_taxes: parseExtraTaxes(settingsForm.invoice_extra_taxes_raw, settingsForm.invoice_extra_taxes),
+        tax_types: parseTaxTypes(settingsForm.tax_types_raw, settingsForm.tax_types),
       });
       setSettingsStatus({ error: "", success: t("settings_saved") || "Settings saved!" });
     } catch (err) {
@@ -473,6 +518,69 @@ export default function SettingsDrawer({
                     onChange={(val) => setSettingsForm(s => ({ ...s, account_vat: val }))}
                   />
                 </div>
+              </div>
+
+              <div className="settings-secret-card">
+                <div className="settings-secret-copy">
+                  <strong>Invoice defaults</strong>
+                  <span>Default units, tax presets, currency and payment terms used when creating invoices.</span>
+                </div>
+
+                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <SecretField
+                    label="Units"
+                    value={Array.isArray(settingsForm.invoice_units) ? settingsForm.invoice_units.join(", ") : settingsForm.invoice_units}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_units: val }))}
+                  />
+                  <SecretField
+                    label="VAT rates (%)"
+                    value={Array.isArray(settingsForm.invoice_vat_rates) ? settingsForm.invoice_vat_rates.join(", ") : settingsForm.invoice_vat_rates}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_vat_rates: val }))}
+                  />
+                  <SecretField
+                    label="Default unit"
+                    value={settingsForm.invoice_default_unit}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_unit: val }))}
+                  />
+                  <SecretField
+                    label="Default VAT rate"
+                    value={settingsForm.invoice_default_vat_rate}
+                    type="number"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_vat_rate: val }))}
+                  />
+                  <SecretField
+                    label="Default currency"
+                    value={settingsForm.invoice_default_currency}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_currency: val }))}
+                  />
+                  <SecretField
+                    label="Default payment terms"
+                    value={settingsForm.invoice_default_payment_terms}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_payment_terms: val }))}
+                  />
+                  <SecretField
+                    label="Extra taxes placeholder"
+                    value={settingsForm.invoice_extra_taxes_raw ?? (Array.isArray(settingsForm.invoice_extra_taxes)
+                      ? settingsForm.invoice_extra_taxes.map((tax) => `${tax.name}:${tax.rate}:${tax.enabled ? "on" : "off"}`).join(", ")
+                      : "")}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_extra_taxes_raw: val }))}
+                  />
+                  <SecretField
+                    label={t("settings_tax_types") || "Tax types"}
+                    value={settingsForm.tax_types_raw ?? (Array.isArray(settingsForm.tax_types)
+                      ? settingsForm.tax_types.map((tax) => `${tax.id}:${tax.name}:${tax.rate}:${tax.account || ""}:${tax.active === false ? "off" : "on"}`).join(", ")
+                      : "")}
+                    type="text"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, tax_types_raw: val }))}
+                  />
+                </div>
+              </div>
 
                 {settingsStatus.error ? <div className="settings-feedback error">{settingsStatus.error}</div> : null}
                 {settingsStatus.success ? <div className="settings-feedback success">{settingsStatus.success}</div> : null}
@@ -483,7 +591,6 @@ export default function SettingsDrawer({
                     {settingsLoading ? t("saving") : t("save")}
                   </button>
                 </div>
-              </div>
             </div>
           ) : null}
 

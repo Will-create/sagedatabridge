@@ -8,7 +8,7 @@ fn default_sage_edition() -> String {
 }
 
 fn default_active_template_id() -> String {
-    "builtin-modern".to_string()
+    "builtin-modern-clean".to_string()
 }
 
 fn default_query_timeout_secs() -> u64 {
@@ -244,6 +244,22 @@ pub struct AppConfig {
     pub account_sales: String,
     #[serde(default = "default_account_vat")]
     pub account_vat: String,
+    #[serde(default = "default_invoice_units")]
+    pub invoice_units: Vec<String>,
+    #[serde(default = "default_invoice_vat_rates")]
+    pub invoice_vat_rates: Vec<f64>,
+    #[serde(default = "default_invoice_unit")]
+    pub invoice_default_unit: String,
+    #[serde(default = "default_invoice_vat_rate")]
+    pub invoice_default_vat_rate: f64,
+    #[serde(default = "default_invoice_currency")]
+    pub invoice_default_currency: String,
+    #[serde(default)]
+    pub invoice_default_payment_terms: String,
+    #[serde(default)]
+    pub invoice_extra_taxes: Vec<InvoiceExtraTaxSetting>,
+    #[serde(default)]
+    pub tax_types: Vec<TaxTypeSetting>,
 }
 
 fn default_account_ar() -> String {
@@ -254,6 +270,68 @@ fn default_account_sales() -> String {
 }
 fn default_account_vat() -> String {
     "445710".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InvoiceExtraTaxSetting {
+    pub name: String,
+    pub rate: f64,
+    #[serde(default)]
+    pub account: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxTypeSetting {
+    pub id: String,
+    pub name: String,
+    pub rate: f64,
+    #[serde(default)]
+    pub account: String,
+    #[serde(default = "default_tax_active")]
+    pub active: bool,
+}
+
+impl Default for TaxTypeSetting {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            rate: 0.0,
+            account: String::new(),
+            active: true,
+        }
+    }
+}
+
+fn default_tax_active() -> bool {
+    true
+}
+
+fn default_invoice_units() -> Vec<String> {
+    vec![
+        "Pce".to_string(),
+        "Kg".to_string(),
+        "L".to_string(),
+        "H".to_string(),
+        "Jour".to_string(),
+    ]
+}
+
+fn default_invoice_vat_rates() -> Vec<f64> {
+    vec![18.0, 20.0, 10.0, 5.5, 0.0]
+}
+
+fn default_invoice_unit() -> String {
+    "Pce".to_string()
+}
+
+fn default_invoice_vat_rate() -> f64 {
+    20.0
+}
+
+fn default_invoice_currency() -> String {
+    "XOF".to_string()
 }
 
 /// Connection status
