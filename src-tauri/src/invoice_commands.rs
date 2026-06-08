@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,12 @@ pub struct InvoiceLine {
     pub bic_account: String,
     #[serde(default)]
     pub custom_tax_rules: String,
+    #[serde(default)]
+    pub product_family_code: String,
+    #[serde(default)]
+    pub accounting_category_code: String,
+    #[serde(default)]
+    pub tax_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -135,6 +141,7 @@ struct ResolvedInvoiceSchema {
     native: InvoiceSchema,
     piece: ResolvedTable,
     line: ResolvedTable,
+    line_available: bool,
     article: ResolvedTable,
     tiers: ResolvedTable,
     role_tiers: Option<ResolvedTable>,
@@ -467,7 +474,11 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
             line.remise_valeur.max(0.0)
         };
         let gross_ht = round2(line.quantite * line.prix_ht);
-        let base_ht = round2(apply_discount(gross_ht, &line.remise_type, line.remise_valeur));
+        let base_ht = round2(apply_discount(
+            gross_ht,
+            &line.remise_type,
+            line.remise_valeur,
+        ));
         line.montant_ht = base_ht;
         if line.tax_exempt {
             line.taux_tva = 0.0;
@@ -484,8 +495,16 @@ fn normalize_invoice(mut invoice: InvoiceHeader) -> InvoiceHeader {
         total_bic += line.montant_bic;
     }
 
-    let discounted_ht = round2(apply_discount(total_ht, &invoice.remise_globale_type, invoice.remise_globale_valeur));
-    let ratio = if total_ht > 0.0 { discounted_ht / total_ht } else { 1.0 };
+    let discounted_ht = round2(apply_discount(
+        total_ht,
+        &invoice.remise_globale_type,
+        invoice.remise_globale_valeur,
+    ));
+    let ratio = if total_ht > 0.0 {
+        discounted_ht / total_ht
+    } else {
+        1.0
+    };
     invoice.total_ht = discounted_ht;
     invoice.total_tva = round2(total_tva * ratio);
     invoice.total_bic = round2(total_bic * ratio);
@@ -513,6 +532,23 @@ async fn resolve_invoice_schema(
     id: &str,
     client: &mut db::DbClient,
 ) -> Result<ResolvedInvoiceSchema, String> {
+    resolve_invoice_schema_with_line_requirement(state, id, client, true).await
+}
+
+async fn resolve_invoice_schema_header_only(
+    state: &State<'_, AppState>,
+    id: &str,
+    client: &mut db::DbClient,
+) -> Result<ResolvedInvoiceSchema, String> {
+    resolve_invoice_schema_with_line_requirement(state, id, client, false).await
+}
+
+async fn resolve_invoice_schema_with_line_requirement(
+    state: &State<'_, AppState>,
+    id: &str,
+    client: &mut db::DbClient,
+    require_line: bool,
+) -> Result<ResolvedInvoiceSchema, String> {
     let connection = load_connection_config(state, id)?;
     let tables = db::get_tables(client).await?;
     let edition = resolve_invoice_edition(state, id, &connection, &tables);
@@ -529,17 +565,31 @@ async fn resolve_invoice_schema(
 
     let piece =
         sage_entity_service::load_table(client, &tables, &[native.table_piece.clone()]).await?;
-    let line = sage_entity_service::load_table(
+    let line_candidates = [
+        native.table_ligne.clone(),
+        "TLIGNEPIÈCE".to_string(),
+        "TLIGNEPIECE".to_string(),
+        "TLIGNEPIECES".to_string(),
+        "TLIGNEPIEC".to_string(),
+    ];
+    let line_result = sage_entity_service::load_table(
         client,
         &tables,
-        &[
-            native.table_ligne.clone(),
-            "TLIGNEPIECE".to_string(),
-            "TLIGNEPIECES".to_string(),
-            "TLIGNEPIEC".to_string(),
-        ],
+        &line_candidates,
     )
-    .await?;
+    .await;
+    let (line, line_available) = match line_result {
+        Ok(table) => (table, true),
+        Err(error) if require_line => return Err(error),
+        Err(_) => (
+            ResolvedTable {
+                schema: String::new(),
+                name: String::new(),
+                columns: HashMap::new(),
+            },
+            false,
+        ),
+    };
     let article =
         sage_entity_service::load_table(client, &tables, &[native.table_article.clone()]).await?;
     let tiers = sage_entity_service::load_table(
@@ -593,56 +643,62 @@ async fn resolve_invoice_schema(
             &["oiddevise", "EC_Devise", "devise"],
         ),
         piece_journal_fk: sage_entity_service::pick_optional(&piece, &["oidjournal", "JO_Num"]),
-        line_piece: sage_entity_service::pick_required(
-            &line,
-            &[&native.col_ligne_piece, "oidpiece", "EC_No"],
-        )?,
-        line_article: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_article, "AR_Ref", "oidarticle"],
-        ),
-        line_libelle: sage_entity_service::pick_optional(
-            &line,
-            &[
-                &native.col_ligne_libelle,
-                "DL_Design",
-                "designation",
-                "Caption",
-            ],
-        ),
-        line_qte: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_qte, "DL_Qte", "qte"],
-        ),
-        line_pu_ht: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"],
-        ),
-        line_taux_tva: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"],
-        ),
-        line_montant_ht: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"],
-        ),
-        line_montant_ttc: sage_entity_service::pick_optional(
-            &line,
-            &[
-                &native.col_ligne_montant_ttc,
-                "DL_MontantTTC",
-                "montant_ttc",
-            ],
-        ),
-        line_remise: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"],
-        ),
-        line_ordre: sage_entity_service::pick_optional(
-            &line,
-            &[&native.col_ligne_ordre, "DL_No", "position"],
-        ),
-        line_unite: sage_entity_service::pick_optional(&line, &["unite", "DL_Unite", "UV_Code"]),
+        line_available,
+        line_piece: if line_available {
+            sage_entity_service::pick_required(&line, &[&native.col_ligne_piece, "oidpiece", "EC_No"])?
+        } else {
+            String::new()
+        },
+        line_article: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_article, "AR_Ref", "oidarticle"])
+        } else {
+            None
+        },
+        line_libelle: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_libelle, "DL_Design", "designation", "Caption"])
+        } else {
+            None
+        },
+        line_qte: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_qte, "DL_Qte", "qte"])
+        } else {
+            None
+        },
+        line_pu_ht: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"])
+        } else {
+            None
+        },
+        line_taux_tva: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"])
+        } else {
+            None
+        },
+        line_montant_ht: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"])
+        } else {
+            None
+        },
+        line_montant_ttc: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_montant_ttc, "DL_MontantTTC", "montant_ttc"])
+        } else {
+            None
+        },
+        line_remise: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"])
+        } else {
+            None
+        },
+        line_ordre: if line_available {
+            sage_entity_service::pick_optional(&line, &[&native.col_ligne_ordre, "DL_No", "position"])
+        } else {
+            None
+        },
+        line_unite: if line_available {
+            sage_entity_service::pick_optional(&line, &["unite", "DL_Unite", "UV_Code"])
+        } else {
+            None
+        },
         article_id: sage_entity_service::pick_optional(&article, &["oid", "AR_Ref", "id"]),
         article_code: sage_entity_service::pick_required(
             &article,
@@ -730,7 +786,7 @@ async fn resolve_invoice_schema(
     };
 
     eprintln!(
-        "[sage] invoice_schema connection_id={} database={} requested={} resolved={} piece_table={}.{} line_table={}.{} tiers_table={}.{} article_table={}.{}",
+        "[sage] invoice_schema connection_id={} database={} requested={} resolved={} piece_table={}.{} line_table={}.{} line_available={} tiers_table={}.{} article_table={}.{}",
         id,
         connection.database,
         connection.sage_edition,
@@ -739,6 +795,7 @@ async fn resolve_invoice_schema(
         schema.piece.name,
         schema.line.schema,
         schema.line.name,
+        schema.line_available,
         schema.tiers.schema,
         schema.tiers.name,
         schema.article.schema,
@@ -800,14 +857,20 @@ BEGIN
         [remise_globale] FLOAT NOT NULL DEFAULT 0,
         [remise_globale_type] NVARCHAR(20) NOT NULL DEFAULT N'percent',
         [remise_globale_valeur] FLOAT NOT NULL DEFAULT 0,
+        [total_ht] FLOAT NOT NULL DEFAULT 0,
+        [total_tva] FLOAT NOT NULL DEFAULT 0,
         [total_bic] FLOAT NOT NULL DEFAULT 0,
+        [total_ttc] FLOAT NOT NULL DEFAULT 0,
         [is_supplier] BIT NOT NULL DEFAULT 0,
         [updated_at] DATETIME NOT NULL DEFAULT GETDATE()
     );
 END;
 IF COL_LENGTH(N'dbo.{meta}', N'remise_globale_type') IS NULL ALTER TABLE [dbo].[{meta}] ADD [remise_globale_type] NVARCHAR(20) NOT NULL CONSTRAINT [DF_{meta}_remise_type] DEFAULT N'percent';
 IF COL_LENGTH(N'dbo.{meta}', N'remise_globale_valeur') IS NULL ALTER TABLE [dbo].[{meta}] ADD [remise_globale_valeur] FLOAT NOT NULL CONSTRAINT [DF_{meta}_remise_valeur] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{meta}', N'total_ht') IS NULL ALTER TABLE [dbo].[{meta}] ADD [total_ht] FLOAT NOT NULL CONSTRAINT [DF_{meta}_total_ht] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{meta}', N'total_tva') IS NULL ALTER TABLE [dbo].[{meta}] ADD [total_tva] FLOAT NOT NULL CONSTRAINT [DF_{meta}_total_tva] DEFAULT 0;
 IF COL_LENGTH(N'dbo.{meta}', N'total_bic') IS NULL ALTER TABLE [dbo].[{meta}] ADD [total_bic] FLOAT NOT NULL CONSTRAINT [DF_{meta}_total_bic] DEFAULT 0;
+IF COL_LENGTH(N'dbo.{meta}', N'total_ttc') IS NULL ALTER TABLE [dbo].[{meta}] ADD [total_ttc] FLOAT NOT NULL CONSTRAINT [DF_{meta}_total_ttc] DEFAULT 0;
 
 IF OBJECT_ID(N'dbo.{line_meta}', N'U') IS NULL
 BEGIN
@@ -1377,6 +1440,49 @@ fn invoice_list_select(
             )
         })
         .unwrap_or_else(|| "COALESCE(m.[tiers_siret], N'')".to_string());
+    let (total_ht_expr, total_tva_expr, total_ttc_expr, totals_apply) = if resolved.line_available
+    {
+        (
+            "COALESCE(tot.[total_ht], m.[total_ht], 0)".to_string(),
+            "COALESCE(tot.[total_tva], m.[total_tva], 0)".to_string(),
+            "COALESCE(tot.[total_ttc], m.[total_ttc], 0)".to_string(),
+            format!(
+                "
+OUTER APPLY (
+    SELECT
+        ROUND(SUM(COALESCE(TRY_CAST({line_ht} AS DECIMAL(18, 6)), 0)), 2) AS total_ht,
+        ROUND(
+            SUM(COALESCE(TRY_CAST({line_ttc} AS DECIMAL(18, 6)), 0))
+            - SUM(COALESCE(TRY_CAST({line_ht} AS DECIMAL(18, 6)), 0)),
+            2
+        ) AS total_tva,
+        ROUND(SUM(COALESCE(TRY_CAST({line_ttc} AS DECIMAL(18, 6)), 0)), 2) AS total_ttc
+    FROM {line_table} l
+    WHERE {line_piece} = {piece_oid}
+) tot",
+                line_ht = resolved
+                    .line_montant_ht
+                    .as_ref()
+                    .map(|column| qualify("l", column))
+                    .unwrap_or_else(|| "0".to_string()),
+                line_ttc = resolved
+                    .line_montant_ttc
+                    .as_ref()
+                    .map(|column| qualify("l", column))
+                    .unwrap_or_else(|| "0".to_string()),
+                line_table = resolved.line.quoted_name(),
+                line_piece = qualify("l", &resolved.line_piece),
+                piece_oid = piece_oid_expr,
+            ),
+        )
+    } else {
+        (
+            "COALESCE(m.[total_ht], 0)".to_string(),
+            "COALESCE(m.[total_tva], 0)".to_string(),
+            "COALESCE(m.[total_ttc], 0)".to_string(),
+            String::new(),
+        )
+    };
 
     format!(
         "
@@ -1396,10 +1502,10 @@ SELECT
     COALESCE(s.[statut], N'Brouillon') AS statut,
     COALESCE(CAST({piece_reference} AS NVARCHAR(255)), N'') AS reference,
     {devise_expr} AS devise,
-    COALESCE(tot.[total_ht], 0) AS total_ht,
-    COALESCE(tot.[total_tva], 0) AS total_tva,
+    {total_ht_expr} AS total_ht,
+    {total_tva_expr} AS total_tva,
     COALESCE(m.[total_bic], 0) AS total_bic,
-    COALESCE(tot.[total_ttc], 0) AS total_ttc,
+    {total_ttc_expr} AS total_ttc,
     COALESCE(m.[notes], N'') AS notes,
     COALESCE(m.[conditions], N'') AS conditions,
     COALESCE(m.[tiers_pays], N'') AS tiers_pays,
@@ -1413,18 +1519,7 @@ LEFT JOIN {tiers_table} t
     ON {piece_tiers} = {tiers_id}
 {status_join}
 {meta_join}
-OUTER APPLY (
-    SELECT
-        ROUND(SUM(COALESCE(TRY_CAST({line_ht} AS DECIMAL(18, 6)), 0)), 2) AS total_ht,
-        ROUND(
-            SUM(COALESCE(TRY_CAST({line_ttc} AS DECIMAL(18, 6)), 0))
-            - SUM(COALESCE(TRY_CAST({line_ht} AS DECIMAL(18, 6)), 0)),
-            2
-        ) AS total_tva,
-        ROUND(SUM(COALESCE(TRY_CAST({line_ttc} AS DECIMAL(18, 6)), 0)), 2) AS total_ttc
-    FROM {line_table} l
-    WHERE {line_piece} = {piece_oid}
-) tot
+{totals_apply}
 ",
         piece_oid = piece_oid_expr,
         piece_numero = qualify("p", &resolved.piece_numero),
@@ -1439,23 +1534,15 @@ OUTER APPLY (
         nature_expr = nature_expr,
         piece_reference = qualify("p", &resolved.piece_reference),
         devise_expr = devise_expr,
+        total_ht_expr = total_ht_expr,
+        total_tva_expr = total_tva_expr,
+        total_ttc_expr = total_ttc_expr,
         piece_table = resolved.piece.quoted_name(),
         tiers_table = resolved.tiers.quoted_name(),
         tiers_id = qualify("t", &resolved.tiers_id),
         status_join = status_join,
         meta_join = meta_join,
-        line_ht = resolved
-            .line_montant_ht
-            .as_ref()
-            .map(|column| qualify("l", column))
-            .unwrap_or_else(|| "0".to_string()),
-        line_ttc = resolved
-            .line_montant_ttc
-            .as_ref()
-            .map(|column| qualify("l", column))
-            .unwrap_or_else(|| "0".to_string()),
-        line_table = resolved.line.quoted_name(),
-        line_piece = qualify("l", &resolved.line_piece),
+        totals_apply = totals_apply,
     )
 }
 
@@ -1502,7 +1589,7 @@ async fn fetch_invoice_internal(
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
-    let resolved = resolve_invoice_schema(state, id, &mut client).await?;
+    let resolved = resolve_invoice_schema_header_only(state, id, &mut client).await?;
     let database_name = client.config.database.clone();
 
     let mut header_sql = invoice_list_select(&resolved, support_tables);
@@ -1530,6 +1617,11 @@ async fn fetch_invoice_internal(
         .cloned()
         .ok_or_else(|| format!("Invoice {} not found", piece_id))?;
     let mut invoice = map_invoice_row(&header_row);
+
+    if !resolved.line_available {
+        invoice.statut_history = fetch_status_history(&mut client, support_tables, piece_id).await?;
+        return Ok(invoice);
+    }
 
     let article_code_expr = resolved
         .article_id
@@ -1728,6 +1820,9 @@ ORDER BY ordre ASC
             vat_account: parse_string(row.get(20)),
             bic_account: parse_string(row.get(21)),
             custom_tax_rules: parse_string(row.get(22)),
+            product_family_code: String::new(),
+            accounting_category_code: String::new(),
+            tax_code: String::new(),
         })
         .collect();
     invoice.statut_history = fetch_status_history(&mut client, support_tables, piece_id).await?;
@@ -1749,7 +1844,7 @@ pub async fn list_invoices(
     let mut client = get_active_client(state.inner(), &id).await?;
     ensure_invoice_support_tables(&mut client).await?;
     let support_tables = detect_invoice_support_table_availability(&mut client).await;
-    let resolved = resolve_invoice_schema(&state, &id, &mut client).await?;
+    let resolved = resolve_invoice_schema_header_only(&state, &id, &mut client).await?;
     let database_name = client.config.database.clone();
 
     let mut sql = invoice_list_select(&resolved, support_tables);
@@ -2116,12 +2211,15 @@ BEGIN TRY
             [remise_globale] = {remise_globale},
             [remise_globale_type] = {remise_globale_type},
             [remise_globale_valeur] = {remise_globale_valeur},
+            [total_ht] = {total_ht},
+            [total_tva] = {total_tva},
             [total_bic] = {total_bic},
+            [total_ttc] = {total_ttc},
             [is_supplier] = {is_supplier},
             [updated_at] = GETDATE()
     WHEN NOT MATCHED THEN
-        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_bic], [is_supplier], [updated_at])
-        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_bic}, {is_supplier}, GETDATE());
+        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_ht], [total_tva], [total_bic], [total_ttc], [is_supplier], [updated_at])
+        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_ht}, {total_tva}, {total_bic}, {total_ttc}, {is_supplier}, GETDATE());
 
     IF EXISTS (SELECT 1 FROM [dbo].[{status_table}] WHERE [piece_id] = @piece_id_text)
     BEGIN
@@ -2180,7 +2278,10 @@ END CATCH
         remise_globale = sql_number(invoice.remise_globale),
         remise_globale_type = sql_string(&invoice.remise_globale_type),
         remise_globale_valeur = sql_number(invoice.remise_globale_valeur),
+        total_ht = sql_number(invoice.total_ht),
+        total_tva = sql_number(invoice.total_tva),
         total_bic = sql_number(invoice.total_bic),
+        total_ttc = sql_number(invoice.total_ttc),
         is_supplier = if invoice.is_supplier { "1" } else { "0" },
         status_table = STATUS_TABLE,
         status = sql_string(&status),
@@ -2435,12 +2536,15 @@ BEGIN TRY
             [remise_globale] = {remise_globale},
             [remise_globale_type] = {remise_globale_type},
             [remise_globale_valeur] = {remise_globale_valeur},
+            [total_ht] = {total_ht},
+            [total_tva] = {total_tva},
             [total_bic] = {total_bic},
+            [total_ttc] = {total_ttc},
             [is_supplier] = {is_supplier},
             [updated_at] = GETDATE()
     WHEN NOT MATCHED THEN
-        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_bic], [is_supplier], [updated_at])
-        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_bic}, {is_supplier}, GETDATE());
+        INSERT ([piece_id], [date_echeance], [tiers_code], [tiers_nom], [tiers_adresse], [tiers_cp], [tiers_ville], [tiers_pays], [tiers_siret], [tiers_tva], [notes], [conditions], [remise_globale], [remise_globale_type], [remise_globale_valeur], [total_ht], [total_tva], [total_bic], [total_ttc], [is_supplier], [updated_at])
+        VALUES (@piece_id_text, {date_echeance}, {tiers_code}, {tiers_nom}, {tiers_adresse}, {tiers_cp}, {tiers_ville}, {tiers_pays}, {tiers_siret}, {tiers_tva}, {notes}, {conditions}, {remise_globale}, {remise_globale_type}, {remise_globale_valeur}, {total_ht}, {total_tva}, {total_bic}, {total_ttc}, {is_supplier}, GETDATE());
 
     COMMIT TRANSACTION;
 END TRY
@@ -2474,7 +2578,10 @@ END CATCH
         remise_globale = sql_number(invoice.remise_globale),
         remise_globale_type = sql_string(&invoice.remise_globale_type),
         remise_globale_valeur = sql_number(invoice.remise_globale_valeur),
+        total_ht = sql_number(invoice.total_ht),
+        total_tva = sql_number(invoice.total_tva),
         total_bic = sql_number(invoice.total_bic),
+        total_ttc = sql_number(invoice.total_ttc),
         is_supplier = if invoice.is_supplier { "1" } else { "0" },
     );
     db::execute_logged_query(
@@ -3247,6 +3354,56 @@ END CATCH
 }
 
 #[tauri::command]
+pub async fn mark_invoice_comptabilise_from_bridge(
+    state: State<'_, AppState>,
+    id: String,
+    piece_id: String,
+    bridge_document_id: String,
+) -> Result<ComptabilisationResult, String> {
+    let invoice = fetch_invoice_internal(&state, &id, &piece_id).await?;
+    if normalize_status(&invoice.statut) == "Comptabilise" {
+        return Ok(ComptabilisationResult {
+            piece_id,
+            entry_ids: Vec::new(),
+            statut: "Comptabilise".to_string(),
+        });
+    }
+    if nature_to_label(&invoice.nature) != "Facture" {
+        return Err("Only Facture invoices can be comptabilise".to_string());
+    }
+
+    let mut client = get_active_client(state.inner(), &id).await?;
+    ensure_invoice_support_tables(&mut client).await?;
+    let batch_sql = format!(
+        "SELECT TOP 1 [id] FROM [sdb].[posting_batch] WHERE [source_kind]=N'invoice' AND [source_id]={bridge_document_id}",
+        bridge_document_id = sql_string(&bridge_document_id),
+    );
+    let batch_data = db::execute_raw_query(&mut client, &batch_sql).await?;
+    let batch_id = batch_data
+        .rows
+        .first()
+        .map(|row| parse_string(row.first()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Posting bridge introuvable pour cette facture".to_string())?;
+
+    let previous = get_current_status(&mut client, &piece_id).await?;
+    upsert_status_batch(
+        &mut client,
+        &piece_id,
+        "Comptabilise",
+        "SDB Bridge",
+        previous.as_ref().map(|status| status.statut.as_str()),
+    )
+    .await?;
+
+    Ok(ComptabilisationResult {
+        piece_id,
+        entry_ids: vec![batch_id],
+        statut: "Comptabilise".to_string(),
+    })
+}
+
+#[tauri::command]
 pub async fn list_tiers(
     state: State<'_, AppState>,
     id: String,
@@ -3612,6 +3769,204 @@ fn build_local_tiers_sql(
     sql
 }
 
+#[derive(Debug, Clone, Default)]
+struct ProductProfileInfo {
+    family: String,
+    category: String,
+    tax_code: String,
+    revenue_account: String,
+    tax_account: String,
+}
+
+async fn load_bridge_product_profiles(
+    client: &mut db::DbClient,
+) -> Result<HashMap<String, ProductProfileInfo>, String> {
+    let sql = r#"
+IF OBJECT_ID(N'sdb.product_accounting_profile', N'U') IS NULL
+BEGIN
+    SELECT CAST(NULL AS NVARCHAR(100)) AS product_code,
+           CAST(NULL AS NVARCHAR(100)) AS product_family_code,
+           CAST(NULL AS NVARCHAR(100)) AS accounting_category_code,
+           CAST(NULL AS NVARCHAR(100)) AS tax_code,
+           CAST(NULL AS NVARCHAR(100)) AS revenue_account,
+           CAST(NULL AS NVARCHAR(100)) AS tax_account
+    WHERE 1 = 0;
+END
+ELSE
+BEGIN
+    SELECT
+        p.[product_code],
+        COALESCE(p.[product_family_code], N'') AS product_family_code,
+        COALESCE(p.[accounting_category_code], N'') AS accounting_category_code,
+        COALESCE(p.[tax_code], N'') AS tax_code,
+        COALESCE(c.[revenue_account], p.[revenue_account], N'') AS revenue_account,
+        COALESCE(t.[collected_account], c.[tax_account], N'') AS tax_account
+    FROM [sdb].[product_accounting_profile] p
+    LEFT JOIN [sdb].[accounting_category] c ON c.[code] = p.[accounting_category_code] AND c.[active] = 1
+    LEFT JOIN [sdb].[tax_code] t ON t.[code] = p.[tax_code] AND t.[active] = 1
+    WHERE p.[active] = 1;
+END
+"#;
+    let data = db::execute_raw_query(client, sql).await?;
+    let mut profiles = HashMap::new();
+    for row in &data.rows {
+        let code = parse_string(row.first());
+        if code.trim().is_empty() {
+            continue;
+        }
+        profiles.insert(
+            code.to_ascii_lowercase(),
+            ProductProfileInfo {
+                family: parse_string(row.get(1)),
+                category: parse_string(row.get(2)),
+                tax_code: parse_string(row.get(3)),
+                revenue_account: parse_string(row.get(4)),
+                tax_account: parse_string(row.get(5)),
+            },
+        );
+    }
+    Ok(profiles)
+}
+
+fn apply_product_profiles(
+    articles: &mut [ArticleSummary],
+    profiles: &HashMap<String, ProductProfileInfo>,
+) {
+    for article in articles {
+        if let Some(profile) = profiles.get(&article.code.to_ascii_lowercase()) {
+            article.product_family_code = profile.family.clone();
+            article.accounting_category_code = profile.category.clone();
+            article.tax_code = profile.tax_code.clone();
+            if article.revenue_account.trim().is_empty() {
+                article.revenue_account = profile.revenue_account.clone();
+            }
+            if article.vat_account.trim().is_empty() {
+                article.vat_account = profile.tax_account.clone();
+            }
+        }
+    }
+}
+
+fn item_matches_query(article: &ArticleSummary, search: Option<&str>) -> bool {
+    let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let needle = search.to_ascii_lowercase();
+    [
+        &article.code,
+        &article.libelle,
+        &article.description,
+        &article.reference,
+        &article.category,
+        &article.product_family_code,
+        &article.accounting_category_code,
+        &article.tax_code,
+    ]
+    .iter()
+    .any(|value| value.to_ascii_lowercase().contains(&needle))
+}
+
+fn profile_backed_articles(
+    profiles: &HashMap<String, ProductProfileInfo>,
+    existing_codes: &std::collections::HashSet<String>,
+    search: Option<&str>,
+) -> Vec<ArticleSummary> {
+    profiles
+        .iter()
+        .filter(|(code, _)| !existing_codes.contains(code.as_str()))
+        .map(|(code, profile)| ArticleSummary {
+            id: format!("profile-{}", code),
+            code: code.to_ascii_uppercase(),
+            libelle: code.to_ascii_uppercase(),
+            description: String::new(),
+            prix_ht: 0.0,
+            currency: String::new(),
+            taux_tva: 0.0,
+            taux_bic: 0.0,
+            unite: String::new(),
+            reference: String::new(),
+            category: profile.category.clone(),
+            en_activite: true,
+            revenue_account: profile.revenue_account.clone(),
+            expense_account: String::new(),
+            vat_account: profile.tax_account.clone(),
+            bic_account: String::new(),
+            tax_exempt: false,
+            custom_tax_rules: String::new(),
+            product_family_code: profile.family.clone(),
+            accounting_category_code: profile.category.clone(),
+            tax_code: profile.tax_code.clone(),
+            source: "bridge_profile".to_string(),
+            status: "synced".to_string(),
+        })
+        .filter(|article| item_matches_query(article, search))
+        .collect()
+}
+
+async fn revenue_account_articles(
+    client: &mut db::DbClient,
+    search: Option<&str>,
+    existing_codes: &std::collections::HashSet<String>,
+) -> Vec<ArticleSummary> {
+    let sql = r#"
+IF OBJECT_ID(N'dbo.TCOMPTEGENERAL', N'U') IS NULL
+BEGIN
+    SELECT CAST(NULL AS NVARCHAR(100)) AS code, CAST(NULL AS NVARCHAR(255)) AS name WHERE 1 = 0;
+END
+ELSE
+BEGIN
+    WITH account_source AS (
+    SELECT TOP 50
+        CAST([codeCompte] AS NVARCHAR(100)) AS code,
+        COALESCE(CAST([Caption] AS NVARCHAR(255)), CAST([codeCompte] AS NVARCHAR(255))) AS name
+    FROM [dbo].[TCOMPTEGENERAL]
+    WHERE CAST([codeCompte] AS NVARCHAR(100)) LIKE N'7%'
+      AND COALESCE(TRY_CAST([enActivite] AS INT), 1) <> 0
+    ORDER BY [codeCompte]
+    )
+    SELECT code, name FROM account_source;
+END
+"#;
+    let Ok(data) = db::execute_raw_query(client, sql).await else {
+        return Vec::new();
+    };
+    data.rows
+        .iter()
+        .filter_map(|row| {
+            let code = parse_string(row.first());
+            if code.trim().is_empty() || existing_codes.contains(&code.to_ascii_lowercase()) {
+                return None;
+            }
+            let article = ArticleSummary {
+                id: format!("account-{}", code),
+                code: code.clone(),
+                libelle: parse_string(row.get(1)),
+                description: "Compte de produits".to_string(),
+                prix_ht: 0.0,
+                currency: String::new(),
+                taux_tva: 0.0,
+                taux_bic: 0.0,
+                unite: String::new(),
+                reference: code.clone(),
+                category: "account".to_string(),
+                en_activite: true,
+                revenue_account: code,
+                expense_account: String::new(),
+                vat_account: String::new(),
+                bic_account: String::new(),
+                tax_exempt: false,
+                custom_tax_rules: String::new(),
+                product_family_code: String::new(),
+                accounting_category_code: String::new(),
+                tax_code: String::new(),
+                source: "account".to_string(),
+                status: "draft".to_string(),
+            };
+            item_matches_query(&article, search).then_some(article)
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn list_articles(
     state: State<'_, AppState>,
@@ -3633,27 +3988,26 @@ pub async fn list_articles(
     let entity_ctx =
         sage_entity_service::resolve_entity_search_context(&state, &id, &mut client).await?;
     let resolved = entity_ctx.article;
+    let product_profiles = load_bridge_product_profiles(&mut client)
+        .await
+        .unwrap_or_default();
 
     if resolved.is_none() {
-        if !support_tables.local_article {
-            return Ok(Vec::new());
-        }
-        let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
-        let local_data = db::execute_logged_query(
-            &mut client,
-            &local_sql,
-            db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local")
-                .with_connection_id(id.clone())
-                .with_database(connection.database.clone())
-                .with_table(LOCAL_ARTICLE_TABLE)
-                .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
-        )
-        .await
-        .unwrap_or_else(|_| empty_table_data());
-        return Ok(local_data
-            .rows
-            .iter()
-            .map(|row| ArticleSummary {
+        let mut result = Vec::new();
+        if support_tables.local_article {
+            let local_sql = build_local_article_sql(normalized_search.as_deref(), limit);
+            let local_data = db::execute_logged_query(
+                &mut client,
+                &local_sql,
+                db::QueryExecutionContext::new("list_articles", "invoice_search_articles_local")
+                    .with_connection_id(id.clone())
+                    .with_database(connection.database.clone())
+                    .with_table(LOCAL_ARTICLE_TABLE)
+                    .with_timeout_secs(db::SEARCH_QUERY_TIMEOUT_SECS),
+            )
+            .await
+            .unwrap_or_else(|_| empty_table_data());
+            result.extend(local_data.rows.iter().map(|row| ArticleSummary {
                 id: sage_entity_service::parse_string(row.first()),
                 code: sage_entity_service::parse_string(row.get(1)),
                 libelle: sage_entity_service::parse_string(row.get(2)),
@@ -3672,8 +4026,29 @@ pub async fn list_articles(
                 bic_account: sage_entity_service::parse_string(row.get(15)),
                 tax_exempt: sage_entity_service::parse_bool(row.get(16)),
                 custom_tax_rules: sage_entity_service::parse_string(row.get(17)),
-            })
-            .collect());
+                product_family_code: String::new(),
+                accounting_category_code: String::new(),
+                tax_code: String::new(),
+                source: "local".to_string(),
+                status: "synced".to_string(),
+            }));
+        }
+        apply_product_profiles(&mut result, &product_profiles);
+        let mut existing_codes: std::collections::HashSet<String> =
+            result.iter().map(|a| a.code.to_ascii_lowercase()).collect();
+        result.extend(profile_backed_articles(
+            &product_profiles,
+            &existing_codes,
+            normalized_search.as_deref(),
+        ));
+        existing_codes = result.iter().map(|a| a.code.to_ascii_lowercase()).collect();
+        result.extend(
+            revenue_account_articles(&mut client, normalized_search.as_deref(), &existing_codes)
+                .await,
+        );
+        result.sort_by(|a, b| a.code.to_lowercase().cmp(&b.code.to_lowercase()));
+        result.truncate(limit as usize);
+        return Ok(result);
     }
     let resolved = resolved.unwrap();
 
@@ -3792,6 +4167,11 @@ WHERE 1=1
             bic_account: String::new(),
             tax_exempt: false,
             custom_tax_rules: String::new(),
+            product_family_code: String::new(),
+            accounting_category_code: String::new(),
+            tax_code: String::new(),
+            source: "database".to_string(),
+            status: "synced".to_string(),
         })
         .collect();
 
@@ -3831,6 +4211,11 @@ WHERE 1=1
                     bic_account: sage_entity_service::parse_string(row.get(15)),
                     tax_exempt: sage_entity_service::parse_bool(row.get(16)),
                     custom_tax_rules: sage_entity_service::parse_string(row.get(17)),
+                    product_family_code: String::new(),
+                    accounting_category_code: String::new(),
+                    tax_code: String::new(),
+                    source: "local".to_string(),
+                    status: "synced".to_string(),
                 };
                 if !native_ids.contains(&entry.code.to_lowercase()) {
                     result.push(entry);
@@ -3838,6 +4223,18 @@ WHERE 1=1
             }
         }
     }
+    apply_product_profiles(&mut result, &product_profiles);
+    let mut existing_codes: std::collections::HashSet<String> =
+        result.iter().map(|a| a.code.to_ascii_lowercase()).collect();
+    result.extend(profile_backed_articles(
+        &product_profiles,
+        &existing_codes,
+        normalized_search.as_deref(),
+    ));
+    existing_codes = result.iter().map(|a| a.code.to_ascii_lowercase()).collect();
+    result.extend(
+        revenue_account_articles(&mut client, normalized_search.as_deref(), &existing_codes).await,
+    );
     result.sort_by(|a, b| a.code.to_lowercase().cmp(&b.code.to_lowercase()));
     result.truncate(limit as usize);
     Ok(result)

@@ -17,6 +17,7 @@ import {
   FilePlus2,
   Files,
   FileText,
+  HelpCircle,
   Package2,
   PencilLine,
   Printer,
@@ -27,7 +28,7 @@ import {
 } from "lucide-react";
 
 import {
-  comptabiliserInvoice,
+  createBridgeDocument,
   createArticle,
   createInvoice,
   createTiers,
@@ -35,19 +36,31 @@ import {
   deleteInvoice,
   deleteTiers,
   exportInvoicePdf,
+  getBridgeManagementData,
+  getBridgeMasterData,
   getInvoice,
   getInvoiceTemplates,
   getSettings,
   listInvoices,
+  markInvoiceComptabiliseFromBridge,
   searchArticles,
   searchTiers,
   renderInvoiceHtml,
+  previewBridgeAccounting,
+  generateBridgeInvoicePosting,
+  saveBridgeManagementRecord,
+  transformBridgeQuote,
+  validateBridgeDocument,
+  saveBridgeProductProfile,
   updateArticle,
   updateInvoice,
   updateTiers,
   updateStatut,
 } from "../../hooks/useTauri";
 import { useT } from "../../i18n";
+import BridgeWorkspace from "./BridgeWorkspace";
+import InvoiceDocumentation from "./InvoiceDocumentation";
+import { SearchSelect, TierSummary } from "./InvoiceInputs";
 
 const DOCUMENT_TABS = [
   { id: "factures", nature: "Facture", icon: Receipt, labelKey: "invoice_tab_factures" },
@@ -59,7 +72,6 @@ const DOCUMENT_TABS = [
 const DIRECTORY_TABS = [
   { id: "clients", type: "clients", icon: Users, labelKey: "invoice_tab_clients" },
   { id: "fournisseurs", type: "fournisseurs", icon: Building2, labelKey: "invoice_tab_fournisseurs" },
-  { id: "articles", icon: Package2, labelKey: "invoice_tab_articles" },
 ];
 
 const STATUS_COLORS = {
@@ -88,14 +100,23 @@ const DEFAULT_INVOICE_SETTINGS = {
   invoice_units: ["Pce", "Kg", "L", "H", "Jour"],
   invoice_vat_rates: [18, 20, 10, 5.5, 0],
   invoice_default_unit: "Pce",
-  invoice_default_vat_rate: 20,
+  invoice_default_vat_rate: 18,
   invoice_default_currency: "XOF",
   invoice_default_payment_terms: "",
   invoice_extra_taxes: [],
   tax_types: [
-    { id: "vat", name: "VAT", rate: 20, account: "445710", active: true },
+    { id: "vat", name: "TVA", rate: 18, account: "443000", active: true },
     { id: "bic", name: "BIC", rate: 0, account: "", active: false },
   ],
+};
+const BRIDGE_RULE_DEFAULTS = {
+  customerAccount: "411000",
+  supplierAccount: "401000",
+  productFamily: "STANDARD",
+  accountingCategory: "VENTES",
+  supplierAccountingCategory: "ACHATS",
+  taxCode: "TVA18",
+  vatAccount: "443000",
 };
 
 function round2(value) {
@@ -272,6 +293,9 @@ function buildBlankLine(ordre = 1, settings = DEFAULT_INVOICE_SETTINGS) {
     vat_account: "",
     bic_account: "",
     custom_tax_rules: "",
+    product_family_code: "",
+    accounting_category_code: "",
+    tax_code: "",
   };
 }
 
@@ -430,12 +454,18 @@ function itemKey(item) {
   return String(item.code || item.reference || item.id || "").trim().toLowerCase();
 }
 
+function looksLikeRevenueAccount(code) {
+  return /^7\d{5,}$/.test(String(code || "").trim());
+}
+
 function normalizeItem(item = {}, invoiceSettings = DEFAULT_INVOICE_SETTINGS) {
   const currency = String(item.currency || item.devise || invoiceSettings.invoice_default_currency || "XOF").toUpperCase();
   const libelle = String(item.libelle || item.name || "").trim();
   const reference = String(item.reference || item.sku || "").trim();
   const code = String(item.code || reference || (libelle ? libelle.toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) : "")).trim();
-  const status = item.status || (!code || !libelle ? "invalid" : item.is_local_draft || item.source === "local_draft" ? "unsynced" : "synced");
+  const source = item.source || (String(item.id || "").startsWith("local-item-") || item.is_local_draft ? "local_draft" : "database");
+  const pending = String(item.id || "").startsWith("local-item-") || source === "local_draft";
+  const status = item.status || (!code || !libelle ? "invalid" : pending ? "unsynced" : source === "account" ? "draft" : "synced");
 
   return {
     id: item.id || `local-item-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -449,6 +479,9 @@ function normalizeItem(item = {}, invoiceSettings = DEFAULT_INVOICE_SETTINGS) {
     unite: item.unite || invoiceSettings.invoice_default_unit || "",
     reference,
     category: item.category || "",
+    product_family_code: item.product_family_code || "",
+    accounting_category_code: item.accounting_category_code || "",
+    tax_code: item.tax_code || "",
     en_activite: item.en_activite !== false,
     revenue_account: item.revenue_account || item.accounting_account || "",
     expense_account: item.expense_account || "",
@@ -456,7 +489,7 @@ function normalizeItem(item = {}, invoiceSettings = DEFAULT_INVOICE_SETTINGS) {
     bic_account: item.bic_account || "",
     tax_exempt: Boolean(item.tax_exempt),
     custom_tax_rules: item.custom_tax_rules || "",
-    source: item.source || (item.is_local_draft ? "local_draft" : "database"),
+    source,
     status,
     sync_error: item.sync_error || "",
     updated_at: item.updated_at || new Date().toISOString(),
@@ -486,7 +519,11 @@ function mergeCatalogItems(remoteItems = [], localItems = [], query = "", invoic
     seen.add(key);
     merged.push(item);
   }
-  for (const item of remoteItems.map((entry) => normalizeItem({ ...entry, source: "database", status: "synced" }, invoiceSettings))) {
+  for (const item of remoteItems.map((entry) => normalizeItem({
+    ...entry,
+    source: entry.source || "database",
+    status: entry.status || "synced",
+  }, invoiceSettings))) {
     const key = itemKey(item) || item.id;
     if (seen.has(key)) continue;
     if (!itemMatchesSearch(item, query)) continue;
@@ -494,6 +531,13 @@ function mergeCatalogItems(remoteItems = [], localItems = [], query = "", invoic
     merged.push(item);
   }
   return merged.sort((left, right) => String(left.libelle || left.code).localeCompare(String(right.libelle || right.code)));
+}
+
+function itemSourceLabel(t, source) {
+  if (source === "local_draft" || source === "local") return t("invoice_source_local");
+  if (source === "bridge_profile") return t("invoice_source_bridge_profile");
+  if (source === "account") return t("invoice_source_account");
+  return t("invoice_source_database");
 }
 
 function useDebouncedValue(value, delay = 300) {
@@ -505,111 +549,6 @@ function useDebouncedValue(value, delay = 300) {
   }, [delay, value]);
 
   return debounced;
-}
-
-function SearchSelect({
-  placeholder,
-  value,
-  displayValue,
-  onSelect,
-  searchFn,
-  emptyLabel,
-  renderOption,
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState(displayValue || "");
-  const [options, setOptions] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const debouncedQuery = useDebouncedValue(query, 300);
-
-  useEffect(() => {
-    if (!open) setQuery(displayValue || "");
-  }, [displayValue, open]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const handle = () => setOpen(false);
-    window.addEventListener("click", handle);
-    return () => window.removeEventListener("click", handle);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-
-    let cancelled = false;
-
-    if (debouncedQuery.trim().length < 2) {
-      setOptions([]);
-      setLoading(false);
-      return undefined;
-    }
-
-    setLoading(true);
-    setError("");
-
-    console.debug("[SearchSelect] Searching for:", debouncedQuery);
-
-    searchFn(debouncedQuery)
-      .then((items) => {
-        if (cancelled) return;
-        console.debug("[SearchSelect] Found items:", items?.length || 0);
-        setOptions(items.slice(0, 12));
-      })
-      .catch((nextError) => {
-        if (cancelled) return;
-        console.error("[SearchSelect] Error:", nextError);
-        setOptions([]);
-        setError(String(nextError));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedQuery, open, searchFn]);
-
-  return (
-    <div className="invoice-search-select" onClick={(event) => event.stopPropagation()}>
-      <input
-        value={query}
-        placeholder={placeholder}
-        onFocus={() => {
-          if (query === displayValue) setQuery("");
-          setOpen(true);
-        }}
-        onChange={(event) => {
-          setQuery(event.target.value);
-          setOpen(true);
-        }}
-      />
-      {open ? (
-        <div className="invoice-search-select-menu">
-          {loading ? <div className="invoice-search-select-empty">Loading…</div> : null}
-          {!loading && error ? <div className="invoice-search-select-empty">{error}</div> : null}
-          {!loading && !error && !options.length && debouncedQuery.trim().length >= 2 ? (
-            <div className="invoice-search-select-empty">{emptyLabel}</div>
-          ) : null}
-          {!loading && !error ? options.map((option) => (
-            <button
-              key={option.id || option.code}
-              type="button"
-              className={`invoice-search-select-option ${value === option.id ? "active" : ""}`}
-              onClick={() => {
-                onSelect(option);
-                setQuery("");
-                setOpen(false);
-              }}
-            >
-              {renderOption(option)}
-            </button>
-          )) : null}
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 function TabButton({ active, icon: Icon, label, onClick }) {
@@ -705,8 +644,16 @@ function DetailRow({ label, value, mono = false }) {
   );
 }
 
-function TiersPanel({ tier, invoices, loading, error }) {
+function bridgeProfileActive(row) {
+  return row?.[4] !== false && row?.[4] !== 0 && row?.[4] !== "0";
+}
+
+function TiersPanel({ tier, invoices, loading, error, bridgeProfile, masterData, onSaveBridgeProfile, busy }) {
   const { t } = useT();
+  const [bridgeForm, setBridgeForm] = useState({
+    collective_account: BRIDGE_RULE_DEFAULTS.customerAccount,
+    accounting_category_code: BRIDGE_RULE_DEFAULTS.accountingCategory,
+  });
 
   const totals = useMemo(() => {
     let ca = 0;
@@ -721,6 +668,21 @@ function TiersPanel({ tier, invoices, loading, error }) {
     }
     return { ca: round2(ca), balance: round2(balance) };
   }, [invoices]);
+
+  useEffect(() => {
+    setBridgeForm({
+      collective_account: bridgeProfile?.[3] || BRIDGE_RULE_DEFAULTS.customerAccount,
+      accounting_category_code: bridgeProfile?.[2] || BRIDGE_RULE_DEFAULTS.accountingCategory,
+    });
+  }, [bridgeProfile, tier?.code]);
+
+  const hasBridgeProfile = bridgeProfile && bridgeProfileActive(bridgeProfile);
+  const hasCollectiveAccount = hasBridgeProfile && String(bridgeProfile?.[3] || "").trim();
+  const bridgeStatus = hasCollectiveAccount
+    ? t("bridge_linked")
+    : hasBridgeProfile
+      ? t("bridge_collective_missing")
+      : t("bridge_to_link");
 
   return (
     <aside className="invoice-directory-panel">
@@ -754,6 +716,55 @@ function TiersPanel({ tier, invoices, loading, error }) {
             <DetailRow label="Email" value={tier.email} />
             <DetailRow label={t("invoice_phone")} value={tier.telephone} />
             <DetailRow label={t("invoice_encours")} value={formatCurrency(tier.encours)} />
+          </div>
+          <div className="invoice-detail-card">
+            <div className="invoice-editor-section-head">
+              <strong>{t("bridge_customer_mapping")}</strong>
+              <span className={`invoice-status-badge ${hasCollectiveAccount ? "success" : "warning"}`}>{bridgeStatus}</span>
+            </div>
+            <div className="invoice-editor-grid invoice-form-grid">
+              <label>
+                <span>{t("bridge_customer_collective_account")}</span>
+                <select
+                  value={bridgeForm.collective_account}
+                  onChange={(event) => setBridgeForm((current) => ({ ...current, collective_account: event.target.value }))}
+                >
+                  <option value="">—</option>
+                  {masterData.accounts.map((item) => (
+                    <option key={item.code} value={item.code}>{item.code} · {item.name}</option>
+                  ))}
+                  {!masterData.accounts.some((item) => item.code === bridgeForm.collective_account) && bridgeForm.collective_account ? (
+                    <option value={bridgeForm.collective_account}>{bridgeForm.collective_account}</option>
+                  ) : null}
+                </select>
+              </label>
+              <label>
+                <span>{t("bridge_accounting_category")}</span>
+                <select
+                  value={bridgeForm.accounting_category_code}
+                  onChange={(event) => setBridgeForm((current) => ({ ...current, accounting_category_code: event.target.value }))}
+                >
+                  <option value="">—</option>
+                  {masterData.accounting_categories.map((item) => (
+                    <option key={item.code} value={item.code}>{item.code} · {item.name}</option>
+                  ))}
+                  {!masterData.accounting_categories.some((item) => item.code === bridgeForm.accounting_category_code) && bridgeForm.accounting_category_code ? (
+                    <option value={bridgeForm.accounting_category_code}>{bridgeForm.accounting_category_code}</option>
+                  ) : null}
+                </select>
+              </label>
+            </div>
+            <div className="bridge-row-actions">
+              <button
+                type="button"
+                className="btn btn-sm btn-accent"
+                disabled={busy || !bridgeForm.collective_account}
+                onClick={() => onSaveBridgeProfile(tier, bridgeForm)}
+              >
+                {busy ? <span className="mini-spinner" /> : null}
+                {t(hasBridgeProfile ? "bridge_update_customer_link" : "bridge_create_customer_link")}
+              </button>
+            </div>
           </div>
           <div className="invoice-directory-panel-list">
             <div className="invoice-directory-panel-title">{t("invoice_related_documents")}</div>
@@ -794,8 +805,9 @@ function ArticlesPanel({ article }) {
             <DetailRow label={t("invoice_bic_rate")} value={`${round2(article.taux_bic)}%`} />
             <DetailRow label={t("invoice_unit")} value={article.unite} />
             <DetailRow label={t("invoice_reference")} value={article.reference} />
-            <DetailRow label={t("invoice_revenue_account")} value={article.revenue_account} mono />
-            <DetailRow label={t("invoice_expense_account")} value={article.expense_account} mono />
+            <DetailRow label={t("bridge_product_family")} value={article.product_family_code} mono />
+            <DetailRow label={t("bridge_accounting_category")} value={article.accounting_category_code} mono />
+            <DetailRow label={t("bridge_tax_code")} value={article.tax_code} mono />
             <DetailRow label={t("invoice_tax_exempt")} value={article.tax_exempt ? t("yes") || "Yes" : t("no") || "No"} />
           </div>
         </>
@@ -833,6 +845,9 @@ const BLANK_ARTICLE = {
   unite: "",
   reference: "",
   category: "",
+  product_family_code: "",
+  accounting_category_code: "",
+  tax_code: "",
   en_activite: true,
   revenue_account: "",
   expense_account: "",
@@ -939,7 +954,19 @@ function TiersFormModal({ initial, onSave, onClose, t }) {
   );
 }
 
-function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_INVOICE_SETTINGS.invoice_units }) {
+function ArticleFormModal({
+  initial,
+  onSave,
+  onClose,
+  t,
+  masterData = {
+    accounts: [],
+    product_families: [],
+    accounting_categories: [],
+    tax_codes: [],
+  },
+  unitOptions = DEFAULT_INVOICE_SETTINGS.invoice_units,
+}) {
   const [form, setForm] = useState({ ...BLANK_ARTICLE, ...initial });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -948,6 +975,10 @@ function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_I
   async function handleSave() {
     const normalized = normalizeItem(form);
     if (!normalized.libelle.trim()) { setError(t("invoice_item_name_required")); return; }
+    if (!normalized.product_family_code || !normalized.accounting_category_code || !normalized.tax_code) {
+      setError(t("bridge_article_mapping_required"));
+      return;
+    }
     setSaving(true); setError("");
     try { await onSave(normalized); onClose(); }
     catch (e) { setError(String(e)); setSaving(false); }
@@ -1002,14 +1033,6 @@ function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_I
                   </select>
                 </label>
                 <label>
-                  <span>{t("invoice_vat_rate")} %</span>
-                  <input type="number" step="0.1" value={form.taux_tva} onChange={(e) => up({ taux_tva: parseFloat(e.target.value) || 0 })} />
-                </label>
-                <label>
-                  <span>{t("invoice_bic_rate")} %</span>
-                  <input type="number" step="0.1" value={form.taux_bic} onChange={(e) => up({ taux_bic: parseFloat(e.target.value) || 0 })} />
-                </label>
-                <label>
                   <span>{t("invoice_unit")}</span>
                   <select value={form.unite || ""} onChange={(e) => up({ unite: e.target.value })}>
                     <option value="">—</option>
@@ -1017,10 +1040,6 @@ function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_I
                       <option key={unit} value={unit}>{unit}</option>
                     ))}
                   </select>
-                </label>
-                <label>
-                  <span>{t("invoice_category")}</span>
-                  <input value={form.category} onChange={(e) => up({ category: e.target.value })} />
                 </label>
                 <label className="invoice-form-toggle">
                   <input type="checkbox" checked={form.en_activite} onChange={(e) => up({ en_activite: e.target.checked })} />
@@ -1033,27 +1052,41 @@ function ArticleFormModal({ initial, onSave, onClose, t, unitOptions = DEFAULT_I
               </div>
             </div>
             <div className="invoice-form-section">
+              <div className="invoice-form-section-title">{t("bridge_accounting_relationship")}</div>
               <div className="invoice-editor-grid invoice-form-grid">
                 <label>
-                  <span>{t("invoice_revenue_account")}</span>
-                  <input value={form.revenue_account} onChange={(e) => up({ revenue_account: e.target.value })} />
+                  <span>{t("bridge_product_family")} *</span>
+                  <select value={form.product_family_code} onChange={(e) => up({ product_family_code: e.target.value })}>
+                    <option value="">—</option>
+                    {masterData.product_families.map((item) => <option key={item.code} value={item.code}>{item.code} · {item.name}</option>)}
+                  </select>
                 </label>
                 <label>
-                  <span>{t("invoice_expense_account")}</span>
-                  <input value={form.expense_account} onChange={(e) => up({ expense_account: e.target.value })} />
+                  <span>{t("bridge_accounting_category")} *</span>
+                  <select value={form.accounting_category_code} onChange={(e) => up({ accounting_category_code: e.target.value })}>
+                    <option value="">—</option>
+                    {masterData.accounting_categories.map((item) => <option key={item.code} value={item.code}>{item.code} · {item.name}</option>)}
+                  </select>
                 </label>
                 <label>
-                  <span>{t("invoice_vat_account")}</span>
-                  <input value={form.vat_account} onChange={(e) => up({ vat_account: e.target.value })} />
+                  <span>{t("bridge_tax_code")} *</span>
+                  <select value={form.tax_code} onChange={(e) => {
+                    const tax = masterData.tax_codes.find((item) => item.code === e.target.value);
+                    up({ tax_code: e.target.value, taux_tva: tax?.rate || 0 });
+                  }}>
+                    <option value="">—</option>
+                    {masterData.tax_codes.map((item) => <option key={item.code} value={item.code}>{item.code} · {item.name} · {item.rate}%</option>)}
+                  </select>
                 </label>
                 <label>
-                  <span>{t("invoice_bic_account")}</span>
-                  <input value={form.bic_account} onChange={(e) => up({ bic_account: e.target.value })} />
+                  <span>{t("bridge_revenue_account")}</span>
+                  <input value={form.revenue_account || ""} onChange={(e) => up({ revenue_account: e.target.value })} />
                 </label>
-                <label className="span-2">
-                  <span>{t("invoice_custom_tax_rules")}</span>
-                  <textarea rows="2" value={form.custom_tax_rules} onChange={(e) => up({ custom_tax_rules: e.target.value })} />
-                </label>
+                <div className="span-2 accounting-resolution-path">
+                  <strong>{t("bridge_resolution_preview")}</strong>
+                  <span>{form.code || "Article"} → {form.product_family_code || "—"} → {form.accounting_category_code || "—"} → {form.revenue_account || "—"} / {form.tax_code || "—"}</span>
+                  <small>{t("bridge_accounts_resolved_hint")}</small>
+                </div>
               </div>
             </div>
           </div>
@@ -1106,6 +1139,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [tierDocsLoading, setTierDocsLoading] = useState(false);
   const [tierDocsError, setTierDocsError] = useState("");
   const [tierSearch, setTierSearch] = useState("");
+  const [selectedTierCodes, setSelectedTierCodes] = useState(() => new Set());
   const [articles, setArticles] = useState([]);
   const [articlesLoading, setArticlesLoading] = useState(false);
   const [articlesError, setArticlesError] = useState("");
@@ -1116,11 +1150,28 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const [tiersModal, setTiersModal] = useState(null); // null | { initial }
   const [articleModal, setArticleModal] = useState(null); // null | { initial }
   const [invoiceSettings, setInvoiceSettings] = useState(DEFAULT_INVOICE_SETTINGS);
+  const [bridgeMasterData, setBridgeMasterData] = useState({
+    accounts: [],
+    journals: [],
+    product_families: [],
+    accounting_categories: [],
+    tax_codes: [],
+    payment_methods: [],
+    product_profiles: [],
+  });
+  const [bridgePartnerProfiles, setBridgePartnerProfiles] = useState([]);
+  const [accountingReadiness, setAccountingReadiness] = useState(null);
+  const [bridgeFlowDocument, setBridgeFlowDocument] = useState(null);
+  const [bridgeRuleProposal, setBridgeRuleProposal] = useState(null);
+  const [documentationOpen, setDocumentationOpen] = useState(false);
 
   const debouncedSearch = useDebouncedValue(search, 300);
   const debouncedTierSearch = useDebouncedValue(tierSearch, 300);
   const debouncedArticleSearch = useDebouncedValue(articleSearch, 300);
   const isItemsTab = activeTab === "items";
+  const isBridgeTab = activeTab === "bridge";
+  const directoryTab = DIRECTORY_TABS.find((tab) => tab.id === activeTab) ?? null;
+  const isDirectoryTab = Boolean(directoryTab);
   const documentTab = DOCUMENT_TABS.find((tab) => tab.id === activeTab) ?? null;
   const documentDrafts = useMemo(() => (
     localDrafts.filter((invoice) => invoice.nature === documentTab?.nature)
@@ -1129,6 +1180,13 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     const remoteIds = new Set(documents.map((invoice) => invoice.id));
     return [...documentDrafts.filter((invoice) => !remoteIds.has(invoice.id)), ...documents];
   }, [documentDrafts, documents]);
+  const bridgePartnerProfileByCode = useMemo(() => {
+    const profiles = new Map();
+    for (const row of bridgePartnerProfiles) {
+      profiles.set(String(row?.[0] || "").trim().toLowerCase(), row);
+    }
+    return profiles;
+  }, [bridgePartnerProfiles]);
   const unitOptions = useMemo(() => {
     const units = [...invoiceSettings.invoice_units];
     for (const line of editorInvoice?.lignes || []) {
@@ -1144,9 +1202,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const loadEditorArticles = useCallback(
     async (query = "") => {
       const remote = await searchArticles(connId, query, { limit: 40 }).catch(() => []);
-      return mergeCatalogItems(remote, localItems, query, invoiceSettings).slice(0, 20);
+      const profiles = new Map(bridgeMasterData.product_profiles.map((profile) => [profile.product_code, profile]));
+      return mergeCatalogItems(remote, localItems, query, invoiceSettings)
+        .map((item) => ({ ...item, ...(profiles.get(item.code) || {}) }))
+        .slice(0, 20);
     },
-    [connId, invoiceSettings, localItems],
+    [bridgeMasterData.product_profiles, connId, invoiceSettings, localItems],
   );
 
   useEffect(() => {
@@ -1162,6 +1223,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     getSettings()
       .then((settings) => setInvoiceSettings(normalizeInvoiceSettings(settings)))
       .catch(() => setInvoiceSettings(DEFAULT_INVOICE_SETTINGS));
+    getBridgeMasterData(connId)
+      .then(setBridgeMasterData)
+      .catch(() => setBridgeMasterData((current) => current));
+    getBridgeManagementData(connId)
+      .then((data) => setBridgePartnerProfiles(data.partner_profiles || []))
+      .catch(() => setBridgePartnerProfiles((current) => current));
     getInvoiceTemplates(connId)
       .then((items) => {
         setTemplates(items);
@@ -1173,11 +1240,35 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
       });
   }, [connId]);
 
+  useEffect(() => {
+    setBridgeFlowDocument(null);
+    setBridgeRuleProposal(null);
+  }, [selectedId]);
+
+  useEffect(() => {
+    const invoice = mode === "edit" ? editorInvoice : selectedInvoice;
+    if (!connId || !invoice || invoice.nature !== "Facture" || !invoice.tiers_code || !invoice.lignes?.length) {
+      setAccountingReadiness(null);
+      return;
+    }
+    let cancelled = false;
+    previewBridgeAccounting(connId, computeInvoice(invoice))
+      .then((result) => {
+        if (!cancelled) setAccountingReadiness(result);
+      })
+      .catch((error) => {
+        if (!cancelled) setAccountingReadiness({ ready: false, issues: [String(error)], lines: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connId, editorInvoice, mode, selectedInvoice]);
+
   const refreshTiers = useCallback(() => {
     if (!connId) return Promise.resolve([]);
     setTiersLoading(true);
     setTiersError("");
-    return searchTiers(connId, debouncedTierSearch, "all", { limit: 60 })
+    return searchTiers(connId, debouncedTierSearch, directoryTab?.type || "all", { limit: 80 })
       .then((items) => {
         setTiers(items);
         return items;
@@ -1188,7 +1279,17 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         return [];
       })
       .finally(() => setTiersLoading(false));
-  }, [connId, debouncedTierSearch]);
+  }, [connId, debouncedTierSearch, directoryTab?.type]);
+
+  useEffect(() => {
+    if (isDirectoryTab) {
+      refreshTiers();
+    }
+  }, [isDirectoryTab, refreshTiers]);
+
+  useEffect(() => {
+    setSelectedTierCodes(new Set());
+  }, [activeTab, debouncedTierSearch]);
 
   const refreshArticles = useCallback(() => {
     if (!connId) return Promise.resolve([]);
@@ -1196,7 +1297,9 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     setArticlesError("");
     return searchArticles(connId, debouncedArticleSearch, { limit: 60 })
       .then((items) => {
-        const merged = mergeCatalogItems(items, localItems, debouncedArticleSearch, invoiceSettings);
+        const profiles = new Map(bridgeMasterData.product_profiles.map((profile) => [profile.product_code, profile]));
+        const merged = mergeCatalogItems(items, localItems, debouncedArticleSearch, invoiceSettings)
+          .map((item) => ({ ...item, ...(profiles.get(item.code) || {}) }));
         setArticles(merged);
         return merged;
       })
@@ -1207,7 +1310,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         return localOnly;
       })
       .finally(() => setArticlesLoading(false));
-  }, [connId, debouncedArticleSearch, invoiceSettings, localItems]);
+  }, [bridgeMasterData.product_profiles, connId, debouncedArticleSearch, invoiceSettings, localItems]);
 
   useEffect(() => {
     if (isItemsTab) {
@@ -1309,6 +1412,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const actionPending = actionBusy !== "";
   const currentStatus = workingInvoice?.statut || "Brouillon";
   const nextStatuses = STATUS_TRANSITIONS[currentStatus] || [];
+  const visibleDocumentCount = visibleDocuments.length;
 
   const openPreview = async (invoice, nextTemplateId = templateId) => {
     if (!invoice) return;
@@ -1327,6 +1431,257 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     const invoice = await getInvoice(connId, pieceId);
     setSelectedInvoice(invoice);
     return invoice;
+  };
+
+  const refreshDocumentList = async () => {
+    const items = await listInvoices(connId, {
+      nature: documentTab?.nature,
+      statut: statutFilter || null,
+      dateFrom: dateFrom || null,
+      dateTo: dateTo || null,
+      search: debouncedSearch || null,
+    });
+    setDocuments(items);
+    return items;
+  };
+
+  const ensureRemoteInvoiceForBridge = async (invoice) => {
+    let payload = computeInvoice(invoice);
+    if (!payload.tiers_id && (!payload.tiers_code || !payload.tiers_nom)) {
+      throw new Error(t("invoice_client_required"));
+    }
+    if (!payload.lignes?.length) {
+      throw new Error(t("invoice_lines_required"));
+    }
+    if (!payload.tiers_id && payload.tiers_code && payload.tiers_nom) {
+      const createdTier = await createTiers(connId, {
+        id: "",
+        code: payload.tiers_code,
+        nom: payload.tiers_nom,
+        adresse: payload.tiers_adresse,
+        cp: payload.tiers_cp,
+        ville: payload.tiers_ville,
+        pays: payload.tiers_pays,
+        siret: payload.tiers_siret,
+        tva_intra: payload.tiers_tva_intra,
+        type_tiers: payload.is_supplier ? "fournisseur" : "client",
+      });
+      payload = computeInvoice({
+        ...payload,
+        tiers_id: createdTier.id,
+        tiers_code: createdTier.code || payload.tiers_code,
+        tiers_nom: createdTier.nom || payload.tiers_nom,
+      });
+    }
+    const sourceLocalId = payload.is_local_draft ? payload.id : "";
+    const shouldCreateRemoteInvoice = Boolean(sourceLocalId) || String(payload.id || "").startsWith("local-");
+    const remotePayload = {
+      ...payload,
+      id: shouldCreateRemoteInvoice ? "" : payload.id,
+      is_local_draft: false,
+      sync_error: "",
+    };
+    const saved = remotePayload.id
+      ? await updateInvoice(connId, remotePayload)
+      : await createInvoice(connId, remotePayload);
+
+    setSelectedId(saved.id);
+    setSelectedInvoice(saved);
+    setEditorInvoice(saved);
+    setLocalDrafts((current) => {
+      const next = current.filter((item) => item.id !== sourceLocalId && item.id !== payload.id);
+      writeLocalDrafts(connId, next);
+      return next;
+    });
+    await refreshDocumentList();
+    return computeInvoice(saved);
+  };
+
+  const buildBridgeRuleProposal = (invoice, readiness) => {
+    const profileByCode = new Map(bridgeMasterData.product_profiles.map((profile) => [profile.product_code, profile]));
+    const readinessByCode = new Map((readiness?.lines || []).map((line) => [line.product_code, line]));
+    const productRules = [];
+    const seenProducts = new Set();
+    for (const line of invoice.lignes || []) {
+      const productCode = String(line.article_code || "").trim();
+      if (!productCode || seenProducts.has(productCode)) continue;
+      seenProducts.add(productCode);
+      const currentProfile = profileByCode.get(productCode);
+      const previewLine = readinessByCode.get(productCode);
+      const revenueAccount = String(line.revenue_account || (looksLikeRevenueAccount(productCode) ? productCode : "")).trim();
+      const missingMapping = !currentProfile?.active
+        || !currentProfile.product_family_code
+        || !currentProfile.accounting_category_code
+        || !currentProfile.tax_code
+        || (revenueAccount && currentProfile.revenue_account !== revenueAccount)
+        || previewLine?.ready === false;
+      if (!missingMapping) continue;
+      productRules.push({
+        product_code: productCode,
+        product_family_code: line.product_family_code || currentProfile?.product_family_code || BRIDGE_RULE_DEFAULTS.productFamily,
+        accounting_category_code: line.accounting_category_code || currentProfile?.accounting_category_code || BRIDGE_RULE_DEFAULTS.accountingCategory,
+        tax_code: line.tax_code || currentProfile?.tax_code || BRIDGE_RULE_DEFAULTS.taxCode,
+        revenue_account: revenueAccount,
+        active: true,
+      });
+    }
+    const needsPartner = Boolean(invoice.tiers_code)
+      && (!readiness?.customer_account || (readiness?.issues || []).some((issue) => issue.includes(invoice.tiers_code) || issue.includes("Compte collectif")));
+    return {
+      invoice,
+      readiness,
+      partnerRule: needsPartner ? {
+        partner_code: invoice.tiers_code,
+        partner_type: "customer",
+        accounting_category_code: BRIDGE_RULE_DEFAULTS.accountingCategory,
+        collective_account: BRIDGE_RULE_DEFAULTS.customerAccount,
+        active: true,
+      } : null,
+      productRules,
+    };
+  };
+
+  const proposalHasRules = (proposal) => Boolean(proposal?.partnerRule || proposal?.productRules?.length);
+
+  const applyBridgeRuleProposal = async (proposal) => {
+    if (!proposalHasRules(proposal)) return proposal?.invoice || null;
+    if (proposal.partnerRule) {
+      await saveBridgeManagementRecord(connId, "partner_profile", proposal.partnerRule);
+    }
+    for (const rule of proposal.productRules || []) {
+      await saveBridgeProductProfile(connId, rule);
+    }
+    const nextMasterData = await getBridgeMasterData(connId);
+    setBridgeMasterData(nextMasterData);
+    setBridgeRuleProposal(null);
+    setDraftNotice(t("bridge_rules_saved"));
+    return proposal.invoice;
+  };
+
+  const refreshBridgePartnerProfiles = async () => {
+    const management = await getBridgeManagementData(connId);
+    setBridgePartnerProfiles(management.partner_profiles || []);
+    return management.partner_profiles || [];
+  };
+
+  const saveTierBridgeProfile = async (tier, form) => {
+    if (!tier?.code || actionPending) return;
+    setActionBusy(`bridge-tier-${tier.code}`);
+    try {
+      await saveBridgeManagementRecord(connId, "partner_profile", {
+        partner_code: tier.code,
+        partner_type: tier.type_tiers === "fournisseur" ? "supplier" : "customer",
+        accounting_category_code: form.accounting_category_code || BRIDGE_RULE_DEFAULTS.accountingCategory,
+        collective_account: form.collective_account || BRIDGE_RULE_DEFAULTS.customerAccount,
+        active: true,
+      });
+      await refreshBridgePartnerProfiles();
+      setDraftNotice(t("bridge_customer_link_saved"));
+      if (selectedInvoice?.tiers_code === tier.code) {
+        const readiness = await previewBridgeAccounting(connId, computeInvoice(selectedInvoice));
+        setAccountingReadiness(readiness);
+      }
+    } catch (error) {
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const bridgeDefaultsForTier = (tier) => {
+    const isSupplier = tier?.type_tiers === "fournisseur" || directoryTab?.type === "fournisseurs";
+    const supplierCategoryExists = bridgeMasterData.accounting_categories.some(
+      (item) => String(item.code || "").toUpperCase() === BRIDGE_RULE_DEFAULTS.supplierAccountingCategory,
+    );
+    return {
+      partner_type: isSupplier ? "supplier" : "customer",
+      collective_account: isSupplier ? BRIDGE_RULE_DEFAULTS.supplierAccount : BRIDGE_RULE_DEFAULTS.customerAccount,
+      accounting_category_code: isSupplier
+        ? (supplierCategoryExists ? BRIDGE_RULE_DEFAULTS.supplierAccountingCategory : "")
+        : BRIDGE_RULE_DEFAULTS.accountingCategory,
+    };
+  };
+
+  const toggleTierSelection = (tierCode, checked) => {
+    setSelectedTierCodes((current) => {
+      const next = new Set(current);
+      if (checked) next.add(tierCode);
+      else next.delete(tierCode);
+      return next;
+    });
+  };
+
+  const bulkLinkTiers = async (targetTiers) => {
+    if (!targetTiers.length || actionPending) return;
+    setActionBusy("bridge-tier-bulk");
+    let saved = 0;
+    const errors = [];
+    try {
+      for (const tier of targetTiers) {
+        if (!tier?.code) continue;
+        const defaults = bridgeDefaultsForTier(tier);
+        try {
+          await saveBridgeManagementRecord(connId, "partner_profile", {
+            partner_code: tier.code,
+            partner_type: defaults.partner_type,
+            accounting_category_code: defaults.accounting_category_code,
+            collective_account: defaults.collective_account,
+            active: true,
+          });
+          saved += 1;
+        } catch (error) {
+          errors.push(`${tier.code}: ${error}`);
+        }
+      }
+      await refreshBridgePartnerProfiles();
+      setSelectedTierCodes(new Set());
+      setDraftNotice(t("bridge_bulk_link_result", saved, errors.length));
+      if (selectedInvoice?.tiers_code && targetTiers.some((tier) => tier.code === selectedInvoice.tiers_code)) {
+        const readiness = await previewBridgeAccounting(connId, computeInvoice(selectedInvoice));
+        setAccountingReadiness(readiness);
+      }
+      if (errors.length) {
+        alert(`${t("error")}\n${errors.join("\n")}`);
+      }
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const openCustomerBridgeFix = async () => {
+    if (!selectedInvoice?.tiers_code) return;
+    setActiveTab("clients");
+    setMode("view");
+    setSelectedInvoice(null);
+    setSelectedId("");
+    setTierSearch(selectedInvoice.tiers_code);
+    setTiersLoading(true);
+    try {
+      const items = await searchTiers(connId, selectedInvoice.tiers_code, "clients", { limit: 20 });
+      setTiers(items);
+      const match = items.find((tier) => String(tier.code).toLowerCase() === String(selectedInvoice.tiers_code).toLowerCase()) || items[0];
+      setSelectedTier(match || {
+        code: selectedInvoice.tiers_code,
+        nom: selectedInvoice.tiers_nom,
+        ville: selectedInvoice.tiers_ville,
+        type_tiers: "client",
+      });
+    } catch (error) {
+      setTiersError(String(error));
+    } finally {
+      setTiersLoading(false);
+    }
+  };
+
+  const createBridgeFlowFromInvoice = async (invoice) => {
+    const created = await createBridgeDocument(connId, {
+      ...invoice,
+      nature: invoice.nature === "Proforma" ? "Devis" : invoice.nature,
+    });
+    setBridgeFlowDocument(created);
+    setBridgeRuleProposal(null);
+    setDraftNotice(t("bridge_document_created"));
+    return created;
   };
 
   const persistLocalDraft = useCallback((invoice, error = "") => {
@@ -1428,18 +1783,46 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
   const saveCurrentInvoice = async (openPreviewAfter = false) => {
     if (!editorInvoice) return;
 
-    if (!editorInvoice.tiers_id) {
-      persistLocalDraft(editorInvoice, "client-required");
+    if (!editorInvoice.tiers_id && (!editorInvoice.tiers_code || !editorInvoice.tiers_nom)) {
+      const localDraft = persistLocalDraft(editorInvoice, "client-required");
+      setSelectedId(localDraft.id);
+      setSelectedInvoice(localDraft);
+      setEditorInvoice(localDraft);
+      setMode("view");
       return;
     }
     if (!editorInvoice.lignes || editorInvoice.lignes.length === 0) {
-      persistLocalDraft(editorInvoice, "lines-required");
+      const localDraft = persistLocalDraft(editorInvoice, "lines-required");
+      setSelectedId(localDraft.id);
+      setSelectedInvoice(localDraft);
+      setEditorInvoice(localDraft);
+      setMode("view");
       return;
     }
 
     setSaving(true);
     try {
-      const payload = computeInvoice(editorInvoice);
+      let payload = computeInvoice(editorInvoice);
+      if (!payload.tiers_id && payload.tiers_code && payload.tiers_nom) {
+        const createdTier = await createTiers(connId, {
+          id: "",
+          code: payload.tiers_code,
+          nom: payload.tiers_nom,
+          adresse: payload.tiers_adresse,
+          cp: payload.tiers_cp,
+          ville: payload.tiers_ville,
+          pays: payload.tiers_pays,
+          siret: payload.tiers_siret,
+          tva_intra: payload.tiers_tva_intra,
+          type_tiers: payload.is_supplier ? "fournisseur" : "client",
+        });
+        payload = computeInvoice({
+          ...payload,
+          tiers_id: createdTier.id,
+          tiers_code: createdTier.code || payload.tiers_code,
+          tiers_nom: createdTier.nom || payload.tiers_nom,
+        });
+      }
       if (payload.id && String(payload.id).startsWith("local-")) {
         const localDraft = persistLocalDraft(payload);
         setSelectedId(localDraft.id);
@@ -1550,18 +1933,133 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const handleComptabiliser = async () => {
     if (!selectedInvoice?.id || actionPending) return;
-    if (selectedInvoice.is_local_draft) {
-      setDraftNotice(t("invoice_sync_before_post"));
-      return;
-    }
     setActionBusy("post");
     try {
-      await comptabiliserInvoice(connId, selectedInvoice.id);
-      await refreshSelectedInvoice(selectedInvoice.id);
+      const invoice = selectedInvoice.is_local_draft
+        ? await ensureRemoteInvoiceForBridge(selectedInvoice)
+        : computeInvoice(selectedInvoice);
+      if (invoice.nature !== "Facture") {
+        alert(t("bridge_only_invoice_posting"));
+        return;
+      }
+      const readiness = await previewBridgeAccounting(connId, invoice);
+      setAccountingReadiness(readiness);
+      if (!readiness.ready) {
+        alert(`${t("bridge_not_ready")}\n${readiness.issues.join("\n")}`);
+        return;
+      }
+
+      let document = bridgeFlowDocument;
+      if (!document || document.document_type !== "Facture") {
+        document = await createBridgeFlowFromInvoice(invoice);
+      }
+      if (document.status === "Draft") {
+        setDraftNotice(t("bridge_post_step_validate"));
+        document = await validateBridgeDocument(connId, document.id);
+        setBridgeFlowDocument(document);
+      }
+      if (document.document_type !== "Facture") {
+        alert(t("bridge_only_invoice_posting"));
+        return;
+      }
+      setDraftNotice(t("bridge_post_step_generate"));
+      await generateBridgeInvoicePosting(connId, document.id);
+      await markInvoiceComptabiliseFromBridge(connId, invoice.id, document.id);
+      setDraftNotice(t("bridge_invoice_comptabilised"));
+      await refreshSelectedInvoice(invoice.id);
       const items = await listInvoices(connId, { nature: documentTab?.nature });
       setDocuments(items);
     } catch (error) {
       console.error("[invoice] Post error:", error);
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const handleCreateBridgeFlowDocument = async () => {
+    if (!selectedInvoice || actionPending) return;
+    setActionBusy("bridge-create");
+    try {
+      const invoice = selectedInvoice.is_local_draft
+        ? await ensureRemoteInvoiceForBridge(selectedInvoice)
+        : computeInvoice(selectedInvoice);
+      const readiness = await previewBridgeAccounting(connId, invoice);
+      setAccountingReadiness(readiness);
+      if (!readiness.ready) {
+        const proposal = buildBridgeRuleProposal(invoice, readiness);
+        if (proposalHasRules(proposal)) {
+          setBridgeRuleProposal(proposal);
+          setDraftNotice(t("bridge_rules_review_required"));
+          return;
+        }
+        alert(`${t("bridge_not_ready")}\n${readiness.issues.join("\n")}`);
+        return;
+      }
+      await createBridgeFlowFromInvoice(invoice);
+    } catch (error) {
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const handleApplyBridgeRuleProposal = async () => {
+    if (!bridgeRuleProposal || actionPending) return;
+    setActionBusy("bridge-rules");
+    try {
+      const invoice = await applyBridgeRuleProposal(bridgeRuleProposal);
+      const readiness = await previewBridgeAccounting(connId, invoice);
+      setAccountingReadiness(readiness);
+      if (!readiness.ready) {
+        const proposal = buildBridgeRuleProposal(invoice, readiness);
+        setBridgeRuleProposal(proposalHasRules(proposal) ? proposal : null);
+        alert(`${t("bridge_not_ready")}\n${readiness.issues.join("\n")}`);
+        return;
+      }
+      await createBridgeFlowFromInvoice(invoice);
+    } catch (error) {
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const handleValidateBridgeFlowDocument = async () => {
+    if (!bridgeFlowDocument?.id || actionPending) return;
+    setActionBusy("bridge-validate");
+    try {
+      const validated = await validateBridgeDocument(connId, bridgeFlowDocument.id);
+      setBridgeFlowDocument(validated);
+      setDraftNotice(t("bridge_document_validated"));
+    } catch (error) {
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const handleTransformBridgeFlowQuote = async () => {
+    if (!bridgeFlowDocument?.id || actionPending) return;
+    setActionBusy("bridge-transform");
+    try {
+      const transformed = await transformBridgeQuote(connId, bridgeFlowDocument.id);
+      setBridgeFlowDocument(transformed);
+      setDraftNotice(t("bridge_document_transformed"));
+    } catch (error) {
+      alert(t("error") + ": " + error);
+    } finally {
+      setActionBusy("");
+    }
+  };
+
+  const handleGenerateBridgeFlowPosting = async () => {
+    if (!bridgeFlowDocument?.id || actionPending) return;
+    setActionBusy("bridge-posting");
+    try {
+      await generateBridgeInvoicePosting(connId, bridgeFlowDocument.id);
+      setDraftNotice(t("bridge_posting_generated"));
+    } catch (error) {
       alert(t("error") + ": " + error);
     } finally {
       setActionBusy("");
@@ -1736,6 +2234,17 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   )}
                 />
               </div>
+              <div className="span-2">
+                <TierSummary tier={editorInvoice} />
+              </div>
+              <label>
+                <span>{t("invoice_code")}</span>
+                <input value={editorInvoice.tiers_code} onChange={(event) => updateEditor({ tiers_code: event.target.value, tiers_id: editorInvoice.tiers_id || event.target.value })} />
+              </label>
+              <label>
+                <span>{t("invoice_name")}</span>
+                <input value={editorInvoice.tiers_nom} onChange={(event) => updateEditor({ tiers_nom: event.target.value })} />
+              </label>
               <label className="span-2">
                 <span>{t("invoice_address")}</span>
                 <input value={editorInvoice.tiers_adresse} onChange={(event) => updateEditor({ tiers_adresse: event.target.value })} />
@@ -1756,6 +2265,17 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <span>SIRET</span>
                 <input value={editorInvoice.tiers_siret} onChange={(event) => updateEditor({ tiers_siret: event.target.value })} />
               </label>
+              <label>
+                <span>{t("invoice_vat_number")}</span>
+                <input value={editorInvoice.tiers_tva_intra} onChange={(event) => updateEditor({ tiers_tva_intra: event.target.value })} />
+              </label>
+              <label>
+                <span>{t("invoice_tiers_type")}</span>
+                <select value={editorInvoice.is_supplier ? "fournisseur" : "client"} onChange={(event) => updateEditor({ is_supplier: event.target.value === "fournisseur" })}>
+                  <option value="client">{t("invoice_tab_clients")}</option>
+                  <option value="fournisseur">{t("invoice_tab_fournisseurs")}</option>
+                </select>
+              </label>
             </div>
           </section>
 
@@ -1769,7 +2289,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             </div>
 
             <div className="invoice-lines-table-wrap">
-              <table className="invoice-lines-table compact">
+              <table className="invoice-lines-table compact invoice-lines-table-entry">
                 <thead>
                   <tr>
                     <th>#</th>
@@ -1779,12 +2299,9 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     <th>{t("invoice_unit")}</th>
                     <th>{t("invoice_unit_price")}</th>
                     <th>{t("invoice_discount")}</th>
-                    <th>{t("invoice_line_total_ht")}</th>
                     <th>{t("invoice_vat_rate")}</th>
-                    <th>{t("invoice_vat_amount")}</th>
                     <th>{t("invoice_bic_rate")}</th>
-                    <th>{t("invoice_bic_amount")}</th>
-                    <th>{t("invoice_line_total_ttc")}</th>
+                    <th>{t("invoice_line_total_ht")}</th>
                     <th />
                   </tr>
                 </thead>
@@ -1828,6 +2345,9 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                               vat_account: article.vat_account,
                               bic_account: article.bic_account,
                               custom_tax_rules: article.custom_tax_rules,
+                              product_family_code: article.product_family_code,
+                              accounting_category_code: article.accounting_category_code,
+                              tax_code: article.tax_code,
                             });
                           }}
                           renderOption={(article) => (
@@ -1858,29 +2378,23 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                           <input type="number" step="0.01" value={line.remise_valeur ?? line.remise_pct} onChange={(event) => updateLine(index, { remise_valeur: event.target.value })} />
                         </div>
                       </td>
-                      <td className="num">{formatCurrency(line.montant_ht, editorInvoice.devise)}</td>
                       <td>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <input type="number" step="0.01" style={{ width: 60 }} value={line.taux_tva} onChange={(event) => updateLine(index, { taux_tva: event.target.value })} />
-                          <select
-                            style={{ width: 45, padding: "4px 2px" }}
-                            value=""
-                            onChange={(e) => {
-                              if (e.target.value) updateLine(index, { taux_tva: Number(e.target.value) });
-                              e.target.value = "";
-                            }}
-                          >
-                            <option value="">⋯</option>
-                            {invoiceSettings.invoice_vat_rates.map((rate) => (
-                              <option key={rate} value={rate}>{rate}%</option>
-                            ))}
-                          </select>
-                        </div>
+                        <select value={line.taux_tva} onChange={(event) => updateLine(index, { taux_tva: Number(event.target.value) })}>
+                          {invoiceSettings.invoice_vat_rates.map((rate) => (
+                            <option key={rate} value={rate}>{rate}%</option>
+                          ))}
+                        </select>
                       </td>
-                      <td className="num">{formatCurrency(line.montant_tva, editorInvoice.devise)}</td>
-                      <td><input type="number" step="0.01" value={line.taux_bic} onChange={(event) => updateLine(index, { taux_bic: event.target.value })} /></td>
-                      <td className="num">{formatCurrency(line.montant_bic, editorInvoice.devise)}</td>
-                      <td className="num">{formatCurrency(line.montant_ttc, editorInvoice.devise)}</td>
+                      <td>
+                        <select value={line.taux_bic} onChange={(event) => updateLine(index, { taux_bic: Number(event.target.value) })}>
+                          {[0, ...invoiceSettings.tax_types
+                            .filter((tax) => String(tax.id || tax.name).toLowerCase() === "bic" && tax.active)
+                            .map((tax) => Number(tax.rate) || 0)]
+                            .filter((rate, rateIndex, rates) => rates.indexOf(rate) === rateIndex)
+                            .map((rate) => <option key={rate} value={rate}>{rate}%</option>)}
+                        </select>
+                      </td>
+                      <td className="num">{formatCurrency(line.montant_ht, editorInvoice.devise)}</td>
                       <td>
                         <button type="button" className="btn btn-icon btn-sm" onClick={() => removeLine(index)}>
                           <Trash2 size={13} />
@@ -2026,6 +2540,101 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </button>
         </div>
 
+        <section className="accounting-readiness">
+          <div>
+            <strong>{t("bridge_transformation_path")}</strong>
+            <span>
+              {bridgeFlowDocument
+                ? `${bridgeFlowDocument.document_type} ${bridgeFlowDocument.number} · ${bridgeFlowDocument.status}`
+                : t("bridge_transformation_hint")}
+            </span>
+          </div>
+          <div className="bridge-row-actions">
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={actionPending || Boolean(bridgeFlowDocument)}
+              onClick={handleCreateBridgeFlowDocument}
+            >
+              {actionBusy === "bridge-create" ? <span className="mini-spinner" /> : null}
+              {t("bridge_create_document")}
+            </button>
+            {bridgeFlowDocument?.status === "Draft" ? (
+              <button type="button" className="btn btn-sm" disabled={actionPending} onClick={handleValidateBridgeFlowDocument}>
+                {t("bridge_validate")}
+              </button>
+            ) : null}
+            {bridgeFlowDocument?.document_type === "Devis" && bridgeFlowDocument?.status === "Validated" ? (
+              <button type="button" className="btn btn-sm" disabled={actionPending} onClick={handleTransformBridgeFlowQuote}>
+                {t("bridge_transform")}
+              </button>
+            ) : null}
+            {bridgeFlowDocument?.document_type === "Facture" && bridgeFlowDocument?.status === "Validated" ? (
+              <button type="button" className="btn btn-sm btn-accent" disabled={actionPending} onClick={handleGenerateBridgeFlowPosting}>
+                {t("bridge_generate_posting")}
+              </button>
+            ) : null}
+          </div>
+        </section>
+
+        {selectedInvoice.nature === "Facture" && accountingReadiness ? (
+          <section className={`accounting-readiness ${accountingReadiness.ready ? "ready" : "blocked"}`}>
+            <div>
+              <strong>{accountingReadiness.ready ? t("bridge_ready_to_post") : t("bridge_not_ready")}</strong>
+              <span>
+                {accountingReadiness.ready
+                  ? `${accountingReadiness.schema_code} · ${accountingReadiness.journal_code} · ${accountingReadiness.customer_account}`
+                  : accountingReadiness.issues.join(" · ")}
+              </span>
+            </div>
+            <div className="accounting-resolution-path">
+              {accountingReadiness.lines.map((line) => (
+                <span key={line.product_code}>
+                  {line.product_code} → {line.product_family_code || "—"} → {line.accounting_category_code || "—"} → {line.revenue_account || "—"} / {line.tax_account || "—"}
+                </span>
+              ))}
+            </div>
+            {!accountingReadiness.ready && selectedInvoice.tiers_code ? (
+              <div className="bridge-row-actions">
+                <button type="button" className="btn btn-sm" disabled={actionPending} onClick={openCustomerBridgeFix}>
+                  <Users size={13} />
+                  {t("bridge_fix_customer_link")}
+                </button>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+
+        {bridgeRuleProposal ? (
+          <section className="accounting-readiness blocked">
+            <div>
+              <strong>{t("bridge_rules_proposed")}</strong>
+              <span>{t("bridge_rules_review_required")}</span>
+            </div>
+            <div className="accounting-resolution-path">
+              {bridgeRuleProposal.partnerRule ? (
+                <span>
+                  {t("bridge_customer_mapping")}: {bridgeRuleProposal.partnerRule.partner_code} → {bridgeRuleProposal.partnerRule.collective_account}
+                </span>
+              ) : null}
+              {bridgeRuleProposal.productRules.map((rule) => (
+                <span key={rule.product_code}>
+                  {rule.product_code} → {rule.product_family_code} → {rule.accounting_category_code} → {rule.revenue_account || "—"} / {rule.tax_code}
+                </span>
+              ))}
+            </div>
+            <div className="bridge-row-actions">
+              <button type="button" className="btn btn-sm" disabled={actionPending} onClick={() => setBridgeRuleProposal(null)}>
+                {t("cancel")}
+              </button>
+              <button type="button" className="btn btn-sm btn-accent" disabled={actionPending} onClick={handleApplyBridgeRuleProposal}>
+                {actionBusy === "bridge-rules" ? <span className="mini-spinner" /> : null}
+                {t("bridge_rules_apply")}
+              </button>
+            </div>
+          </section>
+        ) : null}
+
         <div className="invoice-view-grid">
           <section className="invoice-detail-card">
             <div className="invoice-view-head">
@@ -2146,11 +2755,112 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
 
   const filteredItems = useMemo(() => {
     return articles.filter((item) => {
-      if (itemSourceFilter && item.source !== itemSourceFilter) return false;
+      if (itemSourceFilter && item.source !== itemSourceFilter) {
+        if (!(itemSourceFilter === "local_draft" && item.source === "local")) return false;
+      }
       if (itemStatusFilter && item.status !== itemStatusFilter) return false;
       return true;
     });
   }, [articles, itemSourceFilter, itemStatusFilter]);
+
+  const renderTiersView = () => {
+    const currentProfile = selectedTier
+      ? bridgePartnerProfileByCode.get(String(selectedTier.code || "").trim().toLowerCase())
+      : null;
+    const selectedTiers = tiers.filter((tier) => selectedTierCodes.has(tier.code));
+    const unlinkedVisibleTiers = tiers.filter((tier) => {
+      const profile = bridgePartnerProfileByCode.get(String(tier.code || "").trim().toLowerCase());
+      return !(profile && bridgeProfileActive(profile) && String(profile[3] || "").trim());
+    });
+    return (
+      <div className="invoice-directory-layout">
+        <section className="invoice-directory-list">
+          <div className="invoice-list-toolbar">
+            <div className="invoice-search-row">
+              <div className="invoice-searchbox">
+                <Search size={14} />
+                <input value={tierSearch} onChange={(event) => setTierSearch(event.target.value)} placeholder={t("invoice_tiers_search")} />
+              </div>
+              <div className="invoice-search-count">{tiersLoading ? t("loading") : t("invoice_tiers_count", tiers.length)}</div>
+            </div>
+          </div>
+          <div className="invoice-directory-actions">
+            <button
+              type="button"
+              className="btn btn-accent invoice-directory-create"
+              onClick={() => setTiersModal({ initial: { ...BLANK_TIERS, type_tiers: directoryTab?.type === "fournisseurs" ? "fournisseur" : "client" } })}
+            >
+              <FilePlus2 size={13} />
+              {directoryTab?.type === "fournisseurs" ? t("invoice_new_supplier") : t("invoice_new_client")}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={actionPending || !selectedTiers.length}
+              onClick={() => bulkLinkTiers(selectedTiers)}
+            >
+              {actionBusy === "bridge-tier-bulk" ? <span className="mini-spinner" /> : null}
+              {t("bridge_bulk_link_selected", selectedTiers.length)}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={actionPending || !unlinkedVisibleTiers.length}
+              onClick={() => bulkLinkTiers(unlinkedVisibleTiers)}
+            >
+              {t("bridge_bulk_link_unlinked", unlinkedVisibleTiers.length)}
+            </button>
+          </div>
+          <div className="invoice-directory-items">
+            {tiersLoading ? (
+              <div className="empty-state"><div className="spinner" /><p>{t("loading")}</p></div>
+            ) : null}
+            {!tiersLoading && tiersError ? <div className="invoice-form-error">{tiersError}</div> : null}
+            {!tiersLoading && !tiersError && tiers.length ? tiers.map((tier) => {
+              const profile = bridgePartnerProfileByCode.get(String(tier.code || "").trim().toLowerCase());
+              const linked = profile && bridgeProfileActive(profile) && String(profile[3] || "").trim();
+              const statusLabel = linked ? t("bridge_linked") : profile ? t("bridge_collective_missing") : t("bridge_to_link");
+              return (
+                <div
+                  key={tier.id || tier.code}
+                  className={`invoice-directory-item ${selectedTier?.code === tier.code ? "active" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedTierCodes.has(tier.code)}
+                    aria-label={t("bridge_select_tier", tier.code)}
+                    onChange={(event) => toggleTierSelection(tier.code, event.target.checked)}
+                  />
+                  <button type="button" className="invoice-directory-item-body" onClick={() => setSelectedTier(tier)}>
+                    <strong>{tier.nom || tier.code}</strong>
+                    <span>{[tier.code, tier.ville, tier.type_tiers].filter(Boolean).join(" · ")}</span>
+                    <em>{t("bridge_customer_collective_account")}: {profile?.[3] || "—"}</em>
+                    <span className={`invoice-status-badge ${linked ? "success" : "warning"}`}>{statusLabel}</span>
+                  </button>
+                </div>
+              );
+            }) : null}
+            {!tiersLoading && !tiersError && !tiers.length ? (
+              <div className="empty-state">
+                <Users size={28} />
+                <p>{t("invoice_no_tiers_found")}</p>
+              </div>
+            ) : null}
+          </div>
+        </section>
+        <TiersPanel
+          tier={selectedTier}
+          invoices={selectedTierInvoices}
+          loading={tierDocsLoading}
+          error={tierDocsError}
+          bridgeProfile={currentProfile}
+          masterData={bridgeMasterData}
+          onSaveBridgeProfile={saveTierBridgeProfile}
+          busy={actionBusy.startsWith("bridge-tier-")}
+        />
+      </div>
+    );
+  };
 
   const renderItemsView = () => (
     <div className="invoice-items-view">
@@ -2171,6 +2881,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
             <option value="">{t("invoice_filter_source_all")}</option>
             <option value="database">{t("invoice_source_database")}</option>
             <option value="local_draft">{t("invoice_source_local")}</option>
+            <option value="bridge_profile">{t("invoice_source_bridge_profile")}</option>
+            <option value="account">{t("invoice_source_account")}</option>
           </select>
           <select value={itemStatusFilter} onChange={(event) => setItemStatusFilter(event.target.value)}>
             <option value="">{t("invoice_filter_status_all")}</option>
@@ -2200,8 +2912,9 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   <th>{t("invoice_currency")}</th>
                   <th>{t("invoice_vat_rate")}</th>
                   <th>{t("invoice_bic_rate")}</th>
-                  <th>{t("invoice_revenue_account")}</th>
-                  <th>{t("invoice_tax_account")}</th>
+                  <th>{t("bridge_product_family")}</th>
+                  <th>{t("bridge_accounting_category")}</th>
+                  <th>{t("bridge_tax_code")}</th>
                   <th>{t("invoice_source")}</th>
                   <th>{t("invoice_status")}</th>
                   <th />
@@ -2219,9 +2932,10 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                     <td>{item.currency || invoiceSettings.invoice_default_currency}</td>
                     <td className="num">{round2(item.taux_tva)}%</td>
                     <td className="num">{round2(item.taux_bic)}%</td>
-                    <td>{item.revenue_account || item.expense_account || "—"}</td>
-                    <td>{item.vat_account || item.bic_account || "—"}</td>
-                    <td><span className="invoice-status-badge info">{item.source === "local_draft" ? t("invoice_source_local") : t("invoice_source_database")}</span></td>
+                    <td>{item.product_family_code || "—"}</td>
+                    <td>{item.accounting_category_code || "—"}</td>
+                    <td>{item.tax_code || "—"}</td>
+                    <td><span className="invoice-status-badge info">{itemSourceLabel(t, item.source)}</span></td>
                     <td><span className={`invoice-status-badge ${item.status === "synced" ? "success" : item.status === "invalid" ? "orange" : "warning"}`}>{t(`invoice_status_${item.status || "draft"}`)}</span></td>
                     <td>
                       <button type="button" className="btn btn-icon btn-sm" onClick={() => setArticleModal({ initial: item })} title={t("edit")}>
@@ -2264,6 +2978,10 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
               {t("invoice_sync_queue", syncQueue.length)}
             </button>
           ) : null}
+          <button type="button" className="btn btn-sm" onClick={() => setDocumentationOpen(true)}>
+            <HelpCircle size={14} />
+            {t("invoice_help")}
+          </button>
           <button type="button" className="btn btn-sm" onClick={onOpenTemplateDesigner}>
             <Printer size={14} />
             {t("invoice_template_appearance")}
@@ -2272,32 +2990,40 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         </div>
       </header>
 
-      <div className="invoice-tabbar">
-        {[...DOCUMENT_TABS, { id: "items", icon: Package2, labelKey: "invoice_tab_articles" }].map((tab) => (
-          <TabButton
-            key={tab.id}
-            active={activeTab === tab.id}
-            icon={tab.icon}
-            label={t(tab.labelKey)}
-            onClick={() => {
-              startTransition(() => {
-                setActiveTab(tab.id);
-                setMode("view");
-                setSelectedInvoice(null);
-                setSelectedTier(null);
-                setSelectedArticle(null);
-                if (tab.id === "items") refreshArticles();
-              });
-            }}
-          />
-        ))}
-      </div>
-
-      {isItemsTab ? (
-        <div className="invoicing-items-layout">
-          {renderItemsView()}
-        </div>
+      {documentationOpen ? (
+        <InvoiceDocumentation onBack={() => setDocumentationOpen(false)} />
       ) : (
+        <>
+          <div className="invoice-tabbar">
+            {[...DOCUMENT_TABS, ...DIRECTORY_TABS, { id: "items", icon: Package2, labelKey: "invoice_tab_articles" }, { id: "bridge", icon: BadgeEuro, labelKey: "invoice_tab_bridge" }].map((tab) => (
+              <TabButton
+                key={tab.id}
+                active={activeTab === tab.id}
+                icon={tab.icon}
+                label={t(tab.labelKey)}
+                onClick={() => {
+                  startTransition(() => {
+                    setActiveTab(tab.id);
+                    setMode("view");
+                    setSelectedInvoice(null);
+                    setSelectedTier(null);
+                    setSelectedArticle(null);
+                    if (tab.id === "items") refreshArticles();
+                  });
+                }}
+              />
+            ))}
+          </div>
+
+          {isBridgeTab ? (
+            <BridgeWorkspace connId={connId} schema={schema} />
+          ) : isDirectoryTab ? (
+            renderTiersView()
+          ) : isItemsTab ? (
+            <div className="invoicing-items-layout">
+              {renderItemsView()}
+            </div>
+          ) : (
       <div className={`invoicing-layout ${listCollapsed ? "list-collapsed" : ""}`}>
         <aside className="invoice-list-panel">
           <div className="invoice-list-header">
@@ -2312,7 +3038,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                   />
                 </div>
                 <div className="invoice-search-count" aria-live="polite">
-                  {documentsLoading ? t("loading") : t("invoice_results_count", documents.length)}
+                  {documentsLoading && !visibleDocumentCount ? t("loading") : t("invoice_results_count", visibleDocumentCount)}
                 </div>
               </div>
               <div className="invoice-filter-grid">
@@ -2337,12 +3063,12 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           </div>
 
           <div className="invoice-list-scroll">
-            {documentsLoading ? (
+            {documentsLoading && !visibleDocumentCount ? (
               <div className="empty-state">
                 <div className="spinner" />
                 <p>{t("invoice_loading_list")}</p>
               </div>
-            ) : documentsError ? (
+            ) : documentsError && !visibleDocumentCount ? (
               <div className="empty-state">
                 <FileText size={28} />
                 <p>{documentsError}</p>
@@ -2397,6 +3123,8 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
           {renderDocumentView()}
         </main>
       </div>
+          )}
+        </>
       )}
 
       {mode === "preview" ? (
@@ -2438,6 +3166,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
         <ArticleFormModal
           t={t}
           initial={articleModal.initial}
+          masterData={bridgeMasterData}
           unitOptions={unitOptions}
           onSave={async (form) => {
             try {
@@ -2445,9 +3174,19 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 persistLocalItem(form);
               } else if (form.id && form.id.startsWith("sdb-")) {
                 await updateArticle(connId, form);
-              } else {
+              } else if (!form.id || form.source !== "database") {
                 await createArticle(connId, form);
               }
+              await saveBridgeProductProfile(connId, {
+                product_code: form.code,
+                product_family_code: form.product_family_code,
+                accounting_category_code: form.accounting_category_code,
+                tax_code: form.tax_code,
+                revenue_account: form.revenue_account,
+                active: true,
+              });
+              const nextMasterData = await getBridgeMasterData(connId);
+              setBridgeMasterData(nextMasterData);
               refreshArticles();
             } catch (error) {
               persistLocalItem(form, error);

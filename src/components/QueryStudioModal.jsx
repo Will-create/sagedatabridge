@@ -32,6 +32,34 @@ function tableToTsv(columns, rows) {
   return [header, ...body].join("\n");
 }
 
+function cellToCsvValue(value) {
+  if (value === null || value === undefined) return "";
+  const text = String(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function tableToCsv(columns, rows) {
+  const header = columns.map((column) => cellToCsvValue(column.name)).join(",");
+  const body = rows.map((row) => row.map(cellToCsvValue).join(","));
+  return [header, ...body].join("\r\n");
+}
+
+function downloadTextFile(text, filename, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function timestampForFilename() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
 export default function QueryStudioModal({ activeConn, activeTable, onClose, onToast }) {
   const { t, lang } = useT();
   const [savedQueries, setSavedQueries] = useState([]);
@@ -178,6 +206,14 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
     }
   };
 
+  const exportResultsCsv = () => {
+    if (!results) return;
+    const csv = tableToCsv(results.columns, results.rows);
+    const filename = `sql-results-${timestampForFilename()}.csv`;
+    downloadTextFile(`\uFEFF${csv}`, filename, "text/csv;charset=utf-8");
+    onToast({ type: "success", msg: t("sql_export_csv_ok", results.rows.length.toLocaleString(locale)) });
+  };
+
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal query-studio-modal">
@@ -294,6 +330,9 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={() => copyResults("all")} disabled={!results || running}>
                     {t("sql_copy_all")}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={exportResultsCsv} disabled={!results || running}>
+                    {t("sql_export_csv")}
                   </button>
                 </div>
               </div>

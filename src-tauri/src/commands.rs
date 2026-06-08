@@ -187,7 +187,7 @@ pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
             vec![
                 crate::state::TaxTypeSetting {
                     id: "vat".to_string(),
-                    name: "VAT".to_string(),
+                    name: "TVA".to_string(),
                     rate: config.invoice_default_vat_rate,
                     account: config.account_vat.clone(),
                     active: true,

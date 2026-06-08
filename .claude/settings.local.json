@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Read(//home/louisbertson/.cargo/bin/**)",
+      "Read(//usr/local/cargo/bin/**)",
+      "Read(//home/**)",
+      "Bash(~/.cargo/bin/cargo check *)"
+    ]
+  }
+}

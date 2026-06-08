@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod analytics;
+mod bridge;
 mod commands;
 mod db;
 mod invoice_commands;
@@ -117,6 +118,7 @@ fn main() {
             invoice_commands::update_statut,
             invoice_commands::delete_invoice,
             invoice_commands::comptabiliser_invoice,
+            invoice_commands::mark_invoice_comptabilise_from_bridge,
             invoice_commands::list_tiers,
             invoice_commands::create_tiers,
             invoice_commands::update_tiers,
@@ -125,6 +127,25 @@ fn main() {
             invoice_commands::create_article,
             invoice_commands::update_article,
             invoice_commands::delete_article,
+            // Normalized commercial-to-accounting bridge
+            bridge::initialize_bridge,
+            bridge::list_bridge_documents,
+            bridge::create_bridge_document,
+            bridge::validate_bridge_document,
+            bridge::transform_bridge_quote,
+            bridge::generate_bridge_invoice_posting,
+            bridge::register_bridge_payment,
+            bridge::generate_bridge_payment_posting,
+            bridge::get_bridge_accounting_configuration,
+            bridge::save_bridge_accounting_configuration,
+            bridge::get_bridge_master_data,
+            bridge::save_bridge_product_profile,
+            bridge::get_bridge_management_data,
+            bridge::save_bridge_management_record,
+            bridge::deactivate_bridge_management_record,
+            bridge::preview_bridge_accounting,
+            bridge::list_bridge_posting_batches,
+            bridge::prepare_bridge_export,
             pdf_engine::render_invoice_html,
             pdf_engine::render_invoice_html_preview,
             pdf_engine::export_invoice_pdf,

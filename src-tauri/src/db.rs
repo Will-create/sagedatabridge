@@ -1714,7 +1714,17 @@ pub async fn execute_logged_query(
         Err(error) => log_query_result(client, &context, sql, duration, timeout, None, Some(error)),
     }
 
-    result
+    result.map_err(|error| {
+        let sql_preview = shorten_sql(sql, 900);
+        if context.endpoint.is_empty() && context.query_name.is_empty() {
+            format!("{error}; SQL preview: {sql_preview}")
+        } else {
+            format!(
+                "{error}; query context: {}/{}; SQL preview: {sql_preview}",
+                context.endpoint, context.query_name
+            )
+        }
+    })
 }
 
 async fn execute_raw_query_tds(

@@ -76,6 +76,13 @@ struct Sage1000Context {
     tiers: Option<DetectedTable>,
     role_tiers: Option<DetectedTable>,
     pieces: Option<DetectedTable>,
+    journals: Option<DetectedTable>,
+}
+
+struct Sage1000DocumentSql {
+    join_sql: String,
+    journal_expr: String,
+    ref_piece_expr: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +195,61 @@ fn text_or_empty(expr: &str, len: usize) -> String {
         "COALESCE(CAST({} AS NVARCHAR({})), CAST('' AS NVARCHAR({})))",
         expr, len, len
     )
+}
+
+fn sage1000_piece_join(context: &Sage1000Context) -> String {
+    context
+        .pieces
+        .as_ref()
+        .map(|table| {
+            format!(
+                "LEFT JOIN {} p ON {} = {}",
+                table.sql_name(),
+                qualify("e", "oidpiece"),
+                qualify("p", "oid")
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn sage1000_document_sql(context: &Sage1000Context) -> Sage1000DocumentSql {
+    let piece_join = sage1000_piece_join(context);
+    let journal_join = match (context.pieces.as_ref(), context.journals.as_ref()) {
+        (Some(_), Some(table)) => format!(
+            "LEFT JOIN {} j ON {} = {}",
+            table.sql_name(),
+            qualify("p", "oidjournal"),
+            qualify("j", "oid")
+        ),
+        _ => String::new(),
+    };
+    let join_sql = [piece_join, journal_join]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n            ");
+
+    let journal_expr = match (context.pieces.as_ref(), context.journals.as_ref()) {
+        (Some(_), Some(_)) => format!(
+            "COALESCE(CAST({} AS NVARCHAR(64)), CAST({} AS NVARCHAR(64)), CAST({} AS NVARCHAR(64)), CAST('' AS NVARCHAR(64)))",
+            qualify("j", "code"),
+            qualify("j", "Caption"),
+            qualify("p", "numero")
+        ),
+        (Some(_), None) => text_or_empty(&qualify("p", "numero"), 64),
+        _ => "CAST('' AS NVARCHAR(64))".to_string(),
+    };
+    let ref_piece_expr = if context.pieces.is_some() {
+        text_or_empty(&qualify("p", "numero"), 128)
+    } else {
+        "CAST('' AS NVARCHAR(128))".to_string()
+    };
+
+    Sage1000DocumentSql {
+        join_sql,
+        journal_expr,
+        ref_piece_expr,
+    }
 }
 
 fn join_warnings(warnings: Vec<String>) -> Option<String> {
@@ -401,6 +463,7 @@ async fn resolve_sage1000_context(
         tiers: detect_table(client, &["TTIERS"]).await,
         role_tiers: detect_table(client, &["TROLETIERS"]).await,
         pieces: detect_table(client, &["TPIECE"]).await,
+        journals: detect_table(client, &["TJOURNAL"]).await,
     }))
 }
 
@@ -724,28 +787,7 @@ async fn get_grand_livre_sage1000(
         ]));
     };
 
-    let piece_join = context
-        .pieces
-        .as_ref()
-        .map(|table| {
-            format!(
-                "LEFT JOIN {} p ON {} = {}",
-                table.sql_name(),
-                qualify("e", "oidpiece"),
-                qualify("p", "oid")
-            )
-        })
-        .unwrap_or_default();
-    let journal_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 64)
-    } else {
-        "CAST('' AS NVARCHAR(64))".to_string()
-    };
-    let ref_piece_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 128)
-    } else {
-        "CAST('' AS NVARCHAR(128))".to_string()
-    };
+    let document_sql = sage1000_document_sql(&context);
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = format!(
         "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
@@ -781,7 +823,7 @@ async fn get_grand_livre_sage1000(
                 entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0)
             FROM {entries_table} e
             LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk}
-            {piece_join}
+            {document_join}
             WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to}
               AND {account_no_expr} <> ''
               {account_filter_sql}
@@ -880,10 +922,10 @@ async fn get_grand_livre_sage1000(
         ORDER BY account_no, sort_row
         "#,
         date_col = qualify("e", "eDate"),
-        journal_expr = journal_expr,
+        journal_expr = document_sql.journal_expr,
         account_no_expr = account_no_expr,
         account_label_expr = account_label_expr,
-        ref_piece_expr = ref_piece_expr,
+        ref_piece_expr = document_sql.ref_piece_expr,
         lettrage_expr = lettrage_expr,
         debit_expr = debit_expr,
         credit_expr = credit_expr,
@@ -892,7 +934,7 @@ async fn get_grand_livre_sage1000(
         accounts_table = context.accounts.sql_name(),
         entry_account_fk = qualify("e", "oidcompteGeneral"),
         account_pk = qualify("cg", "oid"),
-        piece_join = piece_join,
+        document_join = document_sql.join_sql,
         date_from = sql_literal(date_from),
         date_to = sql_literal(date_to),
         account_filter_sql = account_filter_sql
@@ -1092,18 +1134,7 @@ async fn get_grand_livre_auxiliaire_sage1000(
     } else {
         "41"
     };
-    let piece_join = context
-        .pieces
-        .as_ref()
-        .map(|table| {
-            format!(
-                "LEFT JOIN {} p ON {} = {}",
-                table.sql_name(),
-                qualify("e", "oidpiece"),
-                qualify("p", "oid")
-            )
-        })
-        .unwrap_or_default();
+    let document_sql = sage1000_document_sql(&context);
     let tier_oid_expr = if context.pieces.is_some() {
         format!(
             "COALESCE({}, {})",
@@ -1112,16 +1143,6 @@ async fn get_grand_livre_auxiliaire_sage1000(
         )
     } else {
         qualify("rt", "oidTiers")
-    };
-    let journal_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 64)
-    } else {
-        "CAST('' AS NVARCHAR(64))".to_string()
-    };
-    let ref_piece_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 128)
-    } else {
-        "CAST('' AS NVARCHAR(128))".to_string()
     };
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = format!(
@@ -1181,7 +1202,7 @@ async fn get_grand_livre_auxiliaire_sage1000(
             FROM {entries_table} e
             LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk}
             LEFT JOIN {role_tiers_table} rt ON {entry_role_fk} = {role_pk}
-            {piece_join}
+            {document_join}
             LEFT JOIN {tiers_table} t ON {tier_oid_expr} = {tiers_pk}
             LEFT JOIN {accounts_table} ap ON {role_account_fk} = {role_account_pk}
             WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to}
@@ -1291,9 +1312,9 @@ async fn get_grand_livre_auxiliaire_sage1000(
         account_label_expr = account_label_expr,
         tiers_code_expr = tiers_code_expr,
         tiers_name_expr = tiers_name_expr,
-        journal_expr = journal_expr,
+        journal_expr = document_sql.journal_expr,
         description_expr = description_expr,
-        ref_piece_expr = ref_piece_expr,
+        ref_piece_expr = document_sql.ref_piece_expr,
         lettrage_expr = lettrage_expr,
         debit_expr = debit_expr,
         credit_expr = credit_expr,
@@ -1310,7 +1331,7 @@ async fn get_grand_livre_auxiliaire_sage1000(
         tiers_pk = qualify("t", "oid"),
         role_account_fk = qualify("rt", "oidcomptePrivilegie"),
         role_account_pk = qualify("ap", "oid"),
-        piece_join = piece_join,
+        document_join = document_sql.join_sql,
         date_from = sql_literal(date_from),
         date_to = sql_literal(date_to),
         tier_kind_filter = tier_kind_filter,
@@ -1357,18 +1378,7 @@ async fn get_dashboard_kpis_sage1000(
         ]));
     };
 
-    let piece_join = context
-        .pieces
-        .as_ref()
-        .map(|table| {
-            format!(
-                "LEFT JOIN {} p ON {} = {}",
-                table.sql_name(),
-                qualify("e", "oidpiece"),
-                qualify("p", "oid")
-            )
-        })
-        .unwrap_or_default();
+    let piece_join = sage1000_piece_join(&context);
     let tiers_join = match (context.role_tiers.as_ref(), context.tiers.as_ref()) {
         (Some(role_tiers), Some(tiers)) => {
             let tier_oid_expr = if context.pieces.is_some() {
@@ -2813,29 +2823,7 @@ async fn stream_gl_sage1000(
         return Ok(());
     };
 
-    let piece_join = context
-        .pieces
-        .as_ref()
-        .map(|t| {
-            format!(
-                "LEFT JOIN {} p ON {} = {}",
-                t.sql_name(),
-                qualify("e", "oidpiece"),
-                qualify("p", "oid")
-            )
-        })
-        .unwrap_or_default();
-
-    let journal_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 64)
-    } else {
-        "CAST('' AS NVARCHAR(64))".to_string()
-    };
-    let ref_piece_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 128)
-    } else {
-        "CAST('' AS NVARCHAR(128))".to_string()
-    };
+    let document_sql = sage1000_document_sql(&context);
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = format!(
         "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
@@ -2857,12 +2845,12 @@ async fn stream_gl_sage1000(
         .unwrap_or_default();
 
     let base_cte = format!(
-        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {piece_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_no_filter} <> '' {account_filter_sql})",
+        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {document_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_no_filter} <> '' {account_filter_sql})",
         date_col = qualify("e", "eDate"),
-        journal_expr = journal_expr,
+        journal_expr = document_sql.journal_expr,
         account_no_expr = account_no_expr,
         account_label_expr = account_label_expr,
-        ref_piece_expr = ref_piece_expr,
+        ref_piece_expr = document_sql.ref_piece_expr,
         lettrage_expr = lettrage_expr,
         debit_expr = debit_expr,
         credit_expr = credit_expr,
@@ -2871,7 +2859,7 @@ async fn stream_gl_sage1000(
         accounts_table = context.accounts.sql_name(),
         entry_account_fk = qualify("e", "oidcompteGeneral"),
         account_pk = qualify("cg", "oid"),
-        piece_join = piece_join,
+        document_join = document_sql.join_sql,
         date_from = sql_literal(date_from),
         date_to = sql_literal(date_to),
         account_no_filter = account_no_expr,
@@ -3466,55 +3454,49 @@ async fn stream_aux_sage1000(
         return Ok(());
     };
 
-    let piece_join = context
-        .pieces
-        .as_ref()
-        .map(|t| {
+    let document_sql = sage1000_document_sql(&context);
+    let tiers_join = match (context.role_tiers.as_ref(), context.tiers.as_ref()) {
+        (Some(role_tiers), Some(tiers)) => {
+            let tier_oid_expr = if context.pieces.is_some() {
+                format!(
+                    "COALESCE({}, {})",
+                    qualify("rt", "oidTiers"),
+                    qualify("p", "oidTiers")
+                )
+            } else {
+                qualify("rt", "oidTiers")
+            };
             format!(
-                "LEFT JOIN {} p ON {} = {}",
-                t.sql_name(),
-                qualify("e", "oidpiece"),
-                qualify("p", "oid")
+                "LEFT JOIN {} rt ON {} = {}\n            LEFT JOIN {} t ON {} = {}",
+                role_tiers.sql_name(),
+                qualify("e", "oidroleTiers"),
+                qualify("rt", "oid"),
+                tiers.sql_name(),
+                tier_oid_expr,
+                qualify("t", "oid")
+            )
+        }
+        (None, Some(tiers)) if context.pieces.is_some() => format!(
+            "LEFT JOIN {} t ON {} = {}",
+            tiers.sql_name(),
+            qualify("p", "oidTiers"),
+            qualify("t", "oid")
+        ),
+        _ => String::new(),
+    };
+    let role_account_join = context
+        .role_tiers
+        .as_ref()
+        .filter(|_| context.tiers.is_some())
+        .map(|_| {
+            format!(
+                "LEFT JOIN {} ap ON {} = {}",
+                context.accounts.sql_name(),
+                qualify("rt", "oidcomptePrivilegie"),
+                qualify("ap", "oid")
             )
         })
         .unwrap_or_default();
-
-    let tiers_join = context
-        .tiers
-        .as_ref()
-        .map(|t| {
-            let role_join = context
-                .role_tiers
-                .as_ref()
-                .map(|rt| {
-                    format!(
-                        "LEFT JOIN {} rt ON {} = {}",
-                        rt.sql_name(),
-                        qualify("rt", "oidTiers"),
-                        qualify("t", "oid")
-                    )
-                })
-                .unwrap_or_default();
-            format!(
-                "LEFT JOIN {} t ON {} = {} {}",
-                t.sql_name(),
-                qualify("t", "oid"),
-                qualify("e", "oidTiers"),
-                role_join
-            )
-        })
-        .unwrap_or_default();
-
-    let journal_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 64)
-    } else {
-        "CAST('' AS NVARCHAR(64))".to_string()
-    };
-    let ref_piece_expr = if context.pieces.is_some() {
-        text_or_empty(&qualify("p", "numero"), 128)
-    } else {
-        "CAST('' AS NVARCHAR(128))".to_string()
-    };
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = format!(
         "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
@@ -3529,12 +3511,28 @@ async fn stream_aux_sage1000(
     let tiers_name_expr = context
         .tiers
         .as_ref()
-        .map(|_| text_or_empty(&qualify("t", "intitule"), 255))
+        .map(|_| {
+            format!(
+                "COALESCE(CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST({} AS NVARCHAR(255)), CAST('' AS NVARCHAR(255)))",
+                qualify("t", "raisonSociale"),
+                qualify("t", "nom"),
+                qualify("t", "code")
+            )
+        })
         .unwrap_or_else(|| "CAST('' AS NVARCHAR(255))".to_string());
     let lettrage_expr = text_or_empty(&qualify("e", "CodeLettrageExterne"), 64);
     let debit_expr = decimal_or_zero(&qualify("e", "debit"));
     let credit_expr = decimal_or_zero(&qualify("e", "credit"));
-    let account_filter = if is_fournisseurs {
+    let role_account_expr = text_or_empty(&qualify("ap", "codeCompte"), 64);
+    let account_filter = if context.role_tiers.is_some() && context.tiers.is_some() {
+        let role_prefix = if is_fournisseurs { "40" } else { "41" };
+        format!(
+            "(LEFT({role_account_expr}, 2) = {role_prefix} OR LEFT({account_no_expr}, 2) = {role_prefix})",
+            role_account_expr = role_account_expr,
+            account_no_expr = account_no_expr,
+            role_prefix = sql_literal(role_prefix)
+        )
+    } else if is_fournisseurs {
         format!(
             "({} LIKE '40%' OR {} LIKE '401%')",
             account_no_expr, account_no_expr
@@ -3557,14 +3555,14 @@ async fn stream_aux_sage1000(
         .unwrap_or_default();
 
     let base_cte = format!(
-        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), account_no = {account_no_expr}, account_label = {account_label_expr}, tiers_code = {tiers_code_expr}, tiers_name = {tiers_name_expr}, journal = {journal_expr}, description = CAST('' AS NVARCHAR(255)), ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {piece_join} {tiers_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_filter} AND {tiers_code_filter} <> '' {prefix_filter})",
+        "WITH base AS (SELECT parsed_date = TRY_CAST({date_col} AS DATE), account_no = {account_no_expr}, account_label = {account_label_expr}, tiers_code = {tiers_code_expr}, tiers_name = {tiers_name_expr}, journal = {journal_expr}, description = CAST('' AS NVARCHAR(255)), ref_piece = {ref_piece_expr}, lettrage = {lettrage_expr}, debit = {debit_expr}, credit = {credit_expr}, entry_number = COALESCE(TRY_CAST({entry_number_col} AS BIGINT), 0) FROM {entries_table} e LEFT JOIN {accounts_table} cg ON {entry_account_fk} = {account_pk} {document_join} {tiers_join} {role_account_join} WHERE TRY_CAST({date_col} AS DATE) BETWEEN {date_from} AND {date_to} AND {account_filter} AND {tiers_code_filter} <> '' {prefix_filter})",
         date_col = qualify("e", "eDate"),
         account_no_expr = account_no_expr,
         account_label_expr = account_label_expr,
         tiers_code_expr = tiers_code_expr,
         tiers_name_expr = tiers_name_expr,
-        journal_expr = journal_expr,
-        ref_piece_expr = ref_piece_expr,
+        journal_expr = document_sql.journal_expr,
+        ref_piece_expr = document_sql.ref_piece_expr,
         lettrage_expr = lettrage_expr,
         debit_expr = debit_expr,
         credit_expr = credit_expr,
@@ -3573,8 +3571,9 @@ async fn stream_aux_sage1000(
         accounts_table = context.accounts.sql_name(),
         entry_account_fk = qualify("e", "oidcompteGeneral"),
         account_pk = qualify("cg", "oid"),
-        piece_join = piece_join,
+        document_join = document_sql.join_sql,
         tiers_join = tiers_join,
+        role_account_join = role_account_join,
         date_from = sql_literal(date_from),
         date_to = sql_literal(date_to),
         account_filter = account_filter,

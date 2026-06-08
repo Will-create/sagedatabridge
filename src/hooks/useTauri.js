@@ -374,6 +374,12 @@ export const comptabiliserInvoice = (id, pieceId) => runInvoiceMutation(
   { id, pieceId },
   "Post invoice",
 );
+export const markInvoiceComptabiliseFromBridge = (id, pieceId, bridgeDocumentId) => runInvoiceMutation(
+  "markInvoiceComptabiliseFromBridge",
+  "mark_invoice_comptabilise_from_bridge",
+  { id, pieceId, bridgeDocumentId },
+  "Mark invoice posted from bridge",
+);
 
 export const listTiers = (id, typeTiers = "all", search = null, { limit = 40 } = {}) =>
   invokeWithTimeout("list_tiers", {
@@ -469,6 +475,9 @@ const normalizeArticlePayload = (article = {}) => ({
   bic_account: article.bic_account ?? "",
   tax_exempt: Boolean(article.tax_exempt),
   custom_tax_rules: article.custom_tax_rules ?? "",
+  product_family_code: article.product_family_code ?? "",
+  accounting_category_code: article.accounting_category_code ?? "",
+  tax_code: article.tax_code ?? "",
 });
 
 export const createArticle = (id, article) => invoke("create_article", { id, article: normalizeArticlePayload(article) });
@@ -502,3 +511,41 @@ export const saveInvoiceTemplate = (connectionId, template) => invoke("save_invo
 export const getInvoiceTemplates = (connectionId = null) => invoke("get_invoice_templates", {
   connectionId,
 });
+
+// Normalized commercial-to-accounting bridge. These commands never write to
+// native Sage commercial or accounting tables.
+export const initializeBridge = (id) => invoke("initialize_bridge", { id });
+export const listBridgeDocuments = (id, documentType = null) =>
+  invoke("list_bridge_documents", { id, documentType });
+export const createBridgeDocument = (id, invoice) =>
+  invoke("create_bridge_document", { id, invoice });
+export const validateBridgeDocument = (id, documentId, validatedBy = "SDB") =>
+  invoke("validate_bridge_document", { id, documentId, validatedBy });
+export const transformBridgeQuote = (id, quoteId) =>
+  invoke("transform_bridge_quote", { id, quoteId });
+export const generateBridgeInvoicePosting = (id, documentId) =>
+  invoke("generate_bridge_invoice_posting", { id, documentId });
+export const registerBridgePayment = (id, payment) =>
+  invoke("register_bridge_payment", { id, payment });
+export const generateBridgePaymentPosting = (id, paymentId) =>
+  invoke("generate_bridge_payment_posting", { id, paymentId });
+export const getBridgeAccountingConfiguration = (id) =>
+  invoke("get_bridge_accounting_configuration", { id });
+export const saveBridgeAccountingConfiguration = (id, configuration) =>
+  invoke("save_bridge_accounting_configuration", { id, configuration });
+export const getBridgeMasterData = (id) =>
+  invoke("get_bridge_master_data", { id });
+export const saveBridgeProductProfile = (id, profile) =>
+  invoke("save_bridge_product_profile", { id, profile });
+export const getBridgeManagementData = (id) =>
+  invoke("get_bridge_management_data", { id });
+export const saveBridgeManagementRecord = (id, entity, record) =>
+  invoke("save_bridge_management_record", { id, entity, record });
+export const deactivateBridgeManagementRecord = (id, entity, key) =>
+  invoke("deactivate_bridge_management_record", { id, entity, key });
+export const previewBridgeAccounting = (id, invoice) =>
+  invoke("preview_bridge_accounting", { id, invoice });
+export const listBridgePostingBatches = (id) =>
+  invoke("list_bridge_posting_batches", { id });
+export const prepareBridgeExport = (id, batchId, adapterType = "neutral") =>
+  invoke("prepare_bridge_export", { id, batchId, adapterType });

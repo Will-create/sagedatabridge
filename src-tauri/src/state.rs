@@ -269,7 +269,7 @@ fn default_account_sales() -> String {
     "701000".to_string()
 }
 fn default_account_vat() -> String {
-    "445710".to_string()
+    "443000".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -327,7 +327,7 @@ fn default_invoice_unit() -> String {
 }
 
 fn default_invoice_vat_rate() -> f64 {
-    20.0
+    18.0
 }
 
 fn default_invoice_currency() -> String {

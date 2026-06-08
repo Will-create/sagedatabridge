@@ -13,14 +13,62 @@ fn default_company_name() -> String {
 
 fn builtin_templates() -> Vec<InvoiceTemplate> {
     let presets = [
-        ("builtin-modern-clean", "Modern Clean", "#1f4f46", "#3b82f6", "modern-clean"),
-        ("builtin-modern-bold", "Modern Bold", "#172554", "#0f766e", "modern-bold"),
-        ("builtin-modern-soft", "Modern Soft", "#334155", "#14b8a6", "modern-soft"),
-        ("builtin-modern-borderless", "Modern Borderless", "#111827", "#64748b", "modern-borderless"),
-        ("builtin-modern-accent", "Modern Accent", "#7c2d12", "#0f766e", "modern-accent"),
-        ("builtin-modern-watermark", "Modern Watermark", "#1e293b", "#2563eb", "modern-watermark"),
-        ("builtin-modern-compact", "Modern Compact", "#0f172a", "#059669", "modern-compact"),
-        ("builtin-modern-premium", "Modern Premium", "#312e81", "#b45309", "modern-premium"),
+        (
+            "builtin-modern-clean",
+            "Modern Clean",
+            "#1f4f46",
+            "#3b82f6",
+            "modern-clean",
+        ),
+        (
+            "builtin-modern-bold",
+            "Modern Bold",
+            "#172554",
+            "#0f766e",
+            "modern-bold",
+        ),
+        (
+            "builtin-modern-soft",
+            "Modern Soft",
+            "#334155",
+            "#14b8a6",
+            "modern-soft",
+        ),
+        (
+            "builtin-modern-borderless",
+            "Modern Borderless",
+            "#111827",
+            "#64748b",
+            "modern-borderless",
+        ),
+        (
+            "builtin-modern-accent",
+            "Modern Accent",
+            "#7c2d12",
+            "#0f766e",
+            "modern-accent",
+        ),
+        (
+            "builtin-modern-watermark",
+            "Modern Watermark",
+            "#1e293b",
+            "#2563eb",
+            "modern-watermark",
+        ),
+        (
+            "builtin-modern-compact",
+            "Modern Compact",
+            "#0f172a",
+            "#059669",
+            "modern-compact",
+        ),
+        (
+            "builtin-modern-premium",
+            "Modern Premium",
+            "#312e81",
+            "#b45309",
+            "modern-premium",
+        ),
     ];
 
     presets
@@ -85,7 +133,12 @@ fn resolve_template(state: &AppState, template_id: &str) -> Result<InvoiceTempla
         .iter()
         .find(|template| template.id == target_id)
         .cloned()
-        .or_else(|| all_templates.iter().find(|template| template.id == "builtin-modern-clean").cloned())
+        .or_else(|| {
+            all_templates
+                .iter()
+                .find(|template| template.id == "builtin-modern-clean")
+                .cloned()
+        })
         .ok_or_else(|| format!("Invoice template '{}' not found", target_id))
 }
 
@@ -103,8 +156,16 @@ fn nl2br(value: &str) -> String {
 }
 
 fn format_currency(value: f64, devise: &str, locale: &str) -> String {
-    let currency = if devise.trim().is_empty() { "XOF" } else { devise.trim() };
-    let decimals = if currency.eq_ignore_ascii_case("XOF") { 0 } else { 2 };
+    let currency = if devise.trim().is_empty() {
+        "XOF"
+    } else {
+        devise.trim()
+    };
+    let decimals = if currency.eq_ignore_ascii_case("XOF") {
+        0
+    } else {
+        2
+    };
     let rounded = (value * 100.0).round() / 100.0;
     let negative = rounded.is_sign_negative();
     let abs = rounded.abs();
@@ -122,9 +183,21 @@ fn format_currency(value: f64, devise: &str, locale: &str) -> String {
         .rev()
         .collect::<String>();
     if decimals == 0 {
-        format!("{}{} {}", if negative { "-" } else { "" }, grouped, currency)
+        format!(
+            "{}{} {}",
+            if negative { "-" } else { "" },
+            grouped,
+            currency
+        )
     } else {
-        format!("{}{}{}{:02} {}", if negative { "-" } else { "" }, grouped, decimal_sep, minor, currency)
+        format!(
+            "{}{}{}{:02} {}",
+            if negative { "-" } else { "" },
+            grouped,
+            decimal_sep,
+            minor,
+            currency
+        )
     }
 }
 
@@ -134,8 +207,16 @@ fn format_number_fr(value: f64) -> String {
 }
 
 fn format_amount(value: f64, devise: &str, locale: &str) -> String {
-    let decimals = if devise.trim().eq_ignore_ascii_case("XOF") { 0 } else { 2 };
-    let rounded = if decimals == 0 { value.round() } else { (value * 100.0).round() / 100.0 };
+    let decimals = if devise.trim().eq_ignore_ascii_case("XOF") {
+        0
+    } else {
+        2
+    };
+    let rounded = if decimals == 0 {
+        value.round()
+    } else {
+        (value * 100.0).round() / 100.0
+    };
     let negative = rounded.is_sign_negative();
     let abs = rounded.abs();
     let major = abs.trunc() as i64;
@@ -154,7 +235,13 @@ fn format_amount(value: f64, devise: &str, locale: &str) -> String {
     if decimals == 0 {
         format!("{}{}", if negative { "-" } else { "" }, grouped)
     } else {
-        format!("{}{}{}{:02}", if negative { "-" } else { "" }, grouped, decimal_sep, minor)
+        format!(
+            "{}{}{}{:02}",
+            if negative { "-" } else { "" },
+            grouped,
+            decimal_sep,
+            minor
+        )
     }
 }
 
@@ -191,16 +278,19 @@ fn push_pdf_text(content: &mut String, x: f64, y: f64, size: f64, text: &str) {
 }
 
 fn push_pdf_line(content: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {
-    content.push_str(&format!(
-        "{:.2} {:.2} m {:.2} {:.2} l S\n",
-        x1, y1, x2, y2
-    ));
+    content.push_str(&format!("{:.2} {:.2} m {:.2} {:.2} l S\n", x1, y1, x2, y2));
 }
 
 fn new_pdf_page_header(invoice: &InvoiceHeader, page_no: usize, page_count_hint: usize) -> String {
     let mut content = String::new();
     content.push_str("0.2 w\n");
-    push_pdf_text(&mut content, 40.0, 805.0, 18.0, &invoice_title(&invoice.nature));
+    push_pdf_text(
+        &mut content,
+        40.0,
+        805.0,
+        18.0,
+        &invoice_title(&invoice.nature),
+    );
     push_pdf_text(
         &mut content,
         360.0,
@@ -210,7 +300,13 @@ fn new_pdf_page_header(invoice: &InvoiceHeader, page_no: usize, page_count_hint:
     );
     push_pdf_line(&mut content, 40.0, 790.0, 555.0, 790.0);
     if page_no == 1 {
-        push_pdf_text(&mut content, 40.0, 765.0, 11.0, &format!("Client: {}", invoice.tiers_nom));
+        push_pdf_text(
+            &mut content,
+            40.0,
+            765.0,
+            11.0,
+            &format!("Client: {}", invoice.tiers_nom),
+        );
         push_pdf_text(&mut content, 40.0, 750.0, 9.0, &invoice.tiers_adresse);
         push_pdf_text(
             &mut content,
@@ -223,8 +319,20 @@ fn new_pdf_page_header(invoice: &InvoiceHeader, page_no: usize, page_count_hint:
                 .collect::<Vec<_>>()
                 .join(" "),
         );
-        push_pdf_text(&mut content, 360.0, 765.0, 9.0, &format!("Reference: {}", invoice.reference));
-        push_pdf_text(&mut content, 360.0, 750.0, 9.0, &format!("Echeance: {}", invoice.date_echeance));
+        push_pdf_text(
+            &mut content,
+            360.0,
+            765.0,
+            9.0,
+            &format!("Reference: {}", invoice.reference),
+        );
+        push_pdf_text(
+            &mut content,
+            360.0,
+            750.0,
+            9.0,
+            &format!("Echeance: {}", invoice.date_echeance),
+        );
     }
     push_pdf_text(
         &mut content,
@@ -275,12 +383,48 @@ fn generate_invoice_pdf_bytes(invoice: &InvoiceHeader, locale: &str) -> Vec<u8> 
         push_pdf_text(&mut content, 42.0, y, 7.0, &line.ordre.to_string());
         push_pdf_text(&mut content, 62.0, y, 7.0, &line.article_code);
         push_pdf_text(&mut content, 120.0, y, 7.0, &label);
-        push_pdf_text(&mut content, 270.0, y, 7.0, &format_plain_number(line.quantite, locale));
-        push_pdf_text(&mut content, 305.0, y, 7.0, &pdf_amount(line.prix_ht, &invoice.devise, locale));
-        push_pdf_text(&mut content, 360.0, y, 7.0, &pdf_amount(line.montant_ht, &invoice.devise, locale));
-        push_pdf_text(&mut content, 420.0, y, 7.0, &pdf_amount(line.montant_tva, &invoice.devise, locale));
-        push_pdf_text(&mut content, 475.0, y, 7.0, &pdf_amount(line.montant_bic, &invoice.devise, locale));
-        push_pdf_text(&mut content, 520.0, y, 7.0, &pdf_amount(line.montant_ttc, &invoice.devise, locale));
+        push_pdf_text(
+            &mut content,
+            270.0,
+            y,
+            7.0,
+            &format_plain_number(line.quantite, locale),
+        );
+        push_pdf_text(
+            &mut content,
+            305.0,
+            y,
+            7.0,
+            &pdf_amount(line.prix_ht, &invoice.devise, locale),
+        );
+        push_pdf_text(
+            &mut content,
+            360.0,
+            y,
+            7.0,
+            &pdf_amount(line.montant_ht, &invoice.devise, locale),
+        );
+        push_pdf_text(
+            &mut content,
+            420.0,
+            y,
+            7.0,
+            &pdf_amount(line.montant_tva, &invoice.devise, locale),
+        );
+        push_pdf_text(
+            &mut content,
+            475.0,
+            y,
+            7.0,
+            &pdf_amount(line.montant_bic, &invoice.devise, locale),
+        );
+        push_pdf_text(
+            &mut content,
+            520.0,
+            y,
+            7.0,
+            &pdf_amount(line.montant_ttc, &invoice.devise, locale),
+        );
         y -= 16.0;
     }
 
@@ -292,30 +436,123 @@ fn generate_invoice_pdf_bytes(invoice: &InvoiceHeader, locale: &str) -> Vec<u8> 
     }
     push_pdf_line(&mut content, 340.0, y, 555.0, y);
     y -= 18.0;
-    push_pdf_text(&mut content, 360.0, y, 9.0, &format!("{} ({})", doc_label(locale, "line_discounts"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 9.0, &pdf_amount(invoice_line_discount_total(invoice), &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        9.0,
+        &format!(
+            "{} ({})",
+            doc_label(locale, "line_discounts"),
+            invoice.devise
+        ),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        9.0,
+        &pdf_amount(
+            invoice_line_discount_total(invoice),
+            &invoice.devise,
+            locale,
+        ),
+    );
     y -= 16.0;
-    push_pdf_text(&mut content, 360.0, y, 9.0, &format!("{} ({})", doc_label(locale, "global_discount"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 9.0, &pdf_amount(invoice_global_discount_total(invoice), &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        9.0,
+        &format!(
+            "{} ({})",
+            doc_label(locale, "global_discount"),
+            invoice.devise
+        ),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        9.0,
+        &pdf_amount(
+            invoice_global_discount_total(invoice),
+            &invoice.devise,
+            locale,
+        ),
+    );
     y -= 16.0;
-    push_pdf_text(&mut content, 360.0, y, 9.0, &format!("{} ({})", doc_label(locale, "total_ht"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 9.0, &pdf_amount(invoice.total_ht, &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        9.0,
+        &format!("{} ({})", doc_label(locale, "total_ht"), invoice.devise),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        9.0,
+        &pdf_amount(invoice.total_ht, &invoice.devise, locale),
+    );
     y -= 16.0;
-    push_pdf_text(&mut content, 360.0, y, 9.0, &format!("{} ({})", doc_label(locale, "total_vat"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 9.0, &pdf_amount(invoice.total_tva, &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        9.0,
+        &format!("{} ({})", doc_label(locale, "total_vat"), invoice.devise),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        9.0,
+        &pdf_amount(invoice.total_tva, &invoice.devise, locale),
+    );
     y -= 16.0;
-    push_pdf_text(&mut content, 360.0, y, 9.0, &format!("{} ({})", doc_label(locale, "total_bic"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 9.0, &pdf_amount(invoice.total_bic, &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        9.0,
+        &format!("{} ({})", doc_label(locale, "total_bic"), invoice.devise),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        9.0,
+        &pdf_amount(invoice.total_bic, &invoice.devise, locale),
+    );
     y -= 22.0;
-    push_pdf_text(&mut content, 360.0, y, 11.0, &format!("{} ({})", doc_label(locale, "total_ttc"), invoice.devise));
-    push_pdf_text(&mut content, 475.0, y, 11.0, &pdf_amount(invoice.total_ttc, &invoice.devise, locale));
+    push_pdf_text(
+        &mut content,
+        360.0,
+        y,
+        11.0,
+        &format!("{} ({})", doc_label(locale, "total_ttc"), invoice.devise),
+    );
+    push_pdf_text(
+        &mut content,
+        475.0,
+        y,
+        11.0,
+        &pdf_amount(invoice.total_ttc, &invoice.devise, locale),
+    );
     pages.push(content);
 
     let page_count = pages.len();
     let pages = pages
         .into_iter()
         .enumerate()
-        .map(|(index, page)| page.replace(&format!("Page {} / 999", index + 1), &format!("Page {} / {}", index + 1, page_count)))
+        .map(|(index, page)| {
+            page.replace(
+                &format!("Page {} / 999", index + 1),
+                &format!("Page {} / {}", index + 1, page_count),
+            )
+        })
         .collect::<Vec<_>>();
 
     let mut objects = Vec::<String>::new();
@@ -324,7 +561,10 @@ fn generate_invoice_pdf_bytes(invoice: &InvoiceHeader, locale: &str) -> Vec<u8> 
         .map(|index| format!("{} 0 R", 3 + index * 2))
         .collect::<Vec<_>>()
         .join(" ");
-    objects.push(format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, page_count));
+    objects.push(format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids, page_count
+    ));
     for (index, page) in pages.iter().enumerate() {
         let page_obj = 3 + index * 2;
         let content_obj = page_obj + 1;
@@ -346,7 +586,10 @@ fn generate_invoice_pdf_bytes(invoice: &InvoiceHeader, locale: &str) -> Vec<u8> 
         pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
     }
     let xref_offset = pdf.as_bytes().len();
-    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
     for offset in offsets {
         pdf.push_str(&format!("{:010} 00000 n \n", offset));
     }
@@ -525,7 +768,11 @@ fn invoice_line_discount_total(invoice: &InvoiceHeader) -> f64 {
 }
 
 fn invoice_global_discount_total(invoice: &InvoiceHeader) -> f64 {
-    let net_lines = invoice.lignes.iter().map(|line| line.montant_ht).sum::<f64>();
+    let net_lines = invoice
+        .lignes
+        .iter()
+        .map(|line| line.montant_ht)
+        .sum::<f64>();
     (net_lines - invoice.total_ht).max(0.0)
 }
 
@@ -600,40 +847,113 @@ fn common_replacements(
         ("__TIERS_SIRET__", escape_html(&invoice.tiers_siret)),
         ("__TIERS_TVA__", escape_html(&invoice.tiers_tva_intra)),
         ("__LINES_HTML__", lines_html(invoice, locale)),
-        ("__TOTAL_HT__", format_amount(invoice.total_ht, &invoice.devise, locale)),
-        ("__TOTAL_LINE_DISCOUNT__", format_amount(invoice_line_discount_total(invoice), &invoice.devise, locale)),
-        ("__TOTAL_GLOBAL_DISCOUNT__", format_amount(invoice_global_discount_total(invoice), &invoice.devise, locale)),
-        ("__TOTAL_TVA__", format_amount(invoice.total_tva, &invoice.devise, locale)),
-        ("__TOTAL_BIC__", format_amount(invoice.total_bic, &invoice.devise, locale)),
-        ("__TOTAL_TTC__", format_amount(invoice.total_ttc, &invoice.devise, locale)),
-        ("__TVA_BREAKDOWN_HTML__", tva_breakdown_html(invoice, locale)),
+        (
+            "__TOTAL_HT__",
+            format_amount(invoice.total_ht, &invoice.devise, locale),
+        ),
+        (
+            "__TOTAL_LINE_DISCOUNT__",
+            format_amount(
+                invoice_line_discount_total(invoice),
+                &invoice.devise,
+                locale,
+            ),
+        ),
+        (
+            "__TOTAL_GLOBAL_DISCOUNT__",
+            format_amount(
+                invoice_global_discount_total(invoice),
+                &invoice.devise,
+                locale,
+            ),
+        ),
+        (
+            "__TOTAL_TVA__",
+            format_amount(invoice.total_tva, &invoice.devise, locale),
+        ),
+        (
+            "__TOTAL_BIC__",
+            format_amount(invoice.total_bic, &invoice.devise, locale),
+        ),
+        (
+            "__TOTAL_TTC__",
+            format_amount(invoice.total_ttc, &invoice.devise, locale),
+        ),
+        (
+            "__TVA_BREAKDOWN_HTML__",
+            tva_breakdown_html(invoice, locale),
+        ),
         ("__NOTES__", nl2br(&invoice.notes)),
         ("__CONDITIONS__", nl2br(&conditions)),
         ("__FOOTER_TEXT__", nl2br(&template.footer_text)),
         ("__LEGAL_MENTIONS__", nl2br(&template.legal_mentions)),
         ("__BANK_HTML__", bank_html(template)),
         ("__MENTION_TVA__", nl2br(&template.mention_tva)),
-        ("__HTML_LANG__", if locale.starts_with("fr") { "fr" } else { "en" }.to_string()),
+        (
+            "__HTML_LANG__",
+            if locale.starts_with("fr") { "fr" } else { "en" }.to_string(),
+        ),
         ("__STATUT_BADGE_HTML__", statut_badge_html(invoice)),
         ("__WATERMARK_HTML__", watermark_html(invoice)),
         ("__LABEL_CLIENT__", doc_label(locale, "client").to_string()),
-        ("__LABEL_DOCUMENT__", doc_label(locale, "document").to_string()),
+        (
+            "__LABEL_DOCUMENT__",
+            doc_label(locale, "document").to_string(),
+        ),
         ("__LABEL_DATE__", doc_label(locale, "date").to_string()),
         ("__LABEL_DUE__", doc_label(locale, "due").to_string()),
         ("__LABEL_ITEM__", doc_label(locale, "item").to_string()),
         ("__LABEL_LABEL__", doc_label(locale, "label").to_string()),
         ("__LABEL_QTY__", doc_label(locale, "qty").to_string()),
         ("__LABEL_UNIT__", doc_label(locale, "unit").to_string()),
-        ("__LABEL_UNIT_PRICE__", format!("{} ({})", doc_label(locale, "unit_price"), invoice.devise)),
-        ("__LABEL_DISCOUNT__", doc_label(locale, "discount").to_string()),
-        ("__LABEL_SUBTOTAL__", doc_label(locale, "subtotal").to_string()),
-        ("__LABEL_LINE_DISCOUNTS__", format!("{} ({})", doc_label(locale, "line_discounts"), invoice.devise)),
-        ("__LABEL_GLOBAL_DISCOUNT__", format!("{} ({})", doc_label(locale, "global_discount"), invoice.devise)),
-        ("__LABEL_VAT_DETAIL__", doc_label(locale, "vat_detail").to_string()),
-        ("__LABEL_TOTAL_HT__", format!("{} ({})", doc_label(locale, "total_ht"), invoice.devise)),
-        ("__LABEL_TOTAL_VAT__", format!("{} ({})", doc_label(locale, "total_vat"), invoice.devise)),
-        ("__LABEL_TOTAL_BIC__", format!("{} ({})", doc_label(locale, "total_bic"), invoice.devise)),
-        ("__LABEL_TOTAL_TTC__", format!("{} ({})", doc_label(locale, "total_ttc"), invoice.devise)),
+        (
+            "__LABEL_UNIT_PRICE__",
+            format!("{} ({})", doc_label(locale, "unit_price"), invoice.devise),
+        ),
+        (
+            "__LABEL_DISCOUNT__",
+            doc_label(locale, "discount").to_string(),
+        ),
+        (
+            "__LABEL_SUBTOTAL__",
+            doc_label(locale, "subtotal").to_string(),
+        ),
+        (
+            "__LABEL_LINE_DISCOUNTS__",
+            format!(
+                "{} ({})",
+                doc_label(locale, "line_discounts"),
+                invoice.devise
+            ),
+        ),
+        (
+            "__LABEL_GLOBAL_DISCOUNT__",
+            format!(
+                "{} ({})",
+                doc_label(locale, "global_discount"),
+                invoice.devise
+            ),
+        ),
+        (
+            "__LABEL_VAT_DETAIL__",
+            doc_label(locale, "vat_detail").to_string(),
+        ),
+        (
+            "__LABEL_TOTAL_HT__",
+            format!("{} ({})", doc_label(locale, "total_ht"), invoice.devise),
+        ),
+        (
+            "__LABEL_TOTAL_VAT__",
+            format!("{} ({})", doc_label(locale, "total_vat"), invoice.devise),
+        ),
+        (
+            "__LABEL_TOTAL_BIC__",
+            format!("{} ({})", doc_label(locale, "total_bic"), invoice.devise),
+        ),
+        (
+            "__LABEL_TOTAL_TTC__",
+            format!("{} ({})", doc_label(locale, "total_ttc"), invoice.devise),
+        ),
         ("__LABEL_NOTES__", doc_label(locale, "notes").to_string()),
         ("__LABEL_TERMS__", doc_label(locale, "terms").to_string()),
     ]
@@ -1469,7 +1789,11 @@ pub fn render_invoice_html(
     locale: Option<String>,
 ) -> Result<String, String> {
     let template = resolve_template(&state, &template_id)?;
-    Ok(render_invoice_html_with_template(&invoice, &template, locale.as_deref().unwrap_or("fr")))
+    Ok(render_invoice_html_with_template(
+        &invoice,
+        &template,
+        locale.as_deref().unwrap_or("fr"),
+    ))
 }
 
 #[tauri::command]
@@ -1478,7 +1802,11 @@ pub fn render_invoice_html_preview(
     template: InvoiceTemplate,
     locale: Option<String>,
 ) -> Result<String, String> {
-    Ok(render_invoice_html_with_template(&invoice, &template, locale.as_deref().unwrap_or("fr")))
+    Ok(render_invoice_html_with_template(
+        &invoice,
+        &template,
+        locale.as_deref().unwrap_or("fr"),
+    ))
 }
 
 #[tauri::command]

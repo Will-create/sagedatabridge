@@ -60,6 +60,16 @@ pub struct ArticleSummary {
     pub tax_exempt: bool,
     #[serde(default)]
     pub custom_tax_rules: String,
+    #[serde(default)]
+    pub product_family_code: String,
+    #[serde(default)]
+    pub accounting_category_code: String,
+    #[serde(default)]
+    pub tax_code: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
