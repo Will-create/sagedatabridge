@@ -4,12 +4,16 @@ import { useT } from "../i18n";
 import QueryStudioModal from "./QueryStudioModal";
 import SchemaMapModal from "./SchemaMapModal";
 import VisualizationModal from "./VisualizationModal";
+import { useExportJobs } from "../exportJobs";
 
 function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToast }) {
   const { t } = useT();
   const [format, setFormat] = useState("xlsx");
   const [selectedCols, setSelectedCols] = useState([]);
   const [exporting, setExporting] = useState(false);
+  const [jobId, setJobId] = useState(null);
+  const { jobs, canStartExport } = useExportJobs();
+  const job = jobs.find((item) => item.id === jobId);
 
   const toggleCol = (name) =>
     setSelectedCols((prev) => prev.includes(name) ? prev.filter((c) => c !== name) : [...prev, name]);
@@ -22,7 +26,10 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
       if (format === "csv")  path = await exportToCsv(activeConn, activeTable.schema, activeTable.name, filters, selectedCols);
       if (format === "json") path = await exportToJson(activeConn, activeTable.schema, activeTable.name, filters, selectedCols);
       if (format === "sql")  path = await exportToSql(activeConn, activeTable.schema, activeTable.name, filters);
-      if (path) { onToast({ type:"success", msg: t("export_ok", path.split(/[\\/]/).pop()) }); onClose(); }
+      if (path) {
+        setJobId(path.id);
+        onToast({ type:"success", msg: `Export queued: ${path.label}` });
+      }
     } catch (err) { onToast({ type:"error", msg: err.toString() }); }
     finally { setExporting(false); }
   };
@@ -97,11 +104,17 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
             background:"var(--bg-input)", borderRadius:"var(--r-sm)", border:"1px solid var(--border)" }}>
             {t("export_note")}
           </div>
+          {job ? (
+            <div className="dashboard-progress">
+              <div className="dashboard-progress-track"><div className="dashboard-progress-fill" style={{ width: `${job.percent || 0}%` }} /></div>
+              <div className="dashboard-progress-text">{job.phase} · {job.percent || 0}% · {Number(job.processed_rows || 0).toLocaleString()} / {Number(job.total_rows || 0).toLocaleString()}</div>
+            </div>
+          ) : null}
         </div>
 
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onClose}>{t("cancel")}</button>
-          <button className="btn btn-accent" onClick={handleExport} disabled={exporting}>
+          <button className="btn btn-accent" onClick={handleExport} disabled={exporting || !canStartExport || ["queued", "running"].includes(job?.status)}>
             {exporting
               ? <><span className="spinner" style={{width:12,height:12}} /> {t("export_ing")}</>
               : t("export_btn", format)}
@@ -130,10 +143,14 @@ export default function Toolbar({
   onToggleTables,
 }) {
   const { t } = useT();
+  const { activeJobs } = useExportJobs();
   const [showExport, setShowExport] = useState(false);
   const [showSqlStudio, setShowSqlStudio] = useState(false);
   const [showSchemaMap, setShowSchemaMap] = useState(false);
   const [showViz, setShowViz] = useState(false);
+  const tableExportActive = activeTable
+    ? activeJobs.some((job) => job.label?.startsWith(`${activeTable.schema}.${activeTable.name} (`))
+    : false;
 
   return (
     <>
@@ -225,7 +242,7 @@ export default function Toolbar({
           {t("toolbar_visualize")}
         </button>
 
-        <button className="btn btn-accent" onClick={() => setShowExport(true)} disabled={!activeTable || loading}>
+        <button className="btn btn-accent" onClick={() => setShowExport(true)} disabled={!activeTable || loading || tableExportActive}>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
             <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />

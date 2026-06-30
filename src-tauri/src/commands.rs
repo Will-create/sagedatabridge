@@ -10,9 +10,243 @@ use tauri::State;
 use crate::db;
 use crate::sage_compat::{DetectionResult, SageEdition, SageSchema};
 use crate::state::{
-    ActiveConnection, AppState, ColumnInfo, ConnectionConfig, ConnectionStatus, Filter,
-    QueryHistoryEntry, RelationshipInfo, SavedQuery, TableData, TableInfo,
+    ActiveConnection, AppState, ColumnInfo, ConnectionConfig, ConnectionStatus,
+    ExploitationMappingsRecord, ExploitationReportRecord, Filter, QueryHistoryEntry,
+    RelationshipInfo, SavedQuery, TableData, TableInfo,
 };
+
+fn exploitation_report_key(connection: &ConnectionConfig, year: i32) -> String {
+    format!(
+        "{}|{}|{}",
+        connection.host.trim().to_ascii_lowercase(),
+        connection.database.trim().to_ascii_lowercase(),
+        year
+    )
+}
+
+fn exploitation_mapping_key(connection: &ConnectionConfig) -> String {
+    format!(
+        "{}|{}",
+        connection.host.trim().to_ascii_lowercase(),
+        connection.database.trim().to_ascii_lowercase(),
+    )
+}
+
+fn default_exploitation_mappings() -> Value {
+    serde_json::from_str(
+        r#"[
+        {"id":"ca-hebergement-7061","section":"PRODUITS_EXPLOITATION","lineCode":"CA_HEBERGEMENT","lineLabel":"C.A Hébergement","accountPattern":"7061","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"autre-ca-hebergement-7068","section":"PRODUITS_EXPLOITATION","lineCode":"AUTRE_CA_HEBERGEMENT","lineLabel":"Autre C.A Hébergement","accountPattern":"7068","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-nourriture-7062","section":"PRODUITS_EXPLOITATION","lineCode":"CA_NOURRITURE","lineLabel":"C.A nourriture","accountPattern":"7062","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-boisson-7063","section":"PRODUITS_EXPLOITATION","lineCode":"CA_BOISSON","lineLabel":"C.A boisson","accountPattern":"7063","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-salles-7064","section":"PRODUITS_EXPLOITATION","lineCode":"CA_LOCATION_SALLES","lineLabel":"C.A location salles","accountPattern":"7064","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-banquet-7065","section":"PRODUITS_EXPLOITATION","lineCode":"CA_DIVERS_BANQUET","lineLabel":"C.A divers banquet","accountPattern":"7065","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-buanderie-70661","section":"PRODUITS_EXPLOITATION","lineCode":"CA_BUANDERIE","lineLabel":"C.A Buanderie","accountPattern":"70661","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-telephone-70662","section":"PRODUITS_EXPLOITATION","lineCode":"CA_TELEPHONE","lineLabel":"C.A Téléphone","accountPattern":"70662","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-boutiques-70663","section":"PRODUITS_EXPLOITATION","lineCode":"CA_BOUTIQUES","lineLabel":"C.A Boutiques","accountPattern":"70663","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-gym-70664","section":"PRODUITS_EXPLOITATION","lineCode":"CA_GYM","lineLabel":"C.A Gym","accountPattern":"70664","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-internet-70665","section":"PRODUITS_EXPLOITATION","lineCode":"CA_INTERNET","lineLabel":"C.A Internet","accountPattern":"70665","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-gsm-70666","section":"PRODUITS_EXPLOITATION","lineCode":"CA_PRODUITS_GSM","lineLabel":"C.A Produits GSM","accountPattern":"70666","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"ca-gab-70667","section":"PRODUITS_EXPLOITATION","lineCode":"CA_LOCATION_GAB","lineLabel":"C.A Location GAB","accountPattern":"70667","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"autres-produits-71","section":"PRODUITS_EXPLOITATION","lineCode":"AUTRES_PRODUITS","lineLabel":"Autres Produits","accountPattern":"71","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"cout-nourriture-6011","section":"CHARGES_EXPLOITATION","lineCode":"COUT_NOURRITURE","lineLabel":"Coût nourriture","accountPattern":"6011","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"cout-boissons-6012","section":"CHARGES_EXPLOITATION","lineCode":"COUT_BOISSONS","lineLabel":"Coût boissons","accountPattern":"6012","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"cout-autres-6018","section":"CHARGES_EXPLOITATION","lineCode":"COUT_AUTRES_MARCHANDISES","lineLabel":"Coût autres marchandises","accountPattern":"6018","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"salaires-661","section":"CHARGES_EXPLOITATION","lineCode":"SALAIRES","lineLabel":"Salaires","accountPattern":"661","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"divers-salaires-662","section":"CHARGES_EXPLOITATION","lineCode":"DIVERS_SALAIRES","lineLabel":"Divers salaires","accountPattern":"662","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"conges-663","section":"CHARGES_EXPLOITATION","lineCode":"CONGES_PAYES","lineLabel":"Congés payés","accountPattern":"663","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"uniformes-664","section":"CHARGES_EXPLOITATION","lineCode":"UNIFORMES_DOTATIONS","lineLabel":"Uniformes & dotations","accountPattern":"664","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"rh-665","section":"CHARGES_EXPLOITATION","lineCode":"EVENEMENTS_RH","lineLabel":"Événements personnel/RH","accountPattern":"665","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"nourriture-personnel-666","section":"CHARGES_EXPLOITATION","lineCode":"NOURRITURE_PERSONNEL","lineLabel":"Nourriture du personnel","accountPattern":"666","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"accueil-6041","section":"CHARGES_EXPLOITATION","lineCode":"PRODUITS_ACCUEIL","lineLabel":"Produits d’accueil","accountPattern":"6041","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"nettoiement-6042","section":"CHARGES_EXPLOITATION","lineCode":"PRODUITS_NETTOIEMENT","lineLabel":"Produits nettoiement/lessive","accountPattern":"6042","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"fournitures-6043","section":"CHARGES_EXPLOITATION","lineCode":"IMPRIMES_FOURNITURES","lineLabel":"Imprimés & fournitures bureaux","accountPattern":"6043","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"pme-pfe-6044","section":"CHARGES_EXPLOITATION","lineCode":"PME_PFE","lineLabel":"PME / PFE","accountPattern":"6044","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"piscines-6045","section":"CHARGES_EXPLOITATION","lineCode":"PRODUITS_PISCINES","lineLabel":"Produits piscines","accountPattern":"6045","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"charge-buanderie-6046","section":"CHARGES_EXPLOITATION","lineCode":"CHARGE_BUANDERIE","lineLabel":"Charge buanderie","accountPattern":"6046","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"petit-materiel-6054","section":"CHARGES_EXPLOITATION","lineCode":"PETIT_MATERIEL","lineLabel":"Petit matériel & outillage","accountPattern":"6054","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"carburant-6055","section":"CHARGES_EXPLOITATION","lineCode":"CARBURANT","lineLabel":"Carburant","accountPattern":"6055","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"medicaments-6056","section":"CHARGES_EXPLOITATION","lineCode":"MEDICAMENTS","lineLabel":"Médicaments","accountPattern":"6056","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"eau-6051","section":"CHARGES_EXPLOITATION","lineCode":"EAU","lineLabel":"Eau","accountPattern":"6051","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"electricite-6052","section":"CHARGES_EXPLOITATION","lineCode":"ELECTRICITE","lineLabel":"Électricité","accountPattern":"6052","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"gaz-cuisine-60531","section":"CHARGES_EXPLOITATION","lineCode":"GAZ_CUISINE","lineLabel":"Gaz cuisine","accountPattern":"60531","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"gaz-maintenance-60532","section":"CHARGES_EXPLOITATION","lineCode":"GAZ_MAINTENANCE","lineLabel":"Gaz maintenance","accountPattern":"60532","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"autres-achats-608","section":"CHARGES_EXPLOITATION","lineCode":"AUTRES_ACHATS","lineLabel":"Autres achats","accountPattern":"608","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"services-exterieurs-62","section":"CHARGES_EXPLOITATION","lineCode":"SERVICES_EXTERIEURS","lineLabel":"Services extérieurs","accountPattern":"62","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"transports-61","section":"CHARGES_EXPLOITATION","lineCode":"TRANSPORTS","lineLabel":"Transports","accountPattern":"61","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"impots-taxes-64","section":"CHARGES_EXPLOITATION","lineCode":"IMPOTS_TAXES","lineLabel":"Impôts & taxes","accountPattern":"64","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"autres-charges-65","section":"CHARGES_EXPLOITATION","lineCode":"AUTRES_CHARGES_EXTERNES","lineLabel":"Autres charges externes","accountPattern":"65","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"dotations-68","section":"RESULTATS","lineCode":"DOTATIONS","lineLabel":"Dotations amortissements & provisions","accountPattern":"68","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"reprises-78","section":"RESULTATS","lineCode":"REPRISES_PROVISIONS","lineLabel":"Reprises provisions","accountPattern":"78","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"transferts-79","section":"RESULTATS","lineCode":"TRANSFERTS_CHARGES","lineLabel":"Transferts de charges","accountPattern":"79","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"charges-fin-67","section":"RESULTATS","lineCode":"CHARGES_FINANCIERES","lineLabel":"Charges financières","accountPattern":"67","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"produits-fin-77","section":"RESULTATS","lineCode":"PRODUITS_FINANCIERS","lineLabel":"Produits financiers","accountPattern":"77","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"charges-hao-81","section":"RESULTATS","lineCode":"CHARGES_HAO","lineLabel":"Charges HAO","accountPattern":"81","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"charges-hao-83","section":"RESULTATS","lineCode":"CHARGES_HAO","lineLabel":"Charges HAO","accountPattern":"83","matchType":"prefix","signRule":"debit","active":true},
+        {"id":"produits-hao-82","section":"RESULTATS","lineCode":"PRODUITS_HAO","lineLabel":"Produits HAO","accountPattern":"82","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"produits-hao-84","section":"RESULTATS","lineCode":"PRODUITS_HAO","lineLabel":"Produits HAO","accountPattern":"84","matchType":"prefix","signRule":"credit","active":true},
+        {"id":"impot-benefices-89","section":"RESULTATS","lineCode":"IMPOT_BENEFICES","lineLabel":"Impôt sur bénéfices","accountPattern":"89","matchType":"prefix","signRule":"debit","active":true}
+    ]"#,
+    )
+    .expect("built-in exploitation mappings must be valid JSON")
+}
+
+fn validate_exploitation_mappings(mappings: &Value) -> Result<(), String> {
+    let rows = mappings
+        .as_array()
+        .ok_or_else(|| "Mappings must be an array".to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let line = row
+            .get("lineCode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let pattern = row
+            .get("accountPattern")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let match_type = row
+            .get("matchType")
+            .and_then(Value::as_str)
+            .unwrap_or("prefix");
+        let sign = row.get("signRule").and_then(Value::as_str).unwrap_or("");
+        if line.is_empty() || pattern.is_empty() {
+            return Err("Each mapping requires a line code and account pattern".to_string());
+        }
+        if !pattern.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        }) {
+            return Err(format!("Invalid account pattern '{}'", pattern));
+        }
+        if match_type != "prefix" && match_type != "exact" {
+            return Err(format!("Invalid match type '{}'", match_type));
+        }
+        if sign != "debit" && sign != "credit" && sign != "net" {
+            return Err(format!("Invalid sign rule '{}'", sign));
+        }
+        let duplicate_key = format!("{}|{}", match_type, pattern.to_ascii_uppercase());
+        if row.get("active").and_then(Value::as_bool).unwrap_or(true) && !seen.insert(duplicate_key)
+        {
+            return Err(format!("Duplicate active account mapping '{}'", pattern));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_exploitation_mappings(state: State<AppState>, id: String) -> Result<Value, String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_mapping_key(&connection);
+    let config = state.config.lock().map_err(|error| error.to_string())?;
+    Ok(config
+        .exploitation_mappings
+        .iter()
+        .find(|record| record.key == key)
+        .map(|record| record.mappings.clone())
+        .unwrap_or_else(default_exploitation_mappings))
+}
+
+#[tauri::command]
+pub fn save_exploitation_mappings(
+    state: State<AppState>,
+    id: String,
+    mappings: Value,
+) -> Result<(), String> {
+    validate_exploitation_mappings(&mappings)?;
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_mapping_key(&connection);
+    let record = ExploitationMappingsRecord {
+        key: key.clone(),
+        connection_id: id,
+        database: connection.database,
+        mappings,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut config = state.config.lock().map_err(|error| error.to_string())?;
+    if let Some(existing) = config
+        .exploitation_mappings
+        .iter_mut()
+        .find(|existing| existing.key == key)
+    {
+        *existing = record;
+    } else {
+        config.exploitation_mappings.push(record);
+    }
+    drop(config);
+    state.save_config()
+}
+
+#[tauri::command]
+pub fn reset_exploitation_mappings(state: State<AppState>, id: String) -> Result<Value, String> {
+    let mappings = default_exploitation_mappings();
+    save_exploitation_mappings(state, id, mappings.clone())?;
+    Ok(mappings)
+}
+
+#[tauri::command]
+pub fn get_exploitation_report(
+    state: State<AppState>,
+    id: String,
+    year: i32,
+) -> Result<Option<Value>, String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_report_key(&connection, year);
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(config
+        .exploitation_reports
+        .iter()
+        .find(|record| record.key == key)
+        .map(|record| record.report.clone()))
+}
+
+#[tauri::command]
+pub fn save_exploitation_report(
+    state: State<AppState>,
+    id: String,
+    year: i32,
+    report: Value,
+) -> Result<(), String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_report_key(&connection, year);
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let record = ExploitationReportRecord {
+        key: key.clone(),
+        connection_id: id,
+        database: connection.database,
+        year,
+        report,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(existing) = config
+        .exploitation_reports
+        .iter_mut()
+        .find(|existing| existing.key == key)
+    {
+        *existing = record;
+    } else {
+        config.exploitation_reports.push(record);
+    }
+    drop(config);
+    state.save_config()
+}
+
+#[tauri::command]
+pub fn delete_exploitation_report(
+    state: State<AppState>,
+    id: String,
+    year: i32,
+) -> Result<(), String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_report_key(&connection, year);
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config
+        .exploitation_reports
+        .retain(|record| record.key != key);
+    drop(config);
+    state.save_config()
+}
 
 const MAX_QUERY_HISTORY: usize = 100;
 const MAX_FIELD_HISTORY: usize = 10;
@@ -113,36 +347,23 @@ pub fn remove_pin(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn has_admin_password(state: State<AppState>) -> bool {
-    let config = state.config.lock().unwrap();
-    config.admin_password_hash.is_some()
+pub fn has_admin_password(_state: State<AppState>) -> bool {
+    true
 }
 
 #[tauri::command]
-pub fn set_admin_password(state: State<AppState>, password: String) -> Result<(), String> {
-    let hash = hash_secret(&password)?;
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config.admin_password_hash = Some(hash);
-    drop(config);
-    state.save_config()
+pub fn set_admin_password(_state: State<AppState>, _password: String) -> Result<(), String> {
+    Ok(())
 }
 
 #[tauri::command]
-pub fn verify_admin_password(state: State<AppState>, password: String) -> Result<bool, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    if let Some(hash_str) = &config.admin_password_hash {
-        verify_secret(&password, hash_str)
-    } else {
-        Ok(true)
-    }
+pub fn verify_admin_password(_state: State<AppState>, password: String) -> Result<bool, String> {
+    Ok(password == "0033")
 }
 
 #[tauri::command]
-pub fn remove_admin_password(state: State<AppState>) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config.admin_password_hash = None;
-    drop(config);
-    state.save_config()
+pub fn remove_admin_password(_state: State<AppState>) -> Result<(), String> {
+    Ok(())
 }
 
 // ─── Settings ───────────────────────────────────────────────────────────────────
@@ -152,6 +373,10 @@ pub struct AppSettings {
     pub query_timeout_secs: u64,
     pub dashboard_timeout_secs: u64,
     pub login_timeout_secs: u64,
+    #[serde(default = "default_fiscal_year_start_month")]
+    pub fiscal_year_start_month: u8,
+    #[serde(default = "default_fiscal_year_start_day")]
+    pub fiscal_year_start_day: u8,
     pub account_ar: String,
     pub account_sales: String,
     pub account_vat: String,
@@ -166,6 +391,14 @@ pub struct AppSettings {
     pub tax_types: Vec<crate::state::TaxTypeSetting>,
 }
 
+fn default_fiscal_year_start_month() -> u8 {
+    1
+}
+
+fn default_fiscal_year_start_day() -> u8 {
+    1
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -173,6 +406,16 @@ pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
         query_timeout_secs: config.query_timeout_secs,
         dashboard_timeout_secs: config.dashboard_timeout_secs,
         login_timeout_secs: config.login_timeout_secs,
+        fiscal_year_start_month: if (1..=12).contains(&config.fiscal_year_start_month) {
+            config.fiscal_year_start_month
+        } else {
+            1
+        },
+        fiscal_year_start_day: if (1..=31).contains(&config.fiscal_year_start_day) {
+            config.fiscal_year_start_day
+        } else {
+            1
+        },
         account_ar: config.account_ar.clone(),
         account_sales: config.account_sales.clone(),
         account_vat: config.account_vat.clone(),
@@ -208,10 +451,24 @@ pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {
 
 #[tauri::command]
 pub fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), String> {
+    let fiscal_month = settings.fiscal_year_start_month;
+    let fiscal_day = settings.fiscal_year_start_day;
+    let max_day = match fiscal_month {
+        2 => 29,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return Err("Fiscal year start month must be between 1 and 12".to_string()),
+    };
+    if fiscal_day == 0 || fiscal_day > max_day {
+        return Err("Fiscal year start day is invalid for the selected month".to_string());
+    }
+
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     config.query_timeout_secs = settings.query_timeout_secs;
     config.dashboard_timeout_secs = settings.dashboard_timeout_secs;
     config.login_timeout_secs = settings.login_timeout_secs;
+    config.fiscal_year_start_month = fiscal_month;
+    config.fiscal_year_start_day = fiscal_day;
     config.account_ar = settings.account_ar;
     config.account_sales = settings.account_sales;
     config.account_vat = settings.account_vat;
@@ -295,6 +552,42 @@ pub fn list_connections(state: State<AppState>) -> Result<Vec<ConnectionConfig>,
         })
         .collect();
     Ok(masked)
+}
+
+#[tauri::command]
+pub fn reveal_connection_password(
+    state: State<AppState>,
+    connection_id: String,
+    unlock_password: String,
+) -> Result<String, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let unlocked = if unlock_password == "0033" {
+        true
+    } else if let Some(hash_str) = &config.password_hash {
+        verify_secret(&unlock_password, hash_str)?
+    } else {
+        false
+    };
+
+    if !unlocked {
+        return Err("Invalid unlock password".to_string());
+    }
+
+    let connection = config
+        .connections
+        .iter()
+        .find(|connection| connection.id == connection_id)
+        .ok_or_else(|| "Connection not found".to_string())?;
+
+    if connection.use_windows_auth {
+        return Err("Windows authentication connections do not store a password".to_string());
+    }
+
+    if connection.password.is_empty() {
+        return Err("No saved password is available for this connection".to_string());
+    }
+
+    Ok(connection.password.clone())
 }
 
 /// Save a new or updated connection

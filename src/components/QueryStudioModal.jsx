@@ -9,8 +9,10 @@ import {
 } from "../hooks/useTauri";
 import { useT } from "../i18n";
 import DataGrid from "./DataGrid";
+import { useExportJobs } from "../exportJobs";
 
 const DEFAULT_PAGE_SIZE = 100;
+const SQL_RESULT_PAGE_SIZES = [50, 100, 250, 500, 1000, 10000, 20000, 0];
 
 function isRiskySql(sql) {
   const trimmed = sql.trim().toUpperCase();
@@ -62,6 +64,7 @@ function timestampForFilename() {
 
 export default function QueryStudioModal({ activeConn, activeTable, onClose, onToast }) {
   const { t, lang } = useT();
+  const { beginLocalJob, updateLocalJob } = useExportJobs();
   const [savedQueries, setSavedQueries] = useState([]);
   const [history, setHistory] = useState([]);
   const [queryName, setQueryName] = useState("");
@@ -73,6 +76,7 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
   const [elapsed, setElapsed] = useState(null);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [exportingCsv, setExportingCsv] = useState(false);
   const locale = lang === "fr" ? "fr-FR" : "en-US";
 
   const refreshLibrary = async () => {
@@ -96,14 +100,15 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
 
   const pagedResults = useMemo(() => {
     if (!results) return null;
-    const start = page * pageSize;
-    const end = start + pageSize;
+    const effectivePageSize = pageSize === 0 ? Math.max(results.rows.length, 1) : pageSize;
+    const start = page * effectivePageSize;
+    const end = start + effectivePageSize;
     return {
       ...results,
       rows: results.rows.slice(start, end),
       total_count: results.total_count,
       page,
-      page_size: pageSize,
+      page_size: effectivePageSize,
     };
   }, [page, pageSize, results]);
 
@@ -206,12 +211,25 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
     }
   };
 
-  const exportResultsCsv = () => {
+  const exportResultsCsv = async () => {
     if (!results) return;
-    const csv = tableToCsv(results.columns, results.rows);
-    const filename = `sql-results-${timestampForFilename()}.csv`;
-    downloadTextFile(`\uFEFF${csv}`, filename, "text/csv;charset=utf-8");
-    onToast({ type: "success", msg: t("sql_export_csv_ok", results.rows.length.toLocaleString(locale)) });
+    const tracked = beginLocalJob("Query results CSV", "query-csv", `query-csv:${activeConn}:${sql}`);
+    if (tracked.existing) return;
+    setExportingCsv(true);
+    try {
+      updateLocalJob(tracked.job.id, { phase: "writing CSV", percent: 50, total_rows: results.rows.length });
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      const csv = tableToCsv(results.columns, results.rows);
+      const filename = `sql-results-${timestampForFilename()}.csv`;
+      downloadTextFile(`\uFEFF${csv}`, filename, "text/csv;charset=utf-8");
+      updateLocalJob(tracked.job.id, { status: "completed", phase: "completed", percent: 100, processed_rows: results.rows.length, finished_at: new Date().toISOString() });
+      onToast({ type: "success", msg: t("sql_export_csv_ok", results.rows.length.toLocaleString(locale)) });
+    } catch (error) {
+      updateLocalJob(tracked.job.id, { status: "failed", phase: "failed", error: String(error), finished_at: new Date().toISOString() });
+      onToast({ type: "error", msg: String(error) });
+    } finally {
+      setExportingCsv(false);
+    }
   };
 
   return (
@@ -331,7 +349,7 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
                   <button className="btn btn-ghost btn-sm" onClick={() => copyResults("all")} disabled={!results || running}>
                     {t("sql_copy_all")}
                   </button>
-                  <button className="btn btn-ghost btn-sm" onClick={exportResultsCsv} disabled={!results || running}>
+                  <button className="btn btn-ghost btn-sm" onClick={exportResultsCsv} disabled={!results || running || exportingCsv}>
                     {t("sql_export_csv")}
                   </button>
                 </div>
@@ -350,6 +368,7 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
                     loading={running}
                     page={page}
                     pageSize={pageSize}
+                    pageSizeOptions={SQL_RESULT_PAGE_SIZES}
                     onPageChange={setPage}
                     onPageSizeChange={(size) => { setPageSize(size); setPage(0); }}
                   />

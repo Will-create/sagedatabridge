@@ -1,8 +1,7 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/api/dialog";
-import { writeBinaryFile } from "@tauri-apps/api/fs";
-import * as XLSX from "xlsx";
-import { createInvokeWithTimeout, withTimeout } from "../utils/tauriTimeout";
+import { createInvokeWithTimeout, secondsToTimeoutMs, withTimeout } from "../utils/tauriTimeout";
 
 // Re-export tauri invoke for easy mocking/testing
 export { invoke };
@@ -10,11 +9,26 @@ export { invoke };
 const CONNECTION_TIMEOUT_MS = 75_000;
 const METADATA_TIMEOUT_MS = 75_000;
 const TABLE_DATA_TIMEOUT_MS = 90_000;
-const DASHBOARD_TIMEOUT_MS = 100_000;
+const DEFAULT_DASHBOARD_TIMEOUT_MS = 90_000;
 const INVOICE_TIMEOUT_MS = 75_000;
 const SEARCH_TIMEOUT_MS = 10_000;
-const EXPORT_TIMEOUT_MS = 180_000;
+const LARGE_EXPORT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+export const DASHBOARD_PREVIEW_ROW_LIMIT = 5_000;
 const invokeWithTimeout = createInvokeWithTimeout(invoke);
+let dashboardTimeoutMs = DEFAULT_DASHBOARD_TIMEOUT_MS;
+
+export function configureTauriTimeouts(settings = {}) {
+  dashboardTimeoutMs = secondsToTimeoutMs(
+    settings.dashboard_timeout_secs,
+    DEFAULT_DASHBOARD_TIMEOUT_MS,
+  );
+}
+
+function getDashboardTimeoutMs(timeoutMs = null) {
+  return Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? Number(timeoutMs)
+    : dashboardTimeoutMs;
+}
 
 function logInvoiceRequest(scope, payload) {
   console.debug("[invoice]", scope, "request", payload);
@@ -59,8 +73,14 @@ export const removeAdminPassword = () => invoke("remove_admin_password");
 
 // ─── Settings ───────────────────────────────────────────────────────────────────
 
-export const getSettings = () => invoke("get_settings");
-export const saveSettings = (settings) => invoke("save_settings", { settings });
+export const getSettings = () => invoke("get_settings").then((settings) => {
+  configureTauriTimeouts(settings);
+  return settings;
+});
+export const saveSettings = (settings) => invoke("save_settings", { settings }).then((result) => {
+  configureTauriTimeouts(settings);
+  return result;
+});
 
 // ─── Field History ────────────────────────────────────────────────────────────
 
@@ -73,6 +93,8 @@ export const removeFieldHistoryEntry = (field, value) => invoke("remove_field_hi
 export const listConnections = () => invoke("list_connections");
 export const saveConnection = (connection) => invoke("save_connection", { connection });
 export const deleteConnection = (id) => invoke("delete_connection", { id });
+export const revealConnectionPassword = (connectionId, unlockPassword) =>
+  invoke("reveal_connection_password", { connectionId, unlockPassword });
 export const testConnection = (connection) => invoke("test_connection", { connection });
 export const discoverDatabases = (connection) => invoke("discover_databases", { connection });
 export const connectDb = (id) => invokeWithTimeout("connect_db", { id }, {
@@ -148,14 +170,29 @@ export const getGrandLivre = (id, dateFrom, dateTo, accountPrefix = null) =>
   invokeWithTimeout(
     "get_grand_livre",
     { id, dateFrom, dateTo, accountPrefix },
-    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Grand livre" },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Grand livre" },
+  );
+
+export const getGrandLivrePage = (
+  id,
+  dateFrom,
+  dateTo,
+  accountPrefix = null,
+  offset = 0,
+  limit = 500,
+  search = "",
+) =>
+  invokeWithTimeout(
+    "get_grand_livre_page",
+    { id, dateFrom, dateTo, accountPrefix, offset, limit, search },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Grand livre page" },
   );
 
 export const getBalance = (id, dateFrom, dateTo, accountPrefix = null) =>
   invokeWithTimeout(
     "get_balance",
     { id, dateFrom, dateTo, accountPrefix },
-    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Balance" },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Balance" },
   );
 
 export const getGrandLivreAuxiliaire = (
@@ -173,15 +210,215 @@ export const getGrandLivreAuxiliaire = (
     tiersType,
     accountPrefix,
   },
-  { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Auxiliary ledger" },
+  { timeoutMs: getDashboardTimeoutMs(), label: "Auxiliary ledger" },
 );
 
 export const getDashboardKpis = (id, dateFrom, dateTo, accountPrefix = null) =>
   invokeWithTimeout(
     "get_dashboard_kpis",
     { id, dateFrom, dateTo, accountPrefix },
-    { timeoutMs: DASHBOARD_TIMEOUT_MS, label: "Dashboard overview" },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Dashboard overview" },
   );
+
+export const getDashboardTiers = (id, tiersType = "all", search = "") =>
+  invokeWithTimeout(
+    "get_dashboard_tiers",
+    { id, tiersType, search: search || null },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Dashboard tiers" },
+  );
+
+export const getExploitationReport = (id, year) =>
+  invoke("get_exploitation_report", { id, year });
+
+export const saveExploitationReport = (id, year, report) =>
+  invoke("save_exploitation_report", { id, year, report });
+
+export const deleteExploitationReport = (id, year) =>
+  invoke("delete_exploitation_report", { id, year });
+
+export const getExploitationMappings = (id) =>
+  invoke("get_exploitation_mappings", { id });
+
+export const saveExploitationMappings = (id, mappings) =>
+  invoke("save_exploitation_mappings", { id, mappings });
+
+export const resetExploitationMappings = (id) =>
+  invoke("reset_exploitation_mappings", { id });
+
+export const getCompteExploitationAccounts = (id, dateFrom, dateTo) =>
+  invokeWithTimeout(
+    "get_compte_exploitation_accounts",
+    { id, dateFrom, dateTo },
+    { timeoutMs: getDashboardTimeoutMs(), label: "Compte d'exploitation" },
+  );
+
+async function streamDashboardRows(command, payload, events, handlers = {}, options = {}) {
+  const rows = [];
+  const maxRetainedRows = Number.isFinite(Number(options.maxRetainedRows))
+    ? Math.max(0, Number(options.maxRetainedRows))
+    : Number.POSITIVE_INFINITY;
+  let warning = null;
+  let total = null;
+  let loaded = 0;
+  let streamError = null;
+
+  const unlisten = await Promise.all([
+    listen(events.total, (event) => {
+      total = Number(event.payload?.total ?? total ?? 0);
+      warning = event.payload?.warning ?? warning;
+      handlers.onTotal?.({ total, warning });
+    }),
+    listen(events.chunk, (event) => {
+      const chunk = Array.isArray(event.payload?.rows) ? event.payload.rows : [];
+      loaded += chunk.length;
+      if (rows.length < maxRetainedRows) {
+        rows.push(...chunk.slice(0, maxRetainedRows - rows.length));
+      }
+      handlers.onRows?.(rows.slice(), {
+        chunk,
+        total,
+        warning,
+        loaded,
+        retained: rows.length,
+        limited: Number.isFinite(maxRetainedRows) && rows.length >= maxRetainedRows,
+      });
+    }),
+    listen(events.complete, (event) => {
+      warning = event.payload?.warning ?? warning;
+      handlers.onComplete?.({
+        rows: rows.slice(),
+        total,
+        warning,
+        loaded,
+        retained: rows.length,
+        limited: total != null && rows.length < total,
+      });
+    }),
+    listen(events.error, (event) => {
+      streamError = String(event.payload ?? `${options.label || command} failed`);
+      handlers.onError?.(streamError);
+    }),
+  ]);
+
+  try {
+    await withTimeout(
+      invoke(command, payload),
+      getDashboardTimeoutMs(options.timeoutMs),
+      options.label || command,
+    );
+    if (streamError) throw new Error(streamError);
+    return {
+      data: rows.slice(),
+      warning,
+      total,
+      loaded,
+      retained: rows.length,
+      limited: total != null && rows.length < total,
+    };
+  } finally {
+    unlisten.forEach((stop) => stop());
+  }
+}
+
+export const streamGrandLivre = (
+  id,
+  dateFrom,
+  dateTo,
+  accountPrefix = null,
+  handlers = {},
+  options = {},
+) => streamDashboardRows(
+  "stream_grand_livre",
+  {
+    id,
+    dateFrom,
+    dateTo,
+    accountPrefix,
+    previewLimit: options.previewLimit ?? null,
+  },
+  {
+    total: "gl_total",
+    chunk: "gl_chunk",
+    complete: "gl_complete",
+    error: "gl_error",
+  },
+  handlers,
+  {
+    maxRetainedRows: options.maxRetainedRows ?? Number.POSITIVE_INFINITY,
+    ...options,
+    label: options.label || "Grand livre",
+  },
+);
+
+export const exportGrandLivreXlsx = async (
+  id,
+  dateFrom,
+  dateTo,
+  accountPrefix = null,
+  filePath,
+  handlers = {},
+) => {
+  let progressError = null;
+  const unlisten = await Promise.all([
+    listen("gl_export_progress", (event) => {
+      handlers.onProgress?.(event.payload);
+    }),
+    listen("gl_export_complete", (event) => {
+      handlers.onComplete?.(event.payload);
+    }),
+    listen("gl_export_error", (event) => {
+      progressError = String(event.payload ?? "Grand Livre export failed");
+      handlers.onError?.(progressError);
+    }),
+  ]);
+
+  try {
+    const result = await invokeWithTimeout(
+      "export_grand_livre_xlsx",
+      { id, dateFrom, dateTo, accountPrefix, filePath },
+      {
+        timeoutMs: Math.max(getDashboardTimeoutMs(), LARGE_EXPORT_TIMEOUT_MS),
+        label: "Grand livre Excel export",
+      },
+    );
+    if (progressError) throw new Error(progressError);
+    return result;
+  } finally {
+    unlisten.forEach((stop) => stop());
+  }
+};
+
+export const streamGrandLivreAuxiliaire = (
+  id,
+  dateFrom,
+  dateTo,
+  tiersType,
+  accountPrefix = null,
+  handlers = {},
+  options = {},
+) => streamDashboardRows(
+  "stream_grand_livre_auxiliaire",
+  {
+    id,
+    dateFrom,
+    dateTo,
+    tiersType,
+    accountPrefix,
+    previewLimit: options.previewLimit ?? null,
+  },
+  {
+    total: "aux_total",
+    chunk: "aux_chunk",
+    complete: "aux_complete",
+    error: "aux_error",
+  },
+  handlers,
+  {
+    maxRetainedRows: options.maxRetainedRows ?? Number.POSITIVE_INFINITY,
+    ...options,
+    label: options.label || "Auxiliary ledger",
+  },
+);
 
 export const fetchTableRows = async (
   id,
@@ -215,10 +452,7 @@ export const exportToCsv = async (id, schema, table, filters, selectedColumns) =
     filters: [{ name: "CSV", extensions: ["csv"] }],
   });
   if (!filePath) return null;
-  return invokeWithTimeout("export_csv", { id, schema, table, filters, selectedColumns, filePath }, {
-    timeoutMs: EXPORT_TIMEOUT_MS,
-    label: `Export CSV for ${schema}.${table}`,
-  });
+  return startTableExport({ connectionId: id, schema, table, filters, selectedColumns, format: "csv", filePath });
 };
 
 export const exportToJson = async (id, schema, table, filters, selectedColumns) => {
@@ -227,10 +461,7 @@ export const exportToJson = async (id, schema, table, filters, selectedColumns) 
     filters: [{ name: "JSON", extensions: ["json"] }],
   });
   if (!filePath) return null;
-  return invokeWithTimeout("export_json", { id, schema, table, filters, selectedColumns, filePath }, {
-    timeoutMs: EXPORT_TIMEOUT_MS,
-    label: `Export JSON for ${schema}.${table}`,
-  });
+  return startTableExport({ connectionId: id, schema, table, filters, selectedColumns, format: "json", filePath });
 };
 
 export const exportToSql = async (id, schema, table, filters) => {
@@ -239,10 +470,7 @@ export const exportToSql = async (id, schema, table, filters) => {
     filters: [{ name: "SQL", extensions: ["sql"] }],
   });
   if (!filePath) return null;
-  return invokeWithTimeout("export_sql", { id, schema, table, filters, filePath }, {
-    timeoutMs: EXPORT_TIMEOUT_MS,
-    label: `Export SQL for ${schema}.${table}`,
-  });
+  return startTableExport({ connectionId: id, schema, table, filters, selectedColumns: [], format: "sql", filePath });
 };
 
 export const exportToExcel = async (id, schema, table, filters, selectedColumns) => {
@@ -252,44 +480,12 @@ export const exportToExcel = async (id, schema, table, filters, selectedColumns)
   });
   if (!filePath) return null;
 
-  return withTimeout((async () => {
-    const { columns, rows } = await fetchTableRows(id, schema, table, filters);
-    const selectedSet = new Set(selectedColumns);
-    const exportIndexes = columns
-      .map((column, index) => ({ column, index }))
-      .filter(({ column }) => selectedSet.size === 0 || selectedSet.has(column.name));
-
-    const headers = exportIndexes.map(({ column }) => column.name);
-    const body = rows.map((row) => exportIndexes.map(({ index }) => row[index]));
-
-    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...body]);
-    const workbook = XLSX.utils.book_new();
-    const sheetName = `${schema}_${table}`.replace(/[\\/?*\[\]:]/g, "_").slice(0, 31) || "Export";
-    const range = XLSX.utils.decode_range(worksheet["!ref"] || "A1");
-
-    worksheet["!cols"] = headers.map((header, index) => {
-      const sampleWidth = body.reduce((max, row) => {
-        const value = row[index];
-        const length = value == null ? 4 : String(value).length;
-        return Math.max(max, length);
-      }, header.length);
-      return { wch: Math.min(Math.max(sampleWidth + 2, 10), 40) };
-    });
-    worksheet["!autofilter"] = {
-      ref: XLSX.utils.encode_range({
-        s: { r: 0, c: 0 },
-        e: { r: range.e.r, c: range.e.c },
-      }),
-    };
-
-    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
-
-    const contents = new Uint8Array(XLSX.write(workbook, { bookType: "xlsx", type: "array" }));
-    await writeBinaryFile(filePath, contents);
-
-    return filePath;
-  })(), EXPORT_TIMEOUT_MS, `Export Excel for ${schema}.${table}`);
+  return startTableExport({ connectionId: id, schema, table, filters, selectedColumns, format: "xlsx", filePath });
 };
+
+export const startTableExport = (spec) => invoke("start_table_export", { spec });
+export const listExportJobs = () => invoke("list_export_jobs");
+export const cancelExportJob = (jobId) => invoke("cancel_export_job", { jobId });
 
 // ─── Invoicing ───────────────────────────────────────────────────────────────
 

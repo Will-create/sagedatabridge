@@ -19,3 +19,9 @@ export function createInvokeWithTimeout(invokeImpl) {
     return withTimeout(invokeImpl(command, payload), timeoutMs, label);
   };
 }
+
+export function secondsToTimeoutMs(value, fallbackMs) {
+  const secs = Number(value);
+  if (!Number.isFinite(secs) || secs <= 0) return fallbackMs;
+  return Math.max(Math.round(secs * 1000), 1);
+}

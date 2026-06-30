@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
+import { Eye, EyeOff } from "lucide-react";
 import {
   connectDb,
   detectSageEdition,
   discoverDatabases,
   getDatabases,
+  revealConnectionPassword,
   saveConnection,
   saveFieldHistory,
   scanNetworkForSqlServers,
@@ -96,6 +98,8 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
   const [testingMapping, setTestingMapping] = useState(false);
   const [scanningNetwork, setScanningNetwork] = useState(false);
   const [scanResults, setScanResults] = useState(null);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [revealUnlock, setRevealUnlock] = useState({ visible: false, password: "", loading: false, error: "" });
   const isEdit = !!existing?.id;
 
   const normalizedHost = form.host.trim();
@@ -139,6 +143,44 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
     setStatusCard({ ok: false, msg: t("conn_reenter_password") });
     return false;
+  };
+
+  const handlePasswordToggle = () => {
+    if (passwordVisible) {
+      setPasswordVisible(false);
+      return;
+    }
+
+    if (isEdit && form.password === MASKED_PASSWORD) {
+      setRevealUnlock({ visible: true, password: "", loading: false, error: "" });
+      return;
+    }
+
+    setPasswordVisible(true);
+  };
+
+  const handleRevealSavedPassword = async () => {
+    if (!existing?.id || revealUnlock.loading) return;
+    if (!revealUnlock.password.trim()) {
+      setRevealUnlock((current) => ({ ...current, error: t("conn_password_reveal_required") }));
+      return;
+    }
+
+    setRevealUnlock((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const password = await revealConnectionPassword(existing.id, revealUnlock.password);
+      setForm((current) => ({ ...current, password }));
+      setPasswordVisible(true);
+      setRevealUnlock({ visible: false, password: "", loading: false, error: "" });
+      setStatusCard(null);
+    } catch (error) {
+      setPasswordVisible(false);
+      setRevealUnlock((current) => ({
+        ...current,
+        loading: false,
+        error: String(error),
+      }));
+    }
   };
 
   const handleTest = async () => {
@@ -525,12 +567,56 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                   </div>
                   <div className="form-group">
                     <label>{t("conn_password")}</label>
-                    <input
-                      type="password"
-                      value={form.password}
-                      onChange={(event) => set("password", event.target.value)}
-                      autoComplete="new-password"
-                    />
+                    <div className="password-input-wrap">
+                      <input
+                        type={passwordVisible ? "text" : "password"}
+                        value={form.password}
+                        onChange={(event) => set("password", event.target.value)}
+                        autoComplete="new-password"
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-icon password-toggle"
+                        onClick={handlePasswordToggle}
+                        disabled={revealUnlock.loading}
+                        aria-label={passwordVisible ? "Hide password" : "Show password"}
+                        title={passwordVisible ? "Hide password" : "Show password"}
+                      >
+                        {passwordVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                    {revealUnlock.visible ? (
+                      <div className="password-reveal-panel">
+                        <input
+                          type="password"
+                          value={revealUnlock.password}
+                          onChange={(event) => setRevealUnlock((current) => ({
+                            ...current,
+                            password: event.target.value,
+                            error: "",
+                          }))}
+                          placeholder={t("conn_password_reveal_ph")}
+                          autoComplete="current-password"
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={handleRevealSavedPassword}
+                          disabled={revealUnlock.loading}
+                        >
+                          {revealUnlock.loading ? t("loading") : t("conn_password_reveal")}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-ghost"
+                          onClick={() => setRevealUnlock({ visible: false, password: "", loading: false, error: "" })}
+                          disabled={revealUnlock.loading}
+                        >
+                          {t("cancel")}
+                        </button>
+                        {revealUnlock.error ? <div className="password-reveal-error">{revealUnlock.error}</div> : null}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               ) : null}

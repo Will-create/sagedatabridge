@@ -195,7 +195,7 @@ export default function Sidebar({
             </button>
           ) : null}
 
-          {activeId && activeDatabase ? (
+          {adminMode && activeId && activeDatabase ? (
             <button
               className={`sidebar-dashboard-btn ${invoicingOpen ? "active" : ""}`}
               onClick={onOpenInvoicing}

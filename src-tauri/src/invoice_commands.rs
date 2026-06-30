@@ -572,12 +572,7 @@ async fn resolve_invoice_schema_with_line_requirement(
         "TLIGNEPIECES".to_string(),
         "TLIGNEPIEC".to_string(),
     ];
-    let line_result = sage_entity_service::load_table(
-        client,
-        &tables,
-        &line_candidates,
-    )
-    .await;
+    let line_result = sage_entity_service::load_table(client, &tables, &line_candidates).await;
     let (line, line_available) = match line_result {
         Ok(table) => (table, true),
         Err(error) if require_line => return Err(error),
@@ -645,17 +640,31 @@ async fn resolve_invoice_schema_with_line_requirement(
         piece_journal_fk: sage_entity_service::pick_optional(&piece, &["oidjournal", "JO_Num"]),
         line_available,
         line_piece: if line_available {
-            sage_entity_service::pick_required(&line, &[&native.col_ligne_piece, "oidpiece", "EC_No"])?
+            sage_entity_service::pick_required(
+                &line,
+                &[&native.col_ligne_piece, "oidpiece", "EC_No"],
+            )?
         } else {
             String::new()
         },
         line_article: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_article, "AR_Ref", "oidarticle"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_article, "AR_Ref", "oidarticle"],
+            )
         } else {
             None
         },
         line_libelle: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_libelle, "DL_Design", "designation", "Caption"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[
+                    &native.col_ligne_libelle,
+                    "DL_Design",
+                    "designation",
+                    "Caption",
+                ],
+            )
         } else {
             None
         },
@@ -665,32 +674,54 @@ async fn resolve_invoice_schema_with_line_requirement(
             None
         },
         line_pu_ht: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_pu_ht, "DL_PrixUnitaire", "prix_ht"],
+            )
         } else {
             None
         },
         line_taux_tva: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_taux_tva, "DL_Taxe1", "tva"],
+            )
         } else {
             None
         },
         line_montant_ht: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_montant_ht, "DL_MontantHT", "montant_ht"],
+            )
         } else {
             None
         },
         line_montant_ttc: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_montant_ttc, "DL_MontantTTC", "montant_ttc"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[
+                    &native.col_ligne_montant_ttc,
+                    "DL_MontantTTC",
+                    "montant_ttc",
+                ],
+            )
         } else {
             None
         },
         line_remise: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_remise, "DL_Remise01", "remise_pct"],
+            )
         } else {
             None
         },
         line_ordre: if line_available {
-            sage_entity_service::pick_optional(&line, &[&native.col_ligne_ordre, "DL_No", "position"])
+            sage_entity_service::pick_optional(
+                &line,
+                &[&native.col_ligne_ordre, "DL_No", "position"],
+            )
         } else {
             None
         },
@@ -1440,8 +1471,7 @@ fn invoice_list_select(
             )
         })
         .unwrap_or_else(|| "COALESCE(m.[tiers_siret], N'')".to_string());
-    let (total_ht_expr, total_tva_expr, total_ttc_expr, totals_apply) = if resolved.line_available
-    {
+    let (total_ht_expr, total_tva_expr, total_ttc_expr, totals_apply) = if resolved.line_available {
         (
             "COALESCE(tot.[total_ht], m.[total_ht], 0)".to_string(),
             "COALESCE(tot.[total_tva], m.[total_tva], 0)".to_string(),
@@ -1619,7 +1649,8 @@ async fn fetch_invoice_internal(
     let mut invoice = map_invoice_row(&header_row);
 
     if !resolved.line_available {
-        invoice.statut_history = fetch_status_history(&mut client, support_tables, piece_id).await?;
+        invoice.statut_history =
+            fetch_status_history(&mut client, support_tables, piece_id).await?;
         return Ok(invoice);
     }
 

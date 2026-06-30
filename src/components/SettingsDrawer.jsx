@@ -79,14 +79,12 @@ export default function SettingsDrawer({
   appVersion,
   onOpenAbout,
   onLockNow,
-  activeConnectionId,
-  onOpenInvoiceAppearance,
 }) {
   const { lang, setLang, t } = useT();
   const [activeTab, setActiveTab] = useState("general");
   const [loadingSecurity, setLoadingSecurity] = useState(true);
   const [pinConfigured, setPinConfigured] = useState(false);
-  const [adminPasswordConfigured, setAdminPasswordConfigured] = useState(false);
+  const [adminPasswordConfigured, setAdminPasswordConfigured] = useState(true);
   const [pinStatus, setPinStatus] = useState({ error: "", success: "", loading: false });
   const [adminStatus, setAdminStatus] = useState({ error: "", success: "", loading: false });
   const [adminUnlock, setAdminUnlock] = useState({ visible: false, password: "", error: "", loading: false });
@@ -99,6 +97,8 @@ export default function SettingsDrawer({
     query_timeout_secs: 60,
     dashboard_timeout_secs: 90,
     login_timeout_secs: 60,
+    fiscal_year_start_month: 1,
+    fiscal_year_start_day: 1,
     account_ar: "411000",
     account_sales: "701000",
     account_vat: "443000",
@@ -328,6 +328,8 @@ export default function SettingsDrawer({
         query_timeout_secs: Number(settingsForm.query_timeout_secs),
         dashboard_timeout_secs: Number(settingsForm.dashboard_timeout_secs),
         login_timeout_secs: Number(settingsForm.login_timeout_secs),
+        fiscal_year_start_month: Math.min(12, Math.max(1, Number(settingsForm.fiscal_year_start_month) || 1)),
+        fiscal_year_start_day: Math.min(31, Math.max(1, Number(settingsForm.fiscal_year_start_day) || 1)),
         account_ar: String(settingsForm.account_ar),
         account_sales: String(settingsForm.account_sales),
         account_vat: String(settingsForm.account_vat),
@@ -444,18 +446,6 @@ export default function SettingsDrawer({
                 <strong>v{appVersion}</strong>
               </div>
 
-              <button
-                type="button"
-                className="settings-link-card"
-                onClick={onOpenInvoiceAppearance}
-                disabled={!activeConnectionId}
-              >
-                <div className="settings-secret-copy">
-                  <strong>{t("invoice_template_appearance")}</strong>
-                  <span>{activeConnectionId ? t("invoice_template_settings_hint") : t("invoice_template_connection_required")}</span>
-                </div>
-                <span className="settings-link-arrow">›</span>
-              </button>
             </div>
           ) : null}
 
@@ -489,95 +479,19 @@ export default function SettingsDrawer({
                     onChange={(val) => setSettingsForm(s => ({ ...s, login_timeout_secs: val }))}
                     inputMode="numeric"
                   />
-                </div>
-              </div>
-
-              <div className="settings-secret-card">
-                <div className="settings-secret-copy">
-                  <strong>{t("settings_accounting_title") || "Accounting Integration"}</strong>
-                  <span>{t("settings_accounting_hint") || "Configure ledger account codes for invoice posting."}</span>
-                </div>
-
-                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                   <SecretField
-                    label={t("settings_account_ar") || "Accounts Receivable (Client)"}
-                    value={settingsForm.account_ar}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, account_ar: val }))}
-                  />
-                  <SecretField
-                    label={t("settings_account_sales") || "Sales Account (Vente)"}
-                    value={settingsForm.account_sales}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, account_sales: val }))}
-                  />
-                  <SecretField
-                    label={t("settings_account_vat") || "VAT Account (TVA)"}
-                    value={settingsForm.account_vat}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, account_vat: val }))}
-                  />
-                </div>
-              </div>
-
-              <div className="settings-secret-card">
-                <div className="settings-secret-copy">
-                  <strong>Invoice defaults</strong>
-                  <span>Default units, tax presets, currency and payment terms used when creating invoices.</span>
-                </div>
-
-                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                  <SecretField
-                    label="Units"
-                    value={Array.isArray(settingsForm.invoice_units) ? settingsForm.invoice_units.join(", ") : settingsForm.invoice_units}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_units: val }))}
-                  />
-                  <SecretField
-                    label="VAT rates (%)"
-                    value={Array.isArray(settingsForm.invoice_vat_rates) ? settingsForm.invoice_vat_rates.join(", ") : settingsForm.invoice_vat_rates}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_vat_rates: val }))}
-                  />
-                  <SecretField
-                    label="Default unit"
-                    value={settingsForm.invoice_default_unit}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_unit: val }))}
-                  />
-                  <SecretField
-                    label="Default VAT rate"
-                    value={settingsForm.invoice_default_vat_rate}
+                    label={t("settings_fiscal_start_month")}
+                    value={settingsForm.fiscal_year_start_month}
                     type="number"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_vat_rate: val }))}
+                    onChange={(val) => setSettingsForm(s => ({ ...s, fiscal_year_start_month: val }))}
+                    inputMode="numeric"
                   />
                   <SecretField
-                    label="Default currency"
-                    value={settingsForm.invoice_default_currency}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_currency: val }))}
-                  />
-                  <SecretField
-                    label="Default payment terms"
-                    value={settingsForm.invoice_default_payment_terms}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_default_payment_terms: val }))}
-                  />
-                  <SecretField
-                    label="Extra taxes placeholder"
-                    value={settingsForm.invoice_extra_taxes_raw ?? (Array.isArray(settingsForm.invoice_extra_taxes)
-                      ? settingsForm.invoice_extra_taxes.map((tax) => `${tax.name}:${tax.rate}:${tax.enabled ? "on" : "off"}`).join(", ")
-                      : "")}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, invoice_extra_taxes_raw: val }))}
-                  />
-                  <SecretField
-                    label={t("settings_tax_types") || "Tax types"}
-                    value={settingsForm.tax_types_raw ?? (Array.isArray(settingsForm.tax_types)
-                      ? settingsForm.tax_types.map((tax) => `${tax.id}:${tax.name}:${tax.rate}:${tax.account || ""}:${tax.active === false ? "off" : "on"}`).join(", ")
-                      : "")}
-                    type="text"
-                    onChange={(val) => setSettingsForm(s => ({ ...s, tax_types_raw: val }))}
+                    label={t("settings_fiscal_start_day")}
+                    value={settingsForm.fiscal_year_start_day}
+                    type="number"
+                    onChange={(val) => setSettingsForm(s => ({ ...s, fiscal_year_start_day: val }))}
+                    inputMode="numeric"
                   />
                 </div>
               </div>
@@ -648,49 +562,6 @@ export default function SettingsDrawer({
                 </div>
               </div>
 
-              <div className="settings-secret-card">
-                <div className="settings-secret-copy">
-                  <strong>{t("settings_admin_password_title")}</strong>
-                  <span>{loadingSecurity ? t("loading") : adminPasswordConfigured ? t("settings_admin_configured") : t("settings_admin_not_configured")}</span>
-                </div>
-
-                {adminPasswordConfigured ? (
-                  <SecretField
-                    label={t("settings_admin_current")}
-                    value={adminForm.current}
-                    onChange={(value) => setAdminForm((current) => ({ ...current, current: value }))}
-                    placeholder={t("settings_admin_current_ph")}
-                  />
-                ) : null}
-
-                <SecretField
-                  label={t("settings_admin_new")}
-                  value={adminForm.next}
-                  onChange={(value) => setAdminForm((current) => ({ ...current, next: value }))}
-                  placeholder={t("settings_admin_new_ph")}
-                />
-
-                <SecretField
-                  label={t("settings_admin_confirm")}
-                  value={adminForm.confirm}
-                  onChange={(value) => setAdminForm((current) => ({ ...current, confirm: value }))}
-                  placeholder={t("settings_admin_confirm_ph")}
-                />
-
-                {adminStatus.error ? <div className="settings-feedback error">{adminStatus.error}</div> : null}
-                {adminStatus.success ? <div className="settings-feedback success">{adminStatus.success}</div> : null}
-
-                <div className="settings-actions">
-                  {adminPasswordConfigured ? (
-                    <button type="button" className="btn btn-ghost btn-danger" onClick={clearAdminPassword} disabled={adminStatus.loading}>
-                      {t("settings_admin_remove")}
-                    </button>
-                  ) : <span />}
-                  <button type="button" className="btn btn-accent" onClick={saveAdminPassword} disabled={adminStatus.loading || loadingSecurity}>
-                    {adminStatus.loading ? t("settings_saving") : adminPasswordConfigured ? t("settings_admin_update") : t("settings_admin_save")}
-                  </button>
-                </div>
-              </div>
             </div>
           ) : null}
 

@@ -18,7 +18,7 @@ pub enum DbBackend {
     #[cfg(windows)]
     Odbc,
 }
-
+/// DB client
 #[derive(Debug, Clone)]
 pub struct DbClient {
     pub config: ConnectionConfig,
@@ -1141,7 +1141,7 @@ pub fn build_where_clause(filters: &[Filter]) -> String {
 }
 
 /// Convert a tiberius row value to serde_json::Value
-fn cell_to_json_tds(row: &tiberius::Row, idx: usize) -> Value {
+pub(crate) fn cell_to_json_tds(row: &tiberius::Row, idx: usize) -> Value {
     let col_type = row.columns()[idx].column_type();
 
     match col_type {
@@ -1256,7 +1256,7 @@ pub async fn get_table_data(
     }
 }
 
-async fn get_table_data_tds(
+pub(crate) async fn get_table_data_tds(
     client: &mut TdsClient,
     schema: &str,
     table: &str,

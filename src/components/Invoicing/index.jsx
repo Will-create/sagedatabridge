@@ -58,6 +58,7 @@ import {
   updateStatut,
 } from "../../hooks/useTauri";
 import { useT } from "../../i18n";
+import { useExportJobs } from "../../exportJobs";
 import BridgeWorkspace from "./BridgeWorkspace";
 import InvoiceDocumentation from "./InvoiceDocumentation";
 import { SearchSelect, TierSummary } from "./InvoiceInputs";
@@ -1105,6 +1106,7 @@ function ArticleFormModal({
 
 export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesigner }) {
   const { t, lang } = useT();
+  const { beginLocalJob, updateLocalJob } = useExportJobs();
 
   const [activeTab, setActiveTab] = useState("factures");
   const [listCollapsed, setListCollapsed] = useState(false);
@@ -2070,13 +2072,27 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
     const invoice = workingInvoice;
     if (!invoice || actionPending) return;
     setActionBusy("export");
+    let tracked = null;
     try {
       const filePath = await save({
         defaultPath: `${invoice.numero || "invoice"}.pdf`,
         filters: [{ name: "PDF", extensions: ["pdf"] }],
       });
       if (!filePath) return;
+      tracked = beginLocalJob(
+        `Invoice ${invoice.numero || ""} PDF`,
+        "invoice-pdf",
+        `invoice-pdf:${invoice.id || invoice.numero}:${filePath}`,
+      );
+      if (tracked.existing) return;
+      updateLocalJob(tracked.job.id, { phase: "writing PDF", percent: 50, output_paths: [filePath] });
       await exportInvoicePdf(invoice, templateId, filePath, lang);
+      updateLocalJob(tracked.job.id, { status: "completed", phase: "completed", percent: 100, finished_at: new Date().toISOString() });
+    } catch (error) {
+      if (tracked && !tracked.existing) {
+        updateLocalJob(tracked.job.id, { status: "failed", phase: "failed", error: String(error), finished_at: new Date().toISOString() });
+      }
+      throw error;
     } finally {
       setActionBusy("");
     }

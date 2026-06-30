@@ -11,7 +11,15 @@ function cellClass(value, colType) {
   return "";
 }
 
-export default function DataGrid({ data, loading, page, pageSize, onPageChange, onPageSizeChange }) {
+export default function DataGrid({
+  data,
+  loading,
+  page,
+  pageSize,
+  onPageChange,
+  onPageSizeChange,
+  pageSizeOptions = [50, 100, 250, 500, 1000],
+}) {
   const { t, lang } = useT();
   const [sortCol, setSortCol] = useState(null);
   const [sortDir, setSortDir] = useState("asc");
@@ -61,7 +69,8 @@ export default function DataGrid({ data, loading, page, pageSize, onPageChange, 
     );
   }
 
-  const totalPages = Math.max(1, Math.ceil(total_count / pageSize));
+  const effectivePageSize = pageSize === 0 ? Math.max(total_count, 1) : pageSize;
+  const totalPages = Math.max(1, Math.ceil(total_count / effectivePageSize));
 
   let displayRows = [...rows];
   if (sortCol !== null) {
@@ -82,8 +91,8 @@ export default function DataGrid({ data, loading, page, pageSize, onPageChange, 
     else { setSortCol(ci); setSortDir("asc"); }
   };
 
-  const rowStart = page * pageSize + 1;
-  const rowEnd   = Math.min((page + 1) * pageSize, total_count);
+  const rowStart = page * effectivePageSize + 1;
+  const rowEnd   = Math.min((page + 1) * effectivePageSize, total_count);
   const locale   = lang === "fr" ? "fr-FR" : "en-US";
 
   return (
@@ -150,7 +159,7 @@ export default function DataGrid({ data, loading, page, pageSize, onPageChange, 
         <div style={{ flex:1 }} />
         <span style={{ color:"var(--text-lo)", fontSize:11 }}>{t("grid_page_size")}</span>
         <select className="page-size-select" value={pageSize} onChange={(e) => onPageSizeChange(Number(e.target.value))}>
-          {[50, 100, 250, 500, 1000].map((n) => <option key={n} value={n}>{n}</option>)}
+          {pageSizeOptions.map((size) => <option key={size} value={size}>{size === 0 ? t("all") : size.toLocaleString(locale)}</option>)}
         </select>
         <button className="btn btn-sm" onClick={() => onPageChange(0)} disabled={page === 0}>«</button>
         <button className="btn btn-sm" onClick={() => onPageChange(page - 1)} disabled={page === 0}>‹</button>

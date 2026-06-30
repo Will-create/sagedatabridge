@@ -9,6 +9,7 @@ import {
   getTables,
   listConnections,
   closeDatabaseWorkspace,
+  getSettings,
   openDatabaseWorkspace,
   runConnectionDiagnostics,
 } from "./hooks/useTauri";
@@ -28,6 +29,7 @@ import TablePanel from "./components/TablePanel";
 import ThemeToggle from "./components/ThemeToggle";
 import Toast from "./components/Toast";
 import Toolbar from "./components/Toolbar";
+import ExportProgressCenter from "./components/ExportProgressCenter";
 
 const ADMIN_MODE_KEY = "sdb_admin_mode";
 const SHOW_TABLE_PANEL_KEY = "sdb_show_table_panel";
@@ -144,7 +146,7 @@ export default function App() {
         pageSize,
         filters,
         mainView,
-        invoicingOpen,
+        invoicingOpen: adminMode && invoicingOpen,
       },
     }));
   }, [
@@ -153,6 +155,7 @@ export default function App() {
     columns,
     data,
     filters,
+    adminMode,
     invoicingOpen,
     mainView,
     page,
@@ -173,7 +176,7 @@ export default function App() {
         && previous?.pageSize === pageSize
         && previous?.filters === filters
         && previous?.mainView === mainView
-        && previous?.invoicingOpen === invoicingOpen
+        && previous?.invoicingOpen === (adminMode && invoicingOpen)
       ) {
         return current;
       }
@@ -188,11 +191,11 @@ export default function App() {
           pageSize,
           filters,
           mainView,
-          invoicingOpen,
+          invoicingOpen: adminMode && invoicingOpen,
         },
       };
     });
-  }, [activeConnId, activeTable, columns, data, filters, invoicingOpen, mainView, page, pageSize, tables]);
+  }, [activeConnId, activeTable, adminMode, columns, data, filters, invoicingOpen, mainView, page, pageSize, tables]);
 
   const restoreWorkspaceState = useCallback((workspaceId) => {
     const workspace = workspaces.find((item) => item.id === workspaceId);
@@ -207,8 +210,9 @@ export default function App() {
     setPageSize(state.pageSize ?? 100);
     setFilters(state.filters ?? []);
     setMainView(state.mainView ?? "dashboard");
-    setInvoicingOpen(state.invoicingOpen ?? false);
-  }, [workspaceStates, workspaces]);
+    setInvoicingOpen(adminMode && Boolean(state.invoicingOpen));
+    setTemplateDesignerOpen(false);
+  }, [adminMode, workspaceStates, workspaces]);
 
   useEffect(() => {
     localStorage.setItem(ADMIN_MODE_KEY, String(adminMode));
@@ -223,17 +227,24 @@ export default function App() {
   }, [showToolbar]);
 
   useEffect(() => {
+    getSettings().catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (!activeConnId) {
       setMainView((current) => (current === "about" ? current : "welcome"));
       setActiveDatabase((current) => (current ? "" : current));
       setDatabases((current) => (current.length ? [] : current));
-      setInvoicingOpen((current) => (current ? false : current));
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
     }
   }, [activeConnId]);
 
   useEffect(() => {
     if (!adminMode) {
       setTablePanelCollapsed(false);
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       if (activeConnId && activeDatabase && mainView !== "about") {
         setMainView("dashboard");
       }
@@ -304,10 +315,13 @@ export default function App() {
       setColumns([]);
       setFilters([]);
       setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       return;
     }
 
     if (!forceReconnect && id === activeConnId && statuses[id] === "connected") {
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       setMainView(activeDatabase ? (adminMode ? "tables" : "dashboard") : "database-selection");
       return;
     }
@@ -324,6 +338,7 @@ export default function App() {
     setFilters([]);
     setMainView("welcome");
     setInvoicingOpen(false);
+    setTemplateDesignerOpen(false);
     showStatus(t("status_connecting"), "idle");
     setStatuses((current) => ({ ...current, [id]: "connecting" }));
     setGlobalLoading(true);
@@ -387,6 +402,8 @@ export default function App() {
   const handleSelectDatabase = useCallback(async (database) => {
     if (!activeConnId || !database) return;
     if (database === activeDatabase) {
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       setMainView(adminMode ? "tables" : "dashboard");
       return;
     }
@@ -394,6 +411,8 @@ export default function App() {
     setGlobalLoading(true);
     try {
       snapshotActiveWorkspace();
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       const baseConnectionId = isWorkspaceId(activeConnId)
         ? activeWorkspace?.baseConnectionId
         : activeConnId;
@@ -458,6 +477,8 @@ export default function App() {
 
     try {
       snapshotActiveWorkspace();
+      setInvoicingOpen(false);
+      setTemplateDesignerOpen(false);
       const workspace = await openDatabaseWorkspace(baseConnection.id, database);
       setWorkspaces((current) => [...current, workspace]);
       setStatuses((current) => ({ ...current, [workspace.id]: "connected" }));
@@ -561,6 +582,7 @@ export default function App() {
         setFilters([]);
         setMainView("welcome");
         setInvoicingOpen(false);
+        setTemplateDesignerOpen(false);
       }
     }
   }, [activeConnId, restoreWorkspaceState, showToast, workspaces]);
@@ -568,6 +590,8 @@ export default function App() {
   const handleBackToTables = useCallback(async () => {
     if (!activeConnId || !activeDatabase) return;
     if (!tables.length) await ensureTablesLoaded(activeConnId);
+    setInvoicingOpen(false);
+    setTemplateDesignerOpen(false);
     setMainView("tables");
   }, [activeConnId, activeDatabase, ensureTablesLoaded, tables.length]);
 
@@ -689,10 +713,14 @@ export default function App() {
             onDuplicateWithDatabase={handleDuplicateWithDatabase}
             onConnectionSaved={handleConnectionSaved}
             onCollapse={() => setSidebarCollapsed(true)}
-            onOpenDashboard={() => setMainView("dashboard")}
-            onOpenInvoicing={() => setInvoicingOpen(true)}
+            onOpenDashboard={() => {
+              setInvoicingOpen(false);
+              setTemplateDesignerOpen(false);
+              setMainView("dashboard");
+            }}
+            onOpenInvoicing={() => adminMode && activeConnId && activeDatabase && setInvoicingOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}
-            invoicingOpen={invoicingOpen}
+            invoicingOpen={adminMode && invoicingOpen}
             disabled={globalLoading}
           />
         )}
@@ -730,7 +758,7 @@ export default function App() {
 
           {mainView === "about" ? (
             <AboutPage onBack={returnFromAbout} onOpenSettings={() => setSettingsOpen(true)} />
-          ) : invoicingOpen && activeConnId && activeDatabase ? (
+          ) : adminMode && invoicingOpen && activeConnId && activeDatabase ? (
             <Invoicing
               connId={activeConnId}
               schema={activeSchemas[activeConnId] ?? null}
@@ -821,12 +849,10 @@ export default function App() {
           appVersion={packageJson.version}
           onOpenAbout={openAboutPage}
           onLockNow={handleLockNow}
-          activeConnectionId={activeConnId}
-          onOpenInvoiceAppearance={() => setTemplateDesignerOpen(true)}
         />
       ) : null}
 
-      {templateDesignerOpen ? (
+      {adminMode && templateDesignerOpen && activeConnId ? (
         <TemplateDesigner
           open={templateDesignerOpen}
           connectionId={activeConnId}
@@ -844,6 +870,7 @@ export default function App() {
       )}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
+      <ExportProgressCenter />
     </div>
   );
 }

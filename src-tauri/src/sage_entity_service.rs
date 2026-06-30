@@ -231,7 +231,17 @@ pub async fn resolve_entity_search_context(
             col_email: pick_optional(&table, &["email", "EMail", "CT_EMail"]),
             col_telephone: pick_optional(&table, &["telephone", "CT_Telephone"]),
             col_tva: pick_optional(&table, &["numTvaIntracom", "CT_Identifiant", "tva"]),
-            col_type: pick_optional(&table, &["CT_Type", "typePersonne", "type"]),
+            col_type: pick_optional(
+                &table,
+                &[
+                    "CT_Type",
+                    "typePersonne",
+                    "BPRTYP",
+                    "TIERS_TYPE",
+                    "TYPE_TIERS",
+                    "type",
+                ],
+            ),
             table,
         })
     } else {

@@ -5,6 +5,7 @@ mod analytics;
 mod bridge;
 mod commands;
 mod db;
+mod export_jobs;
 mod invoice_commands;
 mod invoice_compat;
 mod network_scan;
@@ -61,6 +62,12 @@ fn main() {
             // Settings
             commands::get_settings,
             commands::save_settings,
+            commands::get_exploitation_report,
+            commands::save_exploitation_report,
+            commands::delete_exploitation_report,
+            commands::get_exploitation_mappings,
+            commands::save_exploitation_mappings,
+            commands::reset_exploitation_mappings,
             // Field history
             commands::get_field_history,
             commands::save_field_history,
@@ -69,6 +76,7 @@ fn main() {
             commands::list_connections,
             commands::save_connection,
             commands::delete_connection,
+            commands::reveal_connection_password,
             commands::test_connection,
             commands::discover_databases,
             commands::connect_db,
@@ -97,19 +105,23 @@ fn main() {
             commands::list_query_history,
             commands::clear_query_history,
             // Export
-            commands::export_csv,
-            commands::export_json,
-            commands::export_sql,
+            export_jobs::start_table_export,
+            export_jobs::list_export_jobs,
+            export_jobs::cancel_export_job,
             // Network scan
             network_scan::scan_network_for_sql_servers,
             // Analytics
             analytics::get_grand_livre,
+            analytics::get_grand_livre_page,
             analytics::get_balance,
+            analytics::get_compte_exploitation_accounts,
             analytics::get_grand_livre_auxiliaire,
             analytics::stream_grand_livre,
+            analytics::export_grand_livre_xlsx,
             analytics::stream_balance,
             analytics::stream_grand_livre_auxiliaire,
             analytics::get_dashboard_kpis,
+            analytics::get_dashboard_tiers,
             // Invoicing
             invoice_commands::list_invoices,
             invoice_commands::get_invoice,

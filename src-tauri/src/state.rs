@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 
 fn default_sage_edition() -> String {
     "auto".to_string()
@@ -218,6 +219,25 @@ impl Default for QueryHistoryEntry {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExploitationReportRecord {
+    pub key: String,
+    pub connection_id: String,
+    pub database: String,
+    pub year: i32,
+    pub report: serde_json::Value,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExploitationMappingsRecord {
+    pub key: String,
+    pub connection_id: String,
+    pub database: String,
+    pub mappings: serde_json::Value,
+    pub updated_at: String,
+}
+
 /// App config stored on disk
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -229,6 +249,10 @@ pub struct AppConfig {
     pub query_history: Vec<QueryHistoryEntry>,
     pub input_history: HashMap<String, Vec<String>>,
     #[serde(default)]
+    pub exploitation_reports: Vec<ExploitationReportRecord>,
+    #[serde(default)]
+    pub exploitation_mappings: Vec<ExploitationMappingsRecord>,
+    #[serde(default)]
     pub invoice_templates: Vec<InvoiceTemplate>,
     #[serde(default = "default_active_template_id")]
     pub active_template_id: String,
@@ -238,6 +262,10 @@ pub struct AppConfig {
     pub dashboard_timeout_secs: u64,
     #[serde(default = "default_login_timeout_secs")]
     pub login_timeout_secs: u64,
+    #[serde(default = "default_fiscal_year_start_month")]
+    pub fiscal_year_start_month: u8,
+    #[serde(default = "default_fiscal_year_start_day")]
+    pub fiscal_year_start_day: u8,
     #[serde(default = "default_account_ar")]
     pub account_ar: String,
     #[serde(default = "default_account_sales")]
@@ -260,6 +288,14 @@ pub struct AppConfig {
     pub invoice_extra_taxes: Vec<InvoiceExtraTaxSetting>,
     #[serde(default)]
     pub tax_types: Vec<TaxTypeSetting>,
+}
+
+fn default_fiscal_year_start_month() -> u8 {
+    1
+}
+
+fn default_fiscal_year_start_day() -> u8 {
+    1
 }
 
 fn default_account_ar() -> String {
@@ -343,6 +379,27 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportJob {
+    pub id: String,
+    pub dedupe_key: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub phase: String,
+    pub processed_rows: i64,
+    pub total_rows: i64,
+    pub bytes_written: u64,
+    pub percent: u8,
+    pub output_paths: Vec<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub cancellable: bool,
+    pub cancel_requested: bool,
+}
+
 /// Runtime state for a connection
 #[derive(Debug, Clone)]
 pub struct ActiveConnection {
@@ -356,6 +413,8 @@ pub struct AppState {
     pub active_connections: Mutex<HashMap<String, ActiveConnection>>,
     pub active_schemas: Mutex<HashMap<String, crate::sage_compat::SageSchema>>,
     pub client_cache: Mutex<HashMap<String, Arc<crate::db::CachedClient>>>,
+    pub export_jobs: Mutex<HashMap<String, ExportJob>>,
+    pub export_slots: Arc<Semaphore>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
 }
@@ -383,6 +442,8 @@ impl AppState {
             active_connections: Mutex::new(HashMap::new()),
             active_schemas: Mutex::new(HashMap::new()),
             client_cache: Mutex::new(HashMap::new()),
+            export_jobs: Mutex::new(HashMap::new()),
+            export_slots: Arc::new(Semaphore::new(2)),
             data_dir,
             config_path,
         }

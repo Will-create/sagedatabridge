@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { save } from "@tauri-apps/api/dialog";
-import { writeBinaryFile } from "@tauri-apps/api/fs";
+import { exists, removeFile, renameFile, writeBinaryFile } from "@tauri-apps/api/fs";
 import {
   Bar,
   BarChart,
@@ -24,10 +24,14 @@ import {
 import * as XLSX from "xlsx";
 
 import {
+  exportGrandLivreXlsx,
   getBalance,
   getDashboardKpis,
-  getGrandLivre,
-  getGrandLivreAuxiliaire,
+  getDashboardTiers,
+  getGrandLivrePage,
+  getSettings,
+  DASHBOARD_PREVIEW_ROW_LIMIT,
+  streamGrandLivreAuxiliaire,
 } from "../../hooks/useTauri";
 import {
   formatAmount,
@@ -35,6 +39,9 @@ import {
   getAmountTone,
   toNumber,
 } from "./amounts";
+import { useExportJobs } from "../../exportJobs";
+import CompteExploitationTab from "./CompteExploitation";
+import { EXPLOITATION_MONTHS } from "./exploitationModel";
 
 const TAB_IDS = {
   OVERVIEW: "overview",
@@ -42,10 +49,14 @@ const TAB_IDS = {
   BALANCE: "balance",
   FOURNISSEURS: "fournisseurs",
   CLIENTS: "clients",
+  COMPTE_EXPLOITATION: "compte_exploitation",
+  TIERS: "tiers",
 };
 
 const GRAND_LIVRE_GRID = "110px 110px 120px minmax(240px, 1.4fr) 140px 110px 110px 110px 130px";
 const AUX_GRID = "110px 92px minmax(260px, 1.5fr) 140px 92px 110px 110px 130px";
+const LEDGER_PAGE_SIZE = 500;
+const LEDGER_CACHE_PAGES = 40;
 
 const EXCEL_COLORS = {
   headerBg: "0C0C0F",
@@ -68,12 +79,25 @@ const EXCEL_BORDER = {
   right: { style: "thin", color: { rgb: EXCEL_COLORS.border } },
 };
 
+const EXCEL_MAX_ROWS = 1_048_576;
+
 function getDefaultRange() {
   const now = new Date();
   return {
     dateFrom: `${now.getFullYear()}-01-01`,
     dateTo: now.toISOString().slice(0, 10),
   };
+}
+
+function toIsoDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function getFiscalRange(startYear, month = 1, day = 1) {
+  const start = new Date(Date.UTC(startYear, month - 1, day));
+  const end = new Date(Date.UTC(startYear + 1, month - 1, day));
+  end.setUTCDate(end.getUTCDate() - 1);
+  return { dateFrom: toIsoDate(start), dateTo: toIsoDate(end) };
 }
 
 function normalizeText(value) {
@@ -219,6 +243,14 @@ function buildWorksheet(rows, columnRoles, lang, options = {}) {
   const metaLines = [options.context, options.period, options.generatedAt].filter(Boolean);
   const preambleRows = buildPreambleRows(options.title, metaLines, columnCount);
   const allRows = [...preambleRows, ...rows];
+  const sheetName = options.title || "Worksheet";
+
+  if (allRows.length > EXCEL_MAX_ROWS) {
+    throw new Error(
+      `${sheetName}: ${allRows.length.toLocaleString()} rows exceed Excel's ${EXCEL_MAX_ROWS.toLocaleString()} row limit. Narrow the date range or account filter before exporting.`,
+    );
+  }
+
   const headerRowIndex = allRows.findIndex((row) => row.kind === "header");
   const sheet = XLSX.utils.aoa_to_sheet(allRows.map((row) => row.values));
   const range = XLSX.utils.decode_range(sheet["!ref"] || "A1");
@@ -279,13 +311,66 @@ function buildWorksheet(rows, columnRoles, lang, options = {}) {
   return sheet;
 }
 
-async function saveWorkbook(defaultPath, sheets) {
+function buildExploitationWorksheet(report, t, lang, options = {}) {
+  const preambleCount = 5;
+  const comparing = !!report.hasBudget;
+  const sheetRows = [
+    { kind: "header", values: [t("dashboard_label"), ...(comparing ? EXPLOITATION_MONTHS.flatMap((month) => [month, "", ""]) : EXPLOITATION_MONTHS), ...(comparing ? ["TOTAL", "", ""] : ["TOTAL"])] },
+    ...(comparing ? [{ kind: "header", values: ["", ...EXPLOITATION_MONTHS.flatMap(() => [t("exploitation_budget"), t("exploitation_actual"), t("exploitation_variance")]), t("exploitation_budget"), t("exploitation_actual"), t("exploitation_variance")] }] : []),
+    ...report.rows.map((row) => ({
+      kind: row.kind === "section" ? "group" : row.kind === "total" ? "total" : "data",
+      values: row.kind === "section"
+        ? [row.label, ...Array(comparing ? 39 : 13).fill("")]
+        : comparing
+          ? [row.label, ...Array.from({ length: 12 }, (_, month) => [row.budget[month], row.actual[month], row.variance[month]]).flat(), row.totalBudget, row.totalActual, row.totalVariance]
+          : [row.label, ...row.actual, row.totalActual],
+    })),
+  ];
+  const valueColumnCount = comparing ? 39 : 13;
+  const worksheet = buildWorksheet(sheetRows, ["text", ...Array(valueColumnCount).fill("balance")], lang, options);
+  const monthHeaderRow = preambleCount;
+  if (comparing) worksheet["!merges"] = [
+      ...(worksheet["!merges"] || []),
+      ...Array.from({ length: 12 }, (_, month) => ({ s: { r: monthHeaderRow, c: 1 + month * 3 }, e: { r: monthHeaderRow, c: 3 + month * 3 } })),
+      { s: { r: monthHeaderRow, c: 37 }, e: { r: monthHeaderRow, c: 39 } },
+      { s: { r: monthHeaderRow, c: 0 }, e: { r: monthHeaderRow + 1, c: 0 } },
+    ];
+  report.rows.forEach((row, rowIndex) => {
+    if (row.format !== "percent") return;
+    for (let column = 1; column <= valueColumnCount; column += 1) {
+      const cell = worksheet[XLSX.utils.encode_cell({ r: preambleCount + (comparing ? 2 : 1) + rowIndex, c: column })];
+      if (cell?.t === "n") cell.z = "0.00%";
+    }
+  });
+  return worksheet;
+}
+
+function buildExploitationDetailWorksheet(detail, t, lang, options = {}) {
+  const rows = [
+    { kind: "group", values: [detail.line.lineLabel, "", "", "", "", "", ""] },
+    { kind: "header", values: [t("dashboard_date"), t("dashboard_journal"), t("dashboard_account_no"), t("dashboard_label"), t("dashboard_ref_piece"), t("dashboard_debit"), t("dashboard_credit")] },
+    ...detail.movements.map((row) => ({ kind: "data", values: [row.date || "", row.journal || "", row.account_no || "", row.account_label || row.description || "", row.ref_piece || "", toNumber(row.debit), toNumber(row.credit)] })),
+    { kind: "total", values: [t("dashboard_total"), "", "", "", "", detail.accounts.reduce((sum, row) => sum + toNumber(row.debit), 0), detail.accounts.reduce((sum, row) => sum + toNumber(row.credit), 0)] },
+  ];
+  return buildWorksheet(rows, ["text", "text", "text", "text", "text", "debit", "credit"], lang, options);
+}
+
+function yieldToUi() {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
+async function saveWorkbook(defaultPath, buildSheets, onProgress = () => {}) {
   const filePath = await save({
     defaultPath,
     filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
   });
   if (!filePath) return null;
 
+  onProgress({ phase: "preparing data", percent: 10 });
+  await yieldToUi();
+  const sheets = await buildSheets();
+  onProgress({ phase: "building workbook", percent: 35 });
+  await yieldToUi();
   const workbook = XLSX.utils.book_new();
   workbook.Props = {
     Title: defaultPath,
@@ -297,10 +382,32 @@ async function saveWorkbook(defaultPath, sheets) {
     XLSX.utils.book_append_sheet(workbook, worksheet, safeSheetName(name));
   });
 
+  onProgress({ phase: "serializing workbook", percent: 60 });
+  await yieldToUi();
   const contents = new Uint8Array(
     XLSX.write(workbook, { bookType: "xlsx", type: "array", cellStyles: true }),
   );
-  await writeBinaryFile(filePath, contents);
+  onProgress({ phase: "writing file", percent: 85, bytes_written: contents.byteLength });
+  await yieldToUi();
+  const tempPath = `${filePath}.sdb-${crypto.randomUUID()}.tmp`;
+  const backupPath = `${filePath}.sdb-${crypto.randomUUID()}.bak`;
+  let movedExistingFile = false;
+  try {
+    await writeBinaryFile(tempPath, contents);
+    onProgress({ phase: "finalizing", percent: 95, bytes_written: contents.byteLength });
+    if (await exists(filePath)) {
+      await renameFile(filePath, backupPath);
+      movedExistingFile = true;
+    }
+    await renameFile(tempPath, filePath);
+    if (movedExistingFile) await removeFile(backupPath).catch(() => {});
+  } catch (error) {
+    await removeFile(tempPath).catch(() => {});
+    if (movedExistingFile && !(await exists(filePath))) {
+      await renameFile(backupPath, filePath).catch(() => {});
+    }
+    throw error;
+  }
   return filePath;
 }
 
@@ -360,6 +467,57 @@ function buildGrandLivreRows(rows, search) {
   });
 
   return flattened;
+}
+
+function addGrandLivreSubtotalRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  if (rows.some((row) => row.row_type === "subtotal")) return rows;
+
+  const result = [];
+  let currentKey = "";
+  let subtotal = null;
+
+  const flushSubtotal = () => {
+    if (!subtotal) return;
+    result.push({
+      row_type: "subtotal",
+      date: null,
+      journal: null,
+      account_no: subtotal.account_no,
+      account_label: subtotal.account_label,
+      ref_piece: null,
+      lettrage: null,
+      debit: 0,
+      credit: 0,
+      solde_cumule: subtotal.solde,
+      total_debit: subtotal.total_debit,
+      total_credit: subtotal.total_credit,
+      solde: subtotal.solde,
+    });
+  };
+
+  rows.forEach((row) => {
+    const key = `${row.account_no}::${row.account_label}`;
+    if (key !== currentKey) {
+      flushSubtotal();
+      currentKey = key;
+      subtotal = {
+        account_no: row.account_no,
+        account_label: row.account_label,
+        total_debit: 0,
+        total_credit: 0,
+        solde: 0,
+      };
+    }
+
+    result.push(row);
+    subtotal.total_debit += toNumber(row.debit);
+    subtotal.total_credit += toNumber(row.credit);
+    subtotal.solde += toNumber(row.debit) - toNumber(row.credit);
+  });
+
+  flushSubtotal();
+  return result;
 }
 
 function buildBalanceGroups(rows, search) {
@@ -699,21 +857,45 @@ function DashboardBanner({ tone = "warning", children }) {
   return <div className={`dashboard-banner ${tone}`}>{children}</div>;
 }
 
-function DashboardLoader({ label }) {
+function percentFromCounts(loaded, total, complete = false) {
+  if (complete) return 100;
+  if (!Number.isFinite(total) || total <= 0) return 0;
+  return Math.max(0, Math.min(99, Math.floor((Number(loaded || 0) / Number(total)) * 100)));
+}
+
+function DashboardProgress({ loaded = 0, total = null, percent = 0, label }) {
+  const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+  const detail = Number.isFinite(total) && total > 0
+    ? `${Number(loaded || 0).toLocaleString()} / ${Number(total).toLocaleString()} · ${safePercent}%`
+    : `${safePercent}%`;
+
   return (
-    <div className="dashboard-state">
-      <div className="spinner" />
-      <div>{label}</div>
+    <div className="dashboard-progress" aria-label={label}>
+      <div className="dashboard-progress-track">
+        <div className="dashboard-progress-fill" style={{ width: `${safePercent}%` }} />
+      </div>
+      <div className="dashboard-progress-text">{label ? `${label} · ${detail}` : detail}</div>
     </div>
   );
 }
 
-function DashboardRefreshing({ active, label }) {
+function DashboardLoader({ label, progress = null }) {
+  return (
+    <div className="dashboard-state">
+      <div className="spinner" />
+      <div>{label}</div>
+      {progress ? <DashboardProgress {...progress} /> : null}
+    </div>
+  );
+}
+
+function DashboardRefreshing({ active, label, progress = null }) {
   if (!active) return null;
   return (
     <div className="dashboard-refreshing">
       <span className="spinner" style={{ width: 12, height: 12 }} />
       <span>{label}</span>
+      {progress ? <DashboardProgress {...progress} /> : null}
     </div>
   );
 }
@@ -777,6 +959,63 @@ function VirtualRows({ rows, rowHeight = 36, renderRow }) {
       <div style={{ height: totalHeight, position: "relative" }}>
         <div style={{ transform: `translateY(${offsetTop}px)` }}>
           {rows.slice(start, end).map((row, index) => renderRow(row, start + index))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VirtualPagedRows({
+  rowCount,
+  rowsByIndex,
+  rowHeight = 36,
+  renderRow,
+  renderPlaceholder,
+  loadRange,
+}) {
+  const bodyRef = useRef(null);
+  const [viewportHeight, setViewportHeight] = useState(560);
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useEffect(() => {
+    const node = bodyRef.current;
+    if (!node) return undefined;
+
+    const updateSize = () => setViewportHeight(node.clientHeight || 560);
+    updateSize();
+
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const totalHeight = Math.max(0, rowCount) * rowHeight;
+  const overscan = 20;
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleCount = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
+  const end = Math.min(rowCount, start + visibleCount);
+  const offsetTop = start * rowHeight;
+
+  useEffect(() => {
+    if (rowCount <= 0) return;
+    loadRange(start, end);
+  }, [end, loadRange, rowCount, start]);
+
+  const rendered = [];
+  for (let index = start; index < end; index += 1) {
+    const row = rowsByIndex.get(index);
+    rendered.push(row ? renderRow(row, index) : renderPlaceholder(index));
+  }
+
+  return (
+    <div
+      className="dashboard-virtual-body"
+      ref={bodyRef}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      <div style={{ height: totalHeight, position: "relative" }}>
+        <div style={{ transform: `translateY(${offsetTop}px)` }}>
+          {rendered}
         </div>
       </div>
     </div>
@@ -854,9 +1093,252 @@ function useDashboardQuery(fetcher, deps, enabled = true) {
   return state;
 }
 
+function useStreamingDashboardQuery(fetcher, deps, enabled = true) {
+  const [state, setState] = useState({
+    loading: enabled,
+    error: null,
+    warning: null,
+    data: null,
+    total: null,
+    loaded: 0,
+    percent: 0,
+    retained: 0,
+    limited: false,
+    complete: !enabled,
+  });
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+
+    let cancelled = false;
+    setState((current) => ({
+      ...current,
+      loading: true,
+      error: null,
+      warning: null,
+      total: null,
+      data: null,
+      loaded: 0,
+      percent: 0,
+      retained: 0,
+      limited: false,
+      complete: false,
+    }));
+
+    fetcher({
+      onTotal: ({ total, warning }) => {
+        if (cancelled) return;
+        setState((current) => ({
+          ...current,
+          loading: true,
+          warning: warning ?? current.warning,
+          total,
+          loaded: 0,
+          percent: 0,
+          complete: false,
+        }));
+      },
+      onRows: (rows, meta = {}) => {
+        if (cancelled) return;
+        setState((current) => {
+          const total = meta.total ?? current.total;
+          return {
+            ...current,
+            loading: true,
+            warning: meta.warning ?? current.warning,
+            total,
+            loaded: meta.loaded ?? rows.length,
+            percent: percentFromCounts(meta.loaded ?? rows.length, total, false),
+            complete: false,
+            data: rows,
+            retained: meta.retained ?? rows.length,
+            limited: Boolean(meta.limited),
+          };
+        });
+      },
+    })
+      .then((response) => {
+        if (cancelled) return;
+        const limited = Boolean(response?.limited);
+        const loaded = response?.loaded ?? response?.data?.length ?? 0;
+        const total = response?.total ?? null;
+        setState({
+          loading: false,
+          error: null,
+          warning: response?.warning ?? null,
+          total,
+          loaded,
+          percent: limited ? percentFromCounts(loaded, total, false) : 100,
+          complete: true,
+          data: response?.data ?? [],
+          retained: response?.retained ?? response?.data?.length ?? 0,
+          limited,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setState((current) => ({
+          ...current,
+          loading: false,
+          complete: false,
+          error: String(error),
+        }));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, deps);
+
+  return state;
+}
+
+function usePagedDashboardQuery(fetcher, deps, enabled = true) {
+  const rowsRef = useRef(new Map());
+  const pagesRef = useRef(new Set());
+  const pendingRef = useRef(new Set());
+  const pageOrderRef = useRef([]);
+  const tokenRef = useRef(0);
+  const [state, setState] = useState({
+    initialLoading: enabled,
+    loading: false,
+    error: null,
+    warning: null,
+    total: null,
+    loaded: 0,
+    rowsByIndex: new Map(),
+    complete: !enabled,
+  });
+
+  const resetCache = useCallback(() => {
+    rowsRef.current = new Map();
+    pagesRef.current = new Set();
+    pendingRef.current = new Set();
+    pageOrderRef.current = [];
+  }, []);
+
+  const loadPage = useCallback((pageIndex) => {
+    if (!enabled || pageIndex < 0 || pagesRef.current.has(pageIndex) || pendingRef.current.has(pageIndex)) {
+      return Promise.resolve();
+    }
+
+    const requestToken = tokenRef.current;
+    pendingRef.current.add(pageIndex);
+    setState((current) => ({
+      ...current,
+      loading: true,
+      error: null,
+    }));
+
+    const offset = pageIndex * LEDGER_PAGE_SIZE;
+    return fetcher(offset, LEDGER_PAGE_SIZE)
+      .then((response) => {
+        if (requestToken !== tokenRef.current) return;
+        const pageOffset = Number(response?.offset ?? offset);
+        const rows = Array.isArray(response?.data) ? response.data : [];
+
+        rows.forEach((row, rowIndex) => {
+          rowsRef.current.set(pageOffset + rowIndex, row);
+        });
+        pagesRef.current.add(pageIndex);
+        pageOrderRef.current.push(pageIndex);
+
+        while (pageOrderRef.current.length > LEDGER_CACHE_PAGES) {
+          const evicted = pageOrderRef.current.shift();
+          if (evicted == null) break;
+          pagesRef.current.delete(evicted);
+          const evictedOffset = evicted * LEDGER_PAGE_SIZE;
+          for (let rowIndex = evictedOffset; rowIndex < evictedOffset + LEDGER_PAGE_SIZE; rowIndex += 1) {
+            rowsRef.current.delete(rowIndex);
+          }
+        }
+
+        setState({
+          initialLoading: false,
+          loading: pendingRef.current.size > 1,
+          error: null,
+          warning: response?.warning ?? null,
+          total: Number(response?.total ?? 0),
+          loaded: rowsRef.current.size,
+          rowsByIndex: new Map(rowsRef.current),
+          complete: true,
+        });
+      })
+      .catch((error) => {
+        if (requestToken !== tokenRef.current) return;
+        setState((current) => ({
+          ...current,
+          initialLoading: false,
+          loading: false,
+          complete: false,
+          error: String(error),
+        }));
+      })
+      .finally(() => {
+        pendingRef.current.delete(pageIndex);
+        if (requestToken === tokenRef.current) {
+          setState((current) => ({
+            ...current,
+            loading: pendingRef.current.size > 0,
+          }));
+        }
+      });
+  }, deps);
+
+  const loadRange = useCallback((start, end) => {
+    const firstPage = Math.floor(Math.max(0, start) / LEDGER_PAGE_SIZE);
+    const lastPage = Math.floor(Math.max(0, end - 1) / LEDGER_PAGE_SIZE);
+    for (let pageIndex = firstPage; pageIndex <= lastPage; pageIndex += 1) {
+      loadPage(pageIndex);
+    }
+  }, [loadPage]);
+
+  useEffect(() => {
+    tokenRef.current += 1;
+    resetCache();
+
+    if (!enabled) {
+      setState({
+        initialLoading: false,
+        loading: false,
+        error: null,
+        warning: null,
+        total: null,
+        loaded: 0,
+        rowsByIndex: new Map(),
+        complete: true,
+      });
+      return undefined;
+    }
+
+    setState({
+      initialLoading: true,
+      loading: true,
+      error: null,
+      warning: null,
+      total: null,
+      loaded: 0,
+      rowsByIndex: new Map(),
+      complete: false,
+    });
+    loadPage(0);
+
+    return () => {
+      tokenRef.current += 1;
+      resetCache();
+    };
+  }, [enabled, loadPage, resetCache]);
+
+  return {
+    ...state,
+    loadRange,
+  };
+}
+
 function SectionExportButton({ onClick, disabled, busy, label }) {
+  const { canStartExport } = useExportJobs();
   return (
-    <button className="btn btn-accent" onClick={onClick} disabled={disabled || busy}>
+    <button className="btn btn-accent" onClick={onClick} disabled={disabled || busy || !canStartExport}>
       {busy ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {label}</> : label}
     </button>
   );
@@ -1060,14 +1542,11 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
   );
 }
 
-function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, exporting }) {
-  const deferredSearch = useDeferredValue(search);
-  const displayRows = useMemo(
-    () => buildGrandLivreRows(state.data ?? [], deferredSearch),
-    [state.data, deferredSearch],
-  );
+function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, exporting, exportProgress }) {
+  const rowCount = Number(state.total ?? 0);
+  const exportReady = !state.initialLoading && state.complete && !state.error;
 
-  if (state.loading && !state.data) {
+  if (state.initialLoading) {
     return <DashboardLoader label={t("dashboard_loading_gl")} />;
   }
 
@@ -1078,7 +1557,21 @@ function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, expor
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
-      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
+      <DashboardBanner tone="info">{t("dashboard_full_range_rows", rowCount)}</DashboardBanner>
+      <DashboardRefreshing active={state.loading} label={t("loading")} />
+      {exporting && exportProgress ? (
+        <DashboardProgress
+          loaded={exportProgress.loaded_rows}
+          total={exportProgress.total_rows}
+          percent={exportProgress.percent}
+          label={t(
+            "dashboard_export_progress",
+            exportProgress.total_parts > 1
+              ? `${exportProgress.current_part}/${exportProgress.total_parts} · ${exportProgress.current_sheet}`
+              : exportProgress.current_sheet,
+          )}
+        />
+      ) : null}
 
       <div className="dashboard-section-toolbar">
         <input
@@ -1089,14 +1582,14 @@ function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, expor
         />
         <div className="toolbar-spacer" />
         <SectionExportButton
-          onClick={() => onExport(displayRows)}
-          disabled={!displayRows.length}
+          onClick={onExport}
+          disabled={!exportReady}
           busy={exporting}
           label={t("dashboard_export_tab")}
         />
       </div>
 
-      {!displayRows.length ? (
+      {!rowCount ? (
         <DashboardEmpty title={t("dashboard_no_data")} detail={t("dashboard_no_matches")} />
       ) : (
         <div className="dashboard-ledger">
@@ -1112,37 +1605,20 @@ function GrandLivreTab({ state, t, lang, search, onSearchChange, onExport, expor
             <div className="right">{t("dashboard_running_balance")}</div>
           </div>
 
-          <VirtualRows
-            rows={displayRows}
-            renderRow={(row) => {
-              if (row.type === "account-header") {
-                return (
-                  <div key={row.key} className="dashboard-ledger-row account-header-row" style={{ gridTemplateColumns: GRAND_LIVRE_GRID }}>
-                    <div className="dashboard-span-cell">{row.account_no} - {row.account_label}</div>
-                  </div>
-                );
-              }
-
-              if (row.type === "subtotal") {
-                return (
-                  <div key={row.key} className="dashboard-ledger-row subtotal-row" style={{ gridTemplateColumns: GRAND_LIVRE_GRID }}>
-                    <div>{t("dashboard_total")}</div>
-                    <div />
-                    <div>{row.account_no}</div>
-                    <div>{row.account_label}</div>
-                    <div />
-                    <div />
-                    <div className="right"><Amount value={row.total_debit} lang={lang} /></div>
-                    <div className="right"><Amount value={row.total_credit} lang={lang} /></div>
-                    <div className="right"><Amount value={row.solde} lang={lang} /></div>
-                  </div>
-                );
-              }
-
+          <VirtualPagedRows
+            rowCount={rowCount}
+            rowsByIndex={state.rowsByIndex}
+            loadRange={state.loadRange}
+            renderPlaceholder={(index) => (
+              <div key={`loading-${index}`} className="dashboard-ledger-row alt" style={{ gridTemplateColumns: GRAND_LIVRE_GRID }}>
+                <div className="dashboard-span-cell">{t("loading")}</div>
+              </div>
+            )}
+            renderRow={(row, index) => {
               return (
                 <div
-                  key={row.key}
-                  className={`dashboard-ledger-row ${row.alt ? "alt" : ""}`}
+                  key={`${index}-${row.account_no}-${row.date ?? ""}-${row.ref_piece ?? ""}`}
+                  className={`dashboard-ledger-row ${index % 2 === 1 ? "alt" : ""}`}
                   style={{ gridTemplateColumns: GRAND_LIVRE_GRID }}
                 >
                   <div>{row.date || "-"}</div>
@@ -1314,6 +1790,38 @@ function BalanceTab({
   );
 }
 
+function TiersTab({ state, t, lang, tiersType, onTypeChange, search, onSearchChange, onExport, exporting }) {
+  if (state.loading && !state.data) return <DashboardLoader label={t("dashboard_loading_tiers")} />;
+  if (state.error) return <DashboardBanner tone="error">{state.error}</DashboardBanner>;
+  const rows = state.data ?? [];
+  const possiblyLimited = rows.length >= 100;
+  return (
+    <div className="dashboard-stack">
+      <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
+      {possiblyLimited ? <DashboardBanner tone="info">{t("dashboard_tiers_export_limited")}</DashboardBanner> : null}
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
+      <div className="dashboard-section-toolbar">
+        <select className="dashboard-input" value={tiersType} onChange={(event) => onTypeChange(event.target.value)}>
+          <option value="all">{t("dashboard_all_tiers")}</option>
+          <option value="clients">{t("dashboard_clients")}</option>
+          <option value="fournisseurs">{t("dashboard_suppliers")}</option>
+        </select>
+        <input className="dashboard-input" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={t("dashboard_tiers_search_ph")} />
+        <div className="toolbar-spacer" />
+        <SectionExportButton onClick={() => onExport(rows)} disabled={!rows.length || possiblyLimited} busy={exporting} label={t("dashboard_export_tab")} />
+      </div>
+      {!rows.length ? <DashboardEmpty title={t("dashboard_no_data")} detail={t("dashboard_no_matches")} /> : (
+        <div className="dashboard-card dashboard-balance-card"><div className="dashboard-balance-wrap">
+          <table className="dashboard-balance-table">
+            <thead><tr><th>{t("dashboard_tiers_code")}</th><th>{t("dashboard_label")}</th><th>{t("dashboard_type")}</th><th>{t("dashboard_account_no")}</th><th>{t("dashboard_debit")}</th><th>{t("dashboard_credit")}</th><th>{t("dashboard_running_balance")}</th><th>{t("dashboard_last_movement")}</th></tr></thead>
+            <tbody>{rows.map((row) => <tr key={`${row.code}-${row.tiers_type}`}><td>{row.code}</td><td>{row.name}</td><td>{row.tiers_type || "unknown"}</td><td>{row.account_no || "-"}</td><td className="right">{row.debit == null ? "-" : <Amount value={row.debit} lang={lang} />}</td><td className="right">{row.credit == null ? "-" : <Amount value={row.credit} lang={lang} />}</td><td className="right">{row.balance == null ? "-" : <Amount value={row.balance} lang={lang} />}</td><td>{row.last_movement_date || "-"}</td></tr>)}</tbody>
+          </table>
+        </div></div>
+      )}
+    </div>
+  );
+}
+
 function AuxiliaireTab({
   state,
   t,
@@ -1343,9 +1851,16 @@ function AuxiliaireTab({
     () => Math.max(1, ...visibleTiers.map((tier) => Math.abs(toNumber(tier.solde)))),
     [visibleTiers],
   );
+  const progress = {
+    loaded: state.loaded ?? 0,
+    total: state.total,
+    percent: state.percent ?? percentFromCounts(state.loaded, state.total, state.complete),
+    label: t("dashboard_streaming_progress"),
+  };
+  const exportDisabled = state.loading || state.limited || !visibleRows.length;
 
   if (state.loading && !state.data) {
-    return <DashboardLoader label={title} />;
+    return <DashboardLoader label={title} progress={progress} />;
   }
 
   if (state.error) {
@@ -1355,14 +1870,17 @@ function AuxiliaireTab({
   return (
     <div className="dashboard-stack">
       <DashboardBanner tone="warning">{state.warning}</DashboardBanner>
-      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} />
+      {state.limited ? (
+        <DashboardBanner tone="info">{t("dashboard_aux_preview_limited", state.retained, state.total)}</DashboardBanner>
+      ) : null}
+      <DashboardRefreshing active={state.loading && !!state.data} label={t("loading")} progress={progress} />
 
       <div className="dashboard-section-toolbar">
         <div className="dashboard-section-caption">{t("dashboard_aux_export_hint")}</div>
         <div className="toolbar-spacer" />
         <SectionExportButton
           onClick={() => onExport(visibleRows)}
-          disabled={!visibleRows.length}
+          disabled={exportDisabled}
           busy={exporting}
           label={t("dashboard_export_tab")}
         />
@@ -1498,6 +2016,7 @@ export default function Dashboard({
   onBackToTables,
   onOpenSettings,
 }) {
+  const { activeJobs, beginLocalJob, updateLocalJob } = useExportJobs();
   const range = useMemo(() => getDefaultRange(), []);
   const [activeTab, setActiveTab] = useState(TAB_IDS.OVERVIEW);
   const [dateFrom, setDateFrom] = useState(range.dateFrom);
@@ -1506,14 +2025,41 @@ export default function Dashboard({
   const [balanceSearch, setBalanceSearch] = useState("");
   const [supplierSearch, setSupplierSearch] = useState("");
   const [clientSearch, setClientSearch] = useState("");
+  const [tiersSearch, setTiersSearch] = useState("");
+  const [tiersType, setTiersType] = useState("all");
+  const [fiscalSettings, setFiscalSettings] = useState({ fiscal_year_start_month: 1, fiscal_year_start_day: 1 });
+  const [periodPreset, setPeriodPreset] = useState("custom");
+  const [monthPreset, setMonthPreset] = useState("all");
   const [selectedSupplierTier, setSelectedSupplierTier] = useState(null);
   const [selectedClientTier, setSelectedClientTier] = useState(null);
   const [collapsedClasses, setCollapsedClasses] = useState({});
   const [exportingWorkbook, setExportingWorkbook] = useState(false);
-  const [exportingTab, setExportingTab] = useState(null);
+  const [exportError, setExportError] = useState(null);
+  const [grandLivreExportProgress, setGrandLivreExportProgress] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [exploitationExportData, setExploitationExportData] = useState(null);
+  const deferredGrandLivreSearch = useDeferredValue(grandLivreSearch);
+  const deferredTiersSearch = useDeferredValue(tiersSearch);
+  const tabExportIsActive = useCallback((tabId) => activeJobs.some(
+    (job) => job.dedupe_key === `dashboard:${connId}:${tabId}:${dateFrom}:${dateTo}`,
+  ), [activeJobs, connId, dateFrom, dateTo]);
+  const globalExportIsActive = activeJobs.some(
+    (job) => job.dedupe_key === `dashboard-global:${connId}:${dateFrom}:${dateTo}`,
+  );
+  const exportsAtCapacity = activeJobs.length >= 2;
+  const grandLivreExportIsActive = activeJobs.some((job) => job.dedupe_key === "grand-livre-global");
+
+  useEffect(() => {
+    getSettings()
+      .then((settings) => setFiscalSettings({
+        fiscal_year_start_month: Number(settings?.fiscal_year_start_month) || 1,
+        fiscal_year_start_day: Number(settings?.fiscal_year_start_day) || 1,
+      }))
+      .catch(() => setFiscalSettings({ fiscal_year_start_month: 1, fiscal_year_start_day: 1 }));
+  }, []);
 
   const handleRefresh = useCallback(() => {
+    setExportError(null);
     setRefreshTick((current) => current + 1);
   }, []);
 
@@ -1523,9 +2069,9 @@ export default function Dashboard({
     !!connId,
   );
 
-  const grandLivreState = useDashboardQuery(
-    () => getGrandLivre(connId, dateFrom, dateTo, null),
-    [connId, dateFrom, dateTo, activeTab, refreshTick],
+  const grandLivreState = usePagedDashboardQuery(
+    (offset, limit) => getGrandLivrePage(connId, dateFrom, dateTo, null, offset, limit, deferredGrandLivreSearch),
+    [connId, dateFrom, dateTo, activeTab, refreshTick, deferredGrandLivreSearch],
     !!connId && activeTab === TAB_IDS.GRAND_LIVRE,
   );
 
@@ -1535,14 +2081,28 @@ export default function Dashboard({
     !!connId && activeTab === TAB_IDS.BALANCE,
   );
 
-  const fournisseursState = useDashboardQuery(
-    () => getGrandLivreAuxiliaire(connId, dateFrom, dateTo, "fournisseurs", null),
+  const tiersState = useDashboardQuery(
+    () => getDashboardTiers(connId, tiersType, deferredTiersSearch),
+    [connId, tiersType, deferredTiersSearch, activeTab, refreshTick],
+    !!connId && activeTab === TAB_IDS.TIERS,
+  );
+
+  const fournisseursState = useStreamingDashboardQuery(
+    (handlers) => streamGrandLivreAuxiliaire(connId, dateFrom, dateTo, "fournisseurs", null, handlers, {
+      label: "GL fournisseurs",
+      previewLimit: DASHBOARD_PREVIEW_ROW_LIMIT,
+      maxRetainedRows: DASHBOARD_PREVIEW_ROW_LIMIT,
+    }),
     [connId, dateFrom, dateTo, activeTab, refreshTick],
     !!connId && activeTab === TAB_IDS.FOURNISSEURS,
   );
 
-  const clientsState = useDashboardQuery(
-    () => getGrandLivreAuxiliaire(connId, dateFrom, dateTo, "clients", null),
+  const clientsState = useStreamingDashboardQuery(
+    (handlers) => streamGrandLivreAuxiliaire(connId, dateFrom, dateTo, "clients", null, handlers, {
+      label: "GL clients",
+      previewLimit: DASHBOARD_PREVIEW_ROW_LIMIT,
+      maxRetainedRows: DASHBOARD_PREVIEW_ROW_LIMIT,
+    }),
     [connId, dateFrom, dateTo, activeTab, refreshTick],
     !!connId && activeTab === TAB_IDS.CLIENTS,
   );
@@ -1550,12 +2110,16 @@ export default function Dashboard({
   const activeTabLoading = activeTab === TAB_IDS.OVERVIEW
     ? overviewState.loading
     : activeTab === TAB_IDS.GRAND_LIVRE
-      ? grandLivreState.loading
+      ? grandLivreState.initialLoading || grandLivreState.loading
       : activeTab === TAB_IDS.BALANCE
         ? balanceState.loading
         : activeTab === TAB_IDS.FOURNISSEURS
           ? fournisseursState.loading
-          : clientsState.loading;
+          : activeTab === TAB_IDS.CLIENTS
+            ? clientsState.loading
+            : activeTab === TAB_IDS.COMPTE_EXPLOITATION
+              ? false
+              : tiersState.loading;
 
   useEffect(() => {
     setActiveTab(TAB_IDS.OVERVIEW);
@@ -1563,9 +2127,13 @@ export default function Dashboard({
     setBalanceSearch("");
     setSupplierSearch("");
     setClientSearch("");
+    setTiersSearch("");
+    setTiersType("all");
     setSelectedSupplierTier(null);
     setSelectedClientTier(null);
     setCollapsedClasses({});
+    setExportError(null);
+    setGrandLivreExportProgress(null);
   }, [connId, databaseName]);
 
   useEffect(() => {
@@ -1584,6 +2152,8 @@ export default function Dashboard({
     { id: TAB_IDS.OVERVIEW, label: t("dashboard_tab_overview") },
     { id: TAB_IDS.GRAND_LIVRE, label: t("dashboard_tab_grand_livre") },
     { id: TAB_IDS.BALANCE, label: t("dashboard_tab_balance") },
+    { id: TAB_IDS.COMPTE_EXPLOITATION, label: t("dashboard_tab_exploitation") },
+    { id: TAB_IDS.TIERS, label: t("dashboard_tab_tiers") },
     { id: TAB_IDS.FOURNISSEURS, label: t("dashboard_tab_suppliers") },
     { id: TAB_IDS.CLIENTS, label: t("dashboard_tab_clients") },
   ];
@@ -1599,84 +2169,248 @@ export default function Dashboard({
   }), [connectionName, databaseName, dateFrom, dateTo, lang, t]);
 
   const fetchAllSheetsData = useCallback(async () => {
-    const [overview, grandLivre, balance, fournisseurs, clients] = await Promise.all([
+    const [overview, balance] = await Promise.all([
       overviewState.data ? Promise.resolve({ data: overviewState.data }) : getDashboardKpis(connId, dateFrom, dateTo, null),
-      grandLivreState.data ? Promise.resolve({ data: grandLivreState.data }) : getGrandLivre(connId, dateFrom, dateTo, null),
       balanceState.data ? Promise.resolve({ data: balanceState.data }) : getBalance(connId, dateFrom, dateTo, null),
-      fournisseursState.data ? Promise.resolve({ data: fournisseursState.data }) : getGrandLivreAuxiliaire(connId, dateFrom, dateTo, "fournisseurs", null),
-      clientsState.data ? Promise.resolve({ data: clientsState.data }) : getGrandLivreAuxiliaire(connId, dateFrom, dateTo, "clients", null),
     ]);
 
     return {
       overview: overview?.data ?? {},
-      grandLivre: grandLivre?.data ?? [],
       balance: balance?.data ?? [],
-      fournisseurs: fournisseurs?.data ?? [],
-      clients: clients?.data ?? [],
     };
   }, [
     balanceState.data,
-    clientsState.data,
     connId,
     dateFrom,
     dateTo,
-    fournisseursState.data,
-    grandLivreState.data,
     overviewState.data,
   ]);
 
-  const exportSheet = useCallback(async (tabId, sheets) => {
-    setExportingTab(tabId);
+  const exportSheet = useCallback(async (tabId, buildSheets) => {
+    const tracked = beginLocalJob(`Dashboard ${tabId}`, "dashboard-xlsx", `dashboard:${connId}:${tabId}:${dateFrom}:${dateTo}`);
+    if (tracked.existing) return;
+    setExportError(null);
     try {
-      await saveWorkbook(`dashboard-${tabId}-${dateFrom}-${dateTo}.xlsx`, sheets);
-    } finally {
-      setExportingTab(null);
+      const filePath = await saveWorkbook(
+        `dashboard-${tabId}-${dateFrom}-${dateTo}.xlsx`,
+        buildSheets,
+        (progress) => updateLocalJob(tracked.job.id, progress),
+      );
+      if (!filePath) {
+        updateLocalJob(tracked.job.id, { status: "cancelled", phase: "cancelled", finished_at: new Date().toISOString() });
+        return;
+      }
+      updateLocalJob(tracked.job.id, { status: "completed", phase: "completed", percent: 100, finished_at: new Date().toISOString() });
+    } catch (error) {
+      setExportError(String(error));
+      updateLocalJob(tracked.job.id, { status: "failed", phase: "failed", error: String(error), finished_at: new Date().toISOString() });
+      throw error;
     }
-  }, [dateFrom, dateTo]);
+  }, [beginLocalJob, connId, dateFrom, dateTo, updateLocalJob]);
 
   const exportOverview = useCallback(async () => {
     if (!overviewState.data) return;
-    await exportSheet(TAB_IDS.OVERVIEW, [
+    await exportSheet(TAB_IDS.OVERVIEW, async () => [
       { name: "Vue Générale", worksheet: buildOverviewWorksheet(overviewState.data, t, lang, buildExportOptions(t("dashboard_tab_overview"))) },
     ]);
   }, [buildExportOptions, exportSheet, lang, overviewState.data, t]);
 
-  const exportGrandLivreTab = useCallback(async (displayRows) => {
-    if (!displayRows.length) return;
-    await exportSheet(TAB_IDS.GRAND_LIVRE, [
-      { name: "Grand Livre", worksheet: buildGrandLivreWorksheet(displayRows, t, lang, buildExportOptions(t("dashboard_tab_grand_livre"))) },
-    ]);
-  }, [buildExportOptions, exportSheet, lang, t]);
+  const exportGrandLivreTab = useCallback(async () => {
+    if (grandLivreState.loading || !grandLivreState.complete || grandLivreState.error) return;
+
+    // Grand Livre currently uses shared legacy progress event names, so serialize it until
+    // the backend event contract carries a job id.
+    const tracked = beginLocalJob("Grand Livre XLSX", "grand-livre-xlsx", "grand-livre-global");
+    if (tracked.existing) return;
+    setExportError(null);
+    try {
+      const filePath = await save({
+        defaultPath: `dashboard-${TAB_IDS.GRAND_LIVRE}-${dateFrom}-${dateTo}.xlsx`,
+        filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+      });
+      if (!filePath) {
+        updateLocalJob(tracked.job.id, { status: "cancelled", phase: "cancelled", finished_at: new Date().toISOString() });
+        return;
+      }
+
+      setGrandLivreExportProgress({
+        loaded_rows: 0,
+        total_rows: grandLivreState.total ?? 0,
+        percent: 0,
+        current_sheet: 1,
+        phase: "starting",
+      });
+      const outputPaths = new Set();
+      await exportGrandLivreXlsx(connId, dateFrom, dateTo, null, filePath, {
+        onProgress: (progress) => {
+          if (progress.output_path) outputPaths.add(progress.output_path);
+          setGrandLivreExportProgress(progress);
+          updateLocalJob(tracked.job.id, {
+            phase: progress.phase,
+            percent: progress.percent,
+            processed_rows: progress.loaded_rows,
+            total_rows: progress.total_rows,
+            output_paths: [...outputPaths],
+          });
+        },
+        onComplete: (progress) => {
+          setGrandLivreExportProgress(progress);
+          updateLocalJob(tracked.job.id, { status: "completed", phase: "completed", percent: 100, finished_at: new Date().toISOString() });
+        },
+        onError: (error) => setExportError(String(error)),
+      });
+      updateLocalJob(tracked.job.id, {
+        status: "completed",
+        phase: "completed",
+        percent: 100,
+        output_paths: [...outputPaths],
+        finished_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      setExportError(String(error));
+      updateLocalJob(tracked.job.id, { status: "failed", phase: "failed", error: String(error), finished_at: new Date().toISOString() });
+      throw error;
+    } finally {
+      setGrandLivreExportProgress(null);
+    }
+  }, [
+    connId,
+    beginLocalJob,
+    dateFrom,
+    dateTo,
+    grandLivreState.complete,
+    grandLivreState.error,
+    grandLivreState.loading,
+    grandLivreState.total,
+    updateLocalJob,
+  ]);
 
   const exportBalanceTab = useCallback(async (rows) => {
     if (!rows.length) return;
-    await exportSheet(TAB_IDS.BALANCE, [
+    await exportSheet(TAB_IDS.BALANCE, async () => [
       { name: "Balance", worksheet: buildBalanceWorksheet(rows, t, lang, buildExportOptions(t("dashboard_tab_balance"))) },
     ]);
   }, [buildExportOptions, exportSheet, lang, t]);
 
+  const exportExploitationTab = useCallback(async (report) => {
+    if (!report?.rows?.length) return;
+    await exportSheet(TAB_IDS.COMPTE_EXPLOITATION, async () => [
+      { name: "Compte exploitation", worksheet: buildExploitationWorksheet(report, t, lang, {
+        ...buildExportOptions(report.title || `${t("dashboard_tab_exploitation")} ${report.year || ""}`),
+        title: `${report.title || databaseName || t("dashboard_tab_exploitation")} · ${report.year || ""}`,
+        period: `${t("exploitation_year")}: ${report.year || ""}`,
+      }) },
+    ]);
+  }, [buildExportOptions, databaseName, exportSheet, lang, t]);
+
+  const exportExploitationDetail = useCallback(async (detail) => {
+    await exportSheet(`${TAB_IDS.COMPTE_EXPLOITATION}-detail`, async () => [{
+      name: "Detail exploitation",
+      worksheet: buildExploitationDetailWorksheet(detail, t, lang, buildExportOptions(detail.line.lineLabel)),
+    }]);
+  }, [buildExportOptions, exportSheet, lang, t]);
+
+  const exportTiersTab = useCallback(async (rows) => {
+    if (!rows.length) return;
+    await exportSheet(TAB_IDS.TIERS, async () => {
+      const sheetRows = [
+        { kind: "header", values: [t("dashboard_tiers_code"), t("dashboard_label"), t("dashboard_type"), t("dashboard_account_no"), t("dashboard_debit"), t("dashboard_credit"), t("dashboard_running_balance"), t("dashboard_last_movement")] },
+        ...rows.map((row) => ({ kind: "data", values: [row.code, row.name, row.tiers_type, row.account_no || "", row.debit, row.credit, row.balance, row.last_movement_date || ""] })),
+      ];
+      return [
+        { name: "Tiers", worksheet: buildWorksheet(sheetRows, ["text", "text", "text", "text", "debit", "credit", "balance", "text"], lang, buildExportOptions(t("dashboard_tab_tiers"))) },
+      ];
+    });
+  }, [buildExportOptions, exportSheet, lang, t]);
+
+  const exerciseYears = useMemo(() => {
+    const current = new Date().getUTCFullYear();
+    return Array.from({ length: 8 }, (_, index) => current + 1 - index);
+  }, []);
+
+  const applyExercise = useCallback((value) => {
+    setPeriodPreset(value);
+    setMonthPreset("all");
+    if (value === "custom") return;
+    const next = getFiscalRange(Number(value), fiscalSettings.fiscal_year_start_month, fiscalSettings.fiscal_year_start_day);
+    setDateFrom(next.dateFrom);
+    setDateTo(next.dateTo);
+  }, [fiscalSettings]);
+
+  const applyMonth = useCallback((value) => {
+    setMonthPreset(value);
+    if (value === "all") {
+      if (periodPreset !== "custom") applyExercise(periodPreset);
+      return;
+    }
+    const month = Number(value);
+    const year = periodPreset === "custom"
+      ? Number(dateFrom.slice(0, 4))
+      : Number(periodPreset) + (month < fiscalSettings.fiscal_year_start_month ? 1 : 0);
+    const start = new Date(Date.UTC(year, month - 1, 1));
+    const end = new Date(Date.UTC(year, month, 0));
+    setDateFrom(toIsoDate(start));
+    setDateTo(toIsoDate(end));
+  }, [applyExercise, dateFrom, fiscalSettings.fiscal_year_start_month, periodPreset]);
+
   const exportAuxiliaryTab = useCallback(async (tabId, displayRows, sheetName) => {
     if (!displayRows.length) return;
-    await exportSheet(tabId, [
+    await exportSheet(tabId, async () => [
       { name: sheetName, worksheet: buildAuxiliaryWorksheet(displayRows, t, lang, buildExportOptions(sheetName)) },
     ]);
   }, [buildExportOptions, exportSheet, lang, t]);
 
   const exportDashboardWorkbook = useCallback(async () => {
+    const tracked = beginLocalJob("Global dashboard XLSX", "dashboard-xlsx", `dashboard-global:${connId}:${dateFrom}:${dateTo}`);
+    if (tracked.existing) return;
     setExportingWorkbook(true);
+    setExportError(null);
     try {
-      const data = await fetchAllSheetsData();
-      await saveWorkbook(`dashboard-${databaseName}-${dateFrom}-${dateTo}.xlsx`, [
-        { name: "Vue Générale", worksheet: buildOverviewWorksheet(data.overview, t, lang, buildExportOptions(t("dashboard_tab_overview"))) },
-        { name: "Grand Livre", worksheet: buildGrandLivreWorksheet(buildGrandLivreRows(data.grandLivre, ""), t, lang, buildExportOptions(t("dashboard_tab_grand_livre"))) },
-        { name: "Balance", worksheet: buildBalanceWorksheet(data.balance, t, lang, buildExportOptions(t("dashboard_tab_balance"))) },
-        { name: "GL Fournisseurs", worksheet: buildAuxiliaryWorksheet(buildAuxiliaryDisplayRows(data.fournisseurs, null), t, lang, buildExportOptions(t("dashboard_tab_suppliers"))) },
-        { name: "GL Clients", worksheet: buildAuxiliaryWorksheet(buildAuxiliaryDisplayRows(data.clients, null), t, lang, buildExportOptions(t("dashboard_tab_clients"))) },
-      ]);
+      const filePath = await saveWorkbook(
+        `dashboard-${databaseName}-${dateFrom}-${dateTo}.xlsx`,
+        async () => {
+          updateLocalJob(tracked.job.id, { phase: "loading dashboard data", percent: 15 });
+          const data = await fetchAllSheetsData();
+          return [
+            { name: "Vue Générale", worksheet: buildOverviewWorksheet(data.overview, t, lang, buildExportOptions(t("dashboard_tab_overview"))) },
+            { name: "Balance", worksheet: buildBalanceWorksheet(data.balance, t, lang, buildExportOptions(t("dashboard_tab_balance"))) },
+            ...(exploitationExportData?.rows?.length ? [{
+              name: "Compte exploitation",
+              worksheet: buildExploitationWorksheet(exploitationExportData, t, lang, {
+                ...buildExportOptions(exploitationExportData.title || t("dashboard_tab_exploitation")),
+                title: `${exploitationExportData.title || databaseName || t("dashboard_tab_exploitation")} · ${exploitationExportData.year || ""}`,
+                period: `${t("exploitation_year")}: ${exploitationExportData.year || ""}`,
+              }),
+            }] : []),
+            {
+              name: "Notes",
+              worksheet: buildWorksheet(
+                [
+                  { kind: "header", values: [t("dashboard_export_notes")] },
+                  { kind: "data", values: [t("dashboard_full_export_limited")] },
+                ],
+                ["text"],
+                lang,
+                buildExportOptions(t("dashboard_export_notes")),
+              ),
+            },
+          ];
+        },
+        (progress) => updateLocalJob(tracked.job.id, progress),
+      );
+      if (!filePath) {
+        updateLocalJob(tracked.job.id, { status: "cancelled", phase: "cancelled", finished_at: new Date().toISOString() });
+        return;
+      }
+      updateLocalJob(tracked.job.id, { status: "completed", phase: "completed", percent: 100, finished_at: new Date().toISOString() });
+    } catch (error) {
+      setExportError(String(error));
+      updateLocalJob(tracked.job.id, { status: "failed", phase: "failed", error: String(error), finished_at: new Date().toISOString() });
+      throw error;
     } finally {
       setExportingWorkbook(false);
     }
-  }, [buildExportOptions, databaseName, dateFrom, dateTo, fetchAllSheetsData, lang, t]);
+  }, [beginLocalJob, buildExportOptions, connId, databaseName, dateFrom, dateTo, exploitationExportData, fetchAllSheetsData, lang, t, updateLocalJob]);
 
   return (
     <div className="dashboard-view">
@@ -1704,12 +2438,29 @@ export default function Dashboard({
 
         <div className="dashboard-header-range">
           <label className="dashboard-field">
+            <span>{t("dashboard_exercise")}</span>
+            <select className="dashboard-input" value={periodPreset} onChange={(event) => applyExercise(event.target.value)}>
+              <option value="custom">{t("dashboard_custom_period")}</option>
+              {exerciseYears.map((year) => {
+                const exercise = getFiscalRange(year, fiscalSettings.fiscal_year_start_month, fiscalSettings.fiscal_year_start_day);
+                return <option key={year} value={year}>{exercise.dateFrom} - {exercise.dateTo}</option>;
+              })}
+            </select>
+          </label>
+          <label className="dashboard-field">
+            <span>{t("dashboard_month")}</span>
+            <select className="dashboard-input" value={monthPreset} onChange={(event) => applyMonth(event.target.value)}>
+              <option value="all">{t("dashboard_all_months")}</option>
+              {Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={index + 1}>{String(index + 1).padStart(2, "0")}</option>)}
+            </select>
+          </label>
+          <label className="dashboard-field">
             <span>{t("dashboard_date_from")}</span>
-            <input type="date" className="dashboard-input" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
+            <input type="date" className="dashboard-input" value={dateFrom} onChange={(event) => { setDateFrom(event.target.value); setPeriodPreset("custom"); setMonthPreset("all"); }} />
           </label>
           <label className="dashboard-field">
             <span>{t("dashboard_date_to")}</span>
-            <input type="date" className="dashboard-input" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
+            <input type="date" className="dashboard-input" value={dateTo} onChange={(event) => { setDateTo(event.target.value); setPeriodPreset("custom"); setMonthPreset("all"); }} />
           </label>
         </div>
 
@@ -1731,11 +2482,17 @@ export default function Dashboard({
             )}
             {activeTabLoading ? t("loading") : t("refresh")}
           </button>
-          <button className="btn btn-accent dashboard-export-btn" onClick={exportDashboardWorkbook} disabled={exportingWorkbook}>
-            {exportingWorkbook ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {t("dashboard_exporting")}</> : t("dashboard_export_dashboard")}
+          <button className="btn btn-accent dashboard-export-btn" onClick={exportDashboardWorkbook} disabled={exportingWorkbook || globalExportIsActive || exportsAtCapacity || activeTabLoading}>
+            {exportingWorkbook || globalExportIsActive ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {t("dashboard_exporting")}</> : t("dashboard_export_dashboard")}
           </button>
         </div>
       </div>
+
+      {exportError ? (
+        <div className="dashboard-export-error">
+          <DashboardBanner tone="error">{exportError}</DashboardBanner>
+        </div>
+      ) : null}
 
       <div className="dashboard-tabbar">
         {tabs.map((tab) => (
@@ -1756,7 +2513,7 @@ export default function Dashboard({
             t={t}
             lang={lang}
             onExport={exportOverview}
-            exporting={exportingTab === TAB_IDS.OVERVIEW}
+            exporting={tabExportIsActive(TAB_IDS.OVERVIEW)}
           />
         ) : null}
 
@@ -1768,7 +2525,8 @@ export default function Dashboard({
             search={grandLivreSearch}
             onSearchChange={setGrandLivreSearch}
             onExport={exportGrandLivreTab}
-            exporting={exportingTab === TAB_IDS.GRAND_LIVRE}
+            exporting={grandLivreExportIsActive}
+            exportProgress={grandLivreExportProgress}
           />
         ) : null}
 
@@ -1784,8 +2542,16 @@ export default function Dashboard({
               setCollapsedClasses((current) => ({ ...current, [classCode]: !current[classCode] }))
             }
             onExport={exportBalanceTab}
-            exporting={exportingTab === TAB_IDS.BALANCE}
+            exporting={tabExportIsActive(TAB_IDS.BALANCE)}
           />
+        ) : null}
+
+        {activeTab === TAB_IDS.COMPTE_EXPLOITATION ? (
+          <CompteExploitationTab connId={connId} databaseName={databaseName} t={t} lang={lang} refreshTick={refreshTick} onExport={exportExploitationTab} onExportDetail={exportExploitationDetail} onReportChange={setExploitationExportData} exporting={tabExportIsActive(TAB_IDS.COMPTE_EXPLOITATION)} />
+        ) : null}
+
+        {activeTab === TAB_IDS.TIERS ? (
+          <TiersTab state={tiersState} t={t} lang={lang} tiersType={tiersType} onTypeChange={setTiersType} search={tiersSearch} onSearchChange={setTiersSearch} onExport={exportTiersTab} exporting={tabExportIsActive(TAB_IDS.TIERS)} />
         ) : null}
 
         {activeTab === TAB_IDS.FOURNISSEURS ? (
@@ -1799,7 +2565,7 @@ export default function Dashboard({
             onSelectTier={setSelectedSupplierTier}
             title={t("dashboard_loading_suppliers")}
             onExport={(rows) => exportAuxiliaryTab(TAB_IDS.FOURNISSEURS, rows, "GL Fournisseurs")}
-            exporting={exportingTab === TAB_IDS.FOURNISSEURS}
+            exporting={tabExportIsActive(TAB_IDS.FOURNISSEURS)}
           />
         ) : null}
 
@@ -1814,7 +2580,7 @@ export default function Dashboard({
             onSelectTier={setSelectedClientTier}
             title={t("dashboard_loading_clients")}
             onExport={(rows) => exportAuxiliaryTab(TAB_IDS.CLIENTS, rows, "GL Clients")}
-            exporting={exportingTab === TAB_IDS.CLIENTS}
+            exporting={tabExportIsActive(TAB_IDS.CLIENTS)}
           />
         ) : null}
       </div>
