@@ -112,8 +112,8 @@ export default function AutocompleteInput({
             background: "var(--bg-modal)",
             border: "1px solid var(--border-mid)",
             borderRadius: "var(--r-md)",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
-            maxHeight: 220,
+            boxShadow: "0 6.56px 19.68px rgba(0,0,0,0.4)",
+            maxHeight: 180.4,
             overflowY: "auto",
             marginTop: 2,
           }}
@@ -125,13 +125,13 @@ export default function AutocompleteInput({
               style={{
                 display: "flex",
                 alignItems: "center",
-                padding: "7px 12px",
-                fontSize: "12.5px",
+                padding: "5.74px 9.84px",
+                fontSize: "10.25px",
                 fontFamily: "var(--font-mono)",
                 color: idx === activeIndex ? "var(--accent)" : "var(--text-mid)",
                 background: idx === activeIndex ? "var(--accent-mute)" : "transparent",
                 cursor: "pointer",
-                gap: 6,
+                gap: 4.92,
               }}
               onMouseEnter={(e) => {
                 if (idx !== activeIndex) {
@@ -146,7 +146,7 @@ export default function AutocompleteInput({
                 }
               }}
             >
-              <span style={{ flexShrink: 0, opacity: 0.5, fontSize: 11 }}>⏱</span>
+              <span style={{ flexShrink: 0, opacity: 0.5, fontSize: 9.02 }}>⏱</span>
               <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {entry}
               </span>
@@ -155,7 +155,7 @@ export default function AutocompleteInput({
                 style={{
                   flexShrink: 0,
                   opacity: 0.4,
-                  fontSize: 13,
+                  fontSize: 10.66,
                   lineHeight: 1,
                   padding: "0 2px",
                   cursor: "pointer",

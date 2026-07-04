@@ -30,6 +30,7 @@ import ThemeToggle from "./components/ThemeToggle";
 import Toast from "./components/Toast";
 import Toolbar from "./components/Toolbar";
 import ExportProgressCenter from "./components/ExportProgressCenter";
+import UpdatePrompter from "./components/UpdatePrompter";
 
 const ADMIN_MODE_KEY = "sdb_admin_mode";
 const SHOW_TABLE_PANEL_KEY = "sdb_show_table_panel";
@@ -471,7 +472,7 @@ export default function App() {
 
   const handleDuplicateWithDatabase = useCallback(async (baseConnection, database) => {
     if (!baseConnection || !database) return;
-    
+
     setGlobalLoading(true);
     showStatus(t("status_switching_database", database), "idle");
 
@@ -863,13 +864,14 @@ export default function App() {
       {globalLoading && (
         <div className="global-overlay">
           <div className="empty-state">
-            <div className="spinner" style={{ width: 40, height: 40, borderWidth: 3 }} />
-            <p style={{ marginTop: 12, fontSize: 14, fontWeight: 500 }}>{t("loading")}</p>
+            <div className="spinner" style={{ width: 32.8, height: 32.8, borderWidth: 2.46 }} />
+            <p style={{ marginTop: 9.84, fontSize: 11.48, fontWeight: 500 }}>{t("loading")}</p>
           </div>
         </div>
       )}
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
+      <UpdatePrompter />
       <ExportProgressCenter />
     </div>
   );
@@ -917,14 +919,14 @@ function WelcomeScreen() {
   const { t } = useT();
 
   return (
-    <div className="empty-state" style={{ gap: 16 }}>
+    <div className="empty-state" style={{ gap: 13.12 }}>
       <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
         <path d="M12 2L2 7l10 5 10-5-10-5z" />
         <path d="M2 17l10 5 10-5" />
         <path d="M2 12l10 5 10-5" />
       </svg>
       <div>
-        <h3 style={{ fontSize: 16, marginBottom: 6 }}>{t("welcome_title")}</h3>
+        <h3 style={{ fontSize: 13.12, marginBottom: 4.92 }}>{t("welcome_title")}</h3>
         <p style={{ whiteSpace: "pre-line" }}>{t("welcome_hint")}</p>
       </div>
     </div>
@@ -935,7 +937,7 @@ function DatabaseSelectionScreen({ loading, databases, connectionName, onSelectD
   const { t } = useT();
 
   return (
-    <div className="empty-state empty-state-wide" style={{ gap: 16 }}>
+    <div className="empty-state empty-state-wide" style={{ gap: 13.12 }}>
       {loading ? <div className="spinner" /> : (
         <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.3">
           <ellipse cx="12" cy="5" rx="9" ry="3" />
@@ -944,7 +946,7 @@ function DatabaseSelectionScreen({ loading, databases, connectionName, onSelectD
         </svg>
       )}
       <div>
-        <h3 style={{ fontSize: 16, marginBottom: 6 }}>{t("database_prompt_title")}</h3>
+        <h3 style={{ fontSize: 13.12, marginBottom: 4.92 }}>{t("database_prompt_title")}</h3>
         <p>{loading ? t("database_prompt_loading") : t("database_prompt_body", connectionName)}</p>
       </div>
       {!loading && !databases.length ? <div className="sidebar-empty-copy">{t("sidebar_no_databases")}</div> : null}

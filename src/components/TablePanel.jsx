@@ -43,11 +43,11 @@ export default function TablePanel({ tables, loading, activeTable, onSelectTable
 
       <div className="table-panel-list">
         {loading ? (
-          <div style={{ display:"flex", justifyContent:"center", padding:20 }}>
+          <div style={{ display:"flex", justifyContent:"center", padding:16.4 }}>
             <div className="spinner" />
           </div>
         ) : tables.length === 0 ? (
-          <div style={{ padding:"16px 12px", color:"var(--text-lo)", fontSize:11 }}>
+          <div style={{ padding:"13.12px 9.84px", color:"var(--text-lo)", fontSize:9.02 }}>
             {t("tables_none")}
           </div>
         ) : Object.entries(grouped).map(([schema, schemaTables]) => (

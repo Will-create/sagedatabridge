@@ -8,7 +8,7 @@ export default function StatusBar({ message, type, elapsed }) {
       <div className="status-dot" />
       <span>{message || t("ready")}</span>
       {elapsed != null && (
-        <span style={{ marginLeft:"auto", opacity:0.7, fontSize:10 }}>{elapsed}ms</span>
+        <span style={{ marginLeft:"auto", opacity:0.7, fontSize:8.2 }}>{elapsed}ms</span>
       )}
     </div>
   );

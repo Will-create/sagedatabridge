@@ -227,14 +227,20 @@ export const getDashboardTiers = (id, tiersType = "all", search = "") =>
     { timeoutMs: getDashboardTimeoutMs(), label: "Dashboard tiers" },
   );
 
-export const getExploitationReport = (id, year) =>
-  invoke("get_exploitation_report", { id, year });
+export const listExploitationReports = (id, year) =>
+  invoke("list_exploitation_reports", { id, year });
+
+export const getExploitationReport = (id, year, reportId = null) =>
+  invoke("get_exploitation_report", { id, year, reportId });
 
 export const saveExploitationReport = (id, year, report) =>
   invoke("save_exploitation_report", { id, year, report });
 
-export const deleteExploitationReport = (id, year) =>
-  invoke("delete_exploitation_report", { id, year });
+export const deleteExploitationReport = (id, year, reportId = null) =>
+  invoke("delete_exploitation_report", { id, year, reportId });
+
+export const setActiveExploitationReport = (id, year, reportId) =>
+  invoke("set_active_exploitation_report", { id, year, reportId });
 
 export const getExploitationMappings = (id) =>
   invoke("get_exploitation_mappings", { id });

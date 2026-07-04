@@ -36,6 +36,7 @@ Thumbs.db
 # Local tooling state
 /.agents/
 /.codex/
+/.tauri/
 
 # Accidental duplicate / extraction leftovers in this folder
 /sage-data-bridge/

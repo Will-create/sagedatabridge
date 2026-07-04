@@ -1,3 +1,4 @@
+use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +32,97 @@ const TIERS_TABLE_CANDIDATES: &[&str] = &[
     "CUSTOMERS",
     "SUPPLIERS",
 ];
+
+#[derive(Debug, Clone)]
+struct BalancePeriod {
+    date_from: String,
+    date_to: String,
+    annual_from: String,
+    annual_to: String,
+}
+
+fn resolve_balance_period(date_from: &str, date_to: &str) -> Result<BalancePeriod, String> {
+    let from = NaiveDate::parse_from_str(date_from, "%Y-%m-%d")
+        .map_err(|_| "Invalid Balance start date; expected YYYY-MM-DD".to_string())?;
+    let to = NaiveDate::parse_from_str(date_to, "%Y-%m-%d")
+        .map_err(|_| "Invalid Balance end date; expected YYYY-MM-DD".to_string())?;
+    if from > to {
+        return Err("Balance start date must not be after end date".to_string());
+    }
+    let year_end = NaiveDate::from_ymd_opt(from.year(), 12, 31)
+        .ok_or_else(|| "Unable to determine Balance calendar year".to_string())?;
+    Ok(BalancePeriod {
+        date_from: from.format("%Y-%m-%d").to_string(),
+        date_to: to.format("%Y-%m-%d").to_string(),
+        annual_from: from.format("%Y-%m-%d").to_string(),
+        annual_to: std::cmp::min(to, year_end).format("%Y-%m-%d").to_string(),
+    })
+}
+
+fn annual_account_condition(account_expr: &str) -> String {
+    format!("({account_expr} LIKE '6%' OR {account_expr} LIKE '7%')")
+}
+
+fn non_opening_journal_condition(journal_expr: &str, journal_available: bool) -> String {
+    if journal_available {
+        format!("UPPER(LTRIM(RTRIM({journal_expr}))) NOT IN ('RAN', 'AN', 'OUV')")
+    } else {
+        "1 = 1".to_string()
+    }
+}
+
+fn balance_movement_condition(
+    account_expr: &str,
+    date_expr: &str,
+    journal_expr: &str,
+    journal_available: bool,
+    period: &BalancePeriod,
+) -> String {
+    let annual = annual_account_condition(account_expr);
+    let non_opening = non_opening_journal_condition(journal_expr, journal_available);
+    format!(
+        "((NOT {annual} AND {date_expr} BETWEEN {from} AND {to}) OR ({annual} AND {date_expr} BETWEEN {annual_from} AND {annual_to} AND {non_opening}))",
+        from = sql_literal(&period.date_from),
+        to = sql_literal(&period.date_to),
+        annual_from = sql_literal(&period.annual_from),
+        annual_to = sql_literal(&period.annual_to),
+    )
+}
+
+#[cfg(test)]
+mod balance_period_tests {
+    use super::{balance_movement_condition, resolve_balance_period};
+
+    #[test]
+    fn balance_period_keeps_a_same_year_range() {
+        let period = resolve_balance_period("2025-03-01", "2025-09-30").unwrap();
+        assert_eq!(period.annual_from, "2025-03-01");
+        assert_eq!(period.annual_to, "2025-09-30");
+    }
+
+    #[test]
+    fn balance_period_clamps_annual_accounts_to_start_year() {
+        let period = resolve_balance_period("2025-07-01", "2026-06-30").unwrap();
+        assert_eq!(period.annual_from, "2025-07-01");
+        assert_eq!(period.annual_to, "2025-12-31");
+    }
+
+    #[test]
+    fn balance_period_rejects_invalid_or_reversed_dates() {
+        assert!(resolve_balance_period("2025-13-01", "2025-12-31").is_err());
+        assert!(resolve_balance_period("2025-12-31", "2025-01-01").is_err());
+    }
+
+    #[test]
+    fn annual_movement_condition_excludes_opening_journals() {
+        let period = resolve_balance_period("2025-01-01", "2026-03-31").unwrap();
+        let sql = balance_movement_condition("account_no", "parsed_date", "journal", true, &period);
+        assert!(sql.contains("account_no LIKE '6%'"));
+        assert!(sql.contains("account_no LIKE '7%'"));
+        assert!(sql.contains("'2025-12-31'"));
+        assert!(sql.contains("NOT IN ('RAN', 'AN', 'OUV')"));
+    }
+}
 
 fn dashboard_timeout_secs(state: &AppState) -> u64 {
     state
@@ -1044,8 +1136,7 @@ async fn get_grand_livre_sage1000(
 
 async fn get_balance_sage1000(
     client: &mut db::DbClient,
-    date_from: &str,
-    date_to: &str,
+    period: &BalancePeriod,
     account_prefix: Option<&str>,
     timeout_secs: u64,
 ) -> Result<DashboardResponse<Vec<BalanceRow>>, String> {
@@ -1057,24 +1148,31 @@ async fn get_balance_sage1000(
 
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = text_or_empty(&qualify("cg", "Caption"), 255);
+    let document_sql = sage1000_document_sql(&context);
+    let parsed_date_expr = format!("TRY_CAST({} AS DATE)", qualify("e", "eDate"));
+    let annual_account = annual_account_condition(&account_no_expr);
+    let movement_condition = balance_movement_condition(
+        &account_no_expr,
+        &parsed_date_expr,
+        &document_sql.journal_expr,
+        context.pieces.is_some() && context.journals.is_some(),
+        period,
+    );
     let movement_debit_expr = format!(
-        "COALESCE(SUM(CASE WHEN TRY_CAST({} AS DATE) BETWEEN {} AND {} THEN {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
-        qualify("e", "eDate"),
-        sql_literal(date_from),
-        sql_literal(date_to),
+        "COALESCE(SUM(CASE WHEN {} THEN {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+        movement_condition,
         decimal_or_zero(&qualify("e", "debit"))
     );
     let movement_credit_expr = format!(
-        "COALESCE(SUM(CASE WHEN TRY_CAST({} AS DATE) BETWEEN {} AND {} THEN {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
-        qualify("e", "eDate"),
-        sql_literal(date_from),
-        sql_literal(date_to),
+        "COALESCE(SUM(CASE WHEN {} THEN {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+        movement_condition,
         decimal_or_zero(&qualify("e", "credit"))
     );
     let opening_net_expr = format!(
-        "COALESCE(SUM(CASE WHEN TRY_CAST({} AS DATE) < {} THEN {} - {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
-        qualify("e", "eDate"),
-        sql_literal(date_from),
+        "COALESCE(SUM(CASE WHEN NOT {} AND {} < {} THEN {} - {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+        annual_account,
+        parsed_date_expr,
+        sql_literal(&period.date_from),
         decimal_or_zero(&qualify("e", "debit")),
         decimal_or_zero(&qualify("e", "credit"))
     );
@@ -1101,8 +1199,9 @@ async fn get_balance_sage1000(
                 mvt_debit = {movement_debit_expr},
                 mvt_credit = {movement_credit_expr},
                 movement_net = {movement_net_expr}
-            FROM {accounts_table} cg
-            LEFT JOIN {entries_table} e ON {entry_account_fk} = {account_pk}
+             FROM {accounts_table} cg
+             LEFT JOIN {entries_table} e ON {entry_account_fk} = {account_pk}
+             {document_join}
             WHERE COALESCE(TRY_CAST({is_active_col} AS INT), 1) = 1
               AND {account_no_expr} <> ''
               {account_filter_sql}
@@ -1135,6 +1234,7 @@ async fn get_balance_sage1000(
         accounts_table = context.accounts.sql_name(),
         entries_table = context.entries.sql_name(),
         entry_account_fk = qualify("e", "oidcompteGeneral"),
+        document_join = document_sql.join_sql,
         account_pk = qualify("cg", "oid"),
         is_active_col = qualify("cg", "enActivite"),
         account_filter_sql = account_filter_sql,
@@ -2045,6 +2145,7 @@ pub async fn get_balance(
     date_to: String,
     account_prefix: Option<String>,
 ) -> Result<DashboardResponse<Vec<BalanceRow>>, String> {
+    let period = resolve_balance_period(&date_from, &date_to)?;
     let config = load_connection_config(&state, &id)?;
     let hint_schema = state.get_connection_schema(&id);
     let timeout_secs = dashboard_timeout_secs(state.inner());
@@ -2052,8 +2153,7 @@ pub async fn get_balance(
     if should_use_sage1000_analytics(&mut client, hint_schema.as_ref(), "get_balance").await? {
         return get_balance_sage1000(
             &mut client,
-            &date_from,
-            &date_to,
+            &period,
             account_prefix.as_deref(),
             timeout_secs,
         )
@@ -2169,21 +2269,33 @@ pub async fn get_balance(
             )
         })
         .unwrap_or_default();
-    let opening_condition = if entry_context.journal_col.is_some() {
+    let base_opening_condition = if entry_context.journal_col.is_some() {
         format!(
             "(journal IN ('RAN', 'AN', 'OUV') OR parsed_date < {})",
-            sql_literal(&date_from)
+            sql_literal(&period.date_from)
         )
     } else {
-        format!("parsed_date < {}", sql_literal(&date_from))
+        format!("parsed_date < {}", sql_literal(&period.date_from))
     };
+    let opening_condition = format!(
+        "NOT {} AND {}",
+        annual_account_condition("account_no"),
+        base_opening_condition
+    );
+    let movement_condition = balance_movement_condition(
+        "account_no",
+        "parsed_date",
+        "journal",
+        entry_context.journal_col.is_some(),
+        &period,
+    );
     let cutoff_condition = if entry_context.journal_col.is_some() {
         format!(
             "(parsed_date <= {} OR journal IN ('RAN', 'AN', 'OUV'))",
-            sql_literal(&date_to)
+            sql_literal(&period.date_to)
         )
     } else {
-        format!("parsed_date <= {}", sql_literal(&date_to))
+        format!("parsed_date <= {}", sql_literal(&period.date_to))
     };
 
     let sql = format!(
@@ -2206,8 +2318,8 @@ pub async fn get_balance(
                 MAX(account_label) AS account_label,
                 SUM(CASE WHEN {opening_condition} THEN debit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS open_debit_raw,
                 SUM(CASE WHEN {opening_condition} THEN credit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS open_credit_raw,
-                SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN debit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS mvt_debit,
-                SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN credit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS mvt_credit
+                SUM(CASE WHEN {movement_condition} THEN debit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS mvt_debit,
+                SUM(CASE WHEN {movement_condition} THEN credit ELSE CAST(0 AS DECIMAL(38, 6)) END) AS mvt_credit
             FROM base
             WHERE account_no <> ''
               AND parsed_date IS NOT NULL
@@ -2244,8 +2356,7 @@ pub async fn get_balance(
         account_join = account_join,
         account_filter_sql_base = format!("1 = 1{}", account_filter_sql),
         opening_condition = opening_condition,
-        date_from = sql_literal(&date_from),
-        date_to = sql_literal(&date_to),
+        movement_condition = movement_condition,
         cutoff_condition = cutoff_condition
     );
 
@@ -4743,6 +4854,7 @@ async fn do_stream_balance(
     date_to: &str,
     account_prefix: Option<String>,
 ) -> Result<(), String> {
+    let period = resolve_balance_period(date_from, date_to)?;
     let _config = state.resolve_connection_config(id)?;
     let hint_schema = state.get_connection_schema(id);
     let timeout_secs = dashboard_timeout_secs(state);
@@ -4758,8 +4870,7 @@ async fn do_stream_balance(
     {
         get_balance_sage1000(
             &mut client,
-            date_from,
-            date_to,
+            &period,
             account_prefix.as_deref(),
             timeout_secs,
         )
@@ -4882,26 +4993,38 @@ async fn do_stream_balance(
                 )
             })
             .unwrap_or_default();
-        let opening_condition = if entry_context.journal_col.is_some() {
+        let base_opening_condition = if entry_context.journal_col.is_some() {
             format!(
                 "(journal IN ('RAN', 'AN', 'OUV') OR parsed_date < {})",
-                sql_literal(date_from)
+                sql_literal(&period.date_from)
             )
         } else {
-            format!("parsed_date < {}", sql_literal(date_from))
+            format!("parsed_date < {}", sql_literal(&period.date_from))
         };
+        let opening_condition = format!(
+            "NOT {} AND {}",
+            annual_account_condition("account_no"),
+            base_opening_condition
+        );
+        let movement_condition = balance_movement_condition(
+            "account_no",
+            "parsed_date",
+            "journal",
+            entry_context.journal_col.is_some(),
+            &period,
+        );
         let cutoff_condition = if entry_context.journal_col.is_some() {
             format!(
                 "(parsed_date <= {} OR journal IN ('RAN', 'AN', 'OUV'))",
-                sql_literal(date_to)
+                sql_literal(&period.date_to)
             )
         } else {
-            format!("parsed_date <= {}", sql_literal(date_to))
+            format!("parsed_date <= {}", sql_literal(&period.date_to))
         };
 
         let sql = format!(
             r#"WITH base AS (SELECT parsed_date = {parsed_date_expr}, journal = {journal_expr}, account_no = {account_no_expr}, account_label = {account_label_expr}, debit = {debit_expr}, credit = {credit_expr} FROM {entries_table} e {account_join} WHERE 1=1 {account_filter_sql_base}),
-aggregated AS (SELECT account_no, MAX(account_label) AS account_label, SUM(CASE WHEN {opening_condition} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_debit_raw, SUM(CASE WHEN {opening_condition} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_credit_raw, SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_debit, SUM(CASE WHEN parsed_date BETWEEN {date_from} AND {date_to} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_credit FROM base WHERE account_no <> '' AND parsed_date IS NOT NULL AND {cutoff_condition} GROUP BY account_no)
+aggregated AS (SELECT account_no, MAX(account_label) AS account_label, SUM(CASE WHEN {opening_condition} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_debit_raw, SUM(CASE WHEN {opening_condition} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS open_credit_raw, SUM(CASE WHEN {movement_condition} THEN debit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_debit, SUM(CASE WHEN {movement_condition} THEN credit ELSE CAST(0 AS DECIMAL(38,6)) END) AS mvt_credit FROM base WHERE account_no <> '' AND parsed_date IS NOT NULL AND {cutoff_condition} GROUP BY account_no)
 SELECT account_no, account_label, CASE WHEN (open_debit_raw-open_credit_raw)>=0 THEN (open_debit_raw-open_credit_raw) ELSE CAST(0 AS DECIMAL(38,6)) END AS ouverture_debit, CASE WHEN (open_debit_raw-open_credit_raw)<0 THEN ABS(open_debit_raw-open_credit_raw) ELSE CAST(0 AS DECIMAL(38,6)) END AS ouverture_credit, mvt_debit, mvt_credit, CASE WHEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit))>=0 THEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit)) ELSE CAST(0 AS DECIMAL(38,6)) END AS cloture_debit, CASE WHEN ((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit))<0 THEN ABS((open_debit_raw-open_credit_raw)+(mvt_debit-mvt_credit)) ELSE CAST(0 AS DECIMAL(38,6)) END AS cloture_credit FROM aggregated ORDER BY account_no"#,
             parsed_date_expr = parsed_date_expr,
             journal_expr = journal_expr,
@@ -4913,8 +5036,7 @@ SELECT account_no, account_label, CASE WHEN (open_debit_raw-open_credit_raw)>=0 
             account_join = account_join,
             account_filter_sql_base = format!("{}", account_filter_sql),
             opening_condition = opening_condition,
-            date_from = sql_literal(date_from),
-            date_to = sql_literal(date_to),
+            movement_condition = movement_condition,
             cutoff_condition = cutoff_condition
         );
 

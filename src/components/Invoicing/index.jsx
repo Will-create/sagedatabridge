@@ -2386,7 +2386,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                       </td>
                       <td><input type="number" step="0.01" value={line.prix_ht} onChange={(event) => updateLine(index, { prix_ht: event.target.value })} /></td>
                       <td>
-                        <div style={{ display: "grid", gap: 4, minWidth: 96 }}>
+                        <div style={{ display: "grid", gap: 3.28, minWidth: 78.72 }}>
                           <select value={line.remise_type || "percent"} onChange={(event) => updateLine(index, { remise_type: event.target.value })}>
                             <option value="percent">%</option>
                             <option value="fixed">{editorInvoice.devise}</option>
@@ -2439,7 +2439,7 @@ export default function Invoicing({ connId, schema, onBack, onOpenTemplateDesign
                 <DetailRow label={t("invoice_total_ht")} value={formatCurrency(editorInvoice.total_ht, editorInvoice.devise)} />
                 <label className="invoice-inline-label">
                   <span>{t("invoice_global_discount")}</span>
-                  <div style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "73.8px 1fr", gap: 6.56 }}>
                     <select value={editorInvoice.remise_globale_type || "percent"} onChange={(event) => updateEditor({ remise_globale_type: event.target.value })}>
                       <option value="percent">%</option>
                       <option value="fixed">{editorInvoice.devise}</option>

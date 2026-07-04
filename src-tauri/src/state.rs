@@ -222,9 +222,15 @@ impl Default for QueryHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExploitationReportRecord {
     pub key: String,
+    #[serde(default)]
+    pub report_id: String,
     pub connection_id: String,
     pub database: String,
     pub year: i32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub active: bool,
     pub report: serde_json::Value,
     pub updated_at: String,
 }

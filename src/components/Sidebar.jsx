@@ -25,12 +25,12 @@ function EditionBadge({ configuredEdition, detectedSchema }) {
   const isDetected = !!detectedSchema;
   const color = isCustom ? "#ca8a04" : isDetected ? "var(--accent)" : "var(--text-lo)";
   const bg = isCustom ? "rgba(234,179,8,0.12)" : isDetected ? "var(--accent-mute)" : "rgba(255,255,255,0.05)";
-  
+
   let fullName = edition === "sage100" ? "Sage 100 Comptabilité"
     : edition === "sage1000" ? "Sage 1000"
     : edition === "sagex3" ? "Sage X3"
     : edition;
-  
+
   if (confidence !== undefined && confidence > 0) {
     fullName += ` (${confidence}%)`;
   }
@@ -39,10 +39,10 @@ function EditionBadge({ configuredEdition, detectedSchema }) {
     <span
       title={fullName}
       style={{
-        fontSize: 9.5,
+        fontSize: 7.79,
         fontWeight: 700,
         letterSpacing: "0.04em",
-        padding: "1px 5px",
+        padding: "1px 4.1px",
         borderRadius: 4,
         background: bg,
         color,
@@ -117,7 +117,7 @@ export default function Sidebar({
 
   const handleOpenDatabases = async (connection) => {
     if (dbSubmenu?.connection?.id === connection.id) return;
-    
+
     setDbSubmenu({ connection, databases: [], loading: true });
     try {
       const dbs = await getDatabases(connection.id);
@@ -170,7 +170,7 @@ export default function Sidebar({
               >
                 <span className={`dot ${status}`} />
                 <span className="sidebar-item-copy">
-                  <span className="sidebar-item-label" style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <span className="sidebar-item-label" style={{ display: "flex", alignItems: "center", gap: 4.1 }}>
                     {label}
                     <EditionBadge
                       configuredEdition={connection.sage_edition}
@@ -291,7 +291,7 @@ export default function Sidebar({
                 <div className="context-submenu">
                   {dbSubmenu.loading ? (
                     <div className="context-menu-item disabled">
-                      <div className="spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                      <div className="spinner" style={{ width: 9.84, height: 9.84, borderWidth: 1.5 }} />
                       {t("loading")}
                     </div>
                   ) : dbSubmenu.databases.length === 0 ? (
@@ -307,7 +307,7 @@ export default function Sidebar({
                         onDuplicateWithDatabase(contextMenu.connection, db);
                       }}
                     >
-                      <span className={`dot ${activeDatabase === db && activeId === contextMenu.connection.id ? "connected" : ""}`} style={{ width: 6, height: 6 }} />
+                      <span className={`dot ${activeDatabase === db && activeId === contextMenu.connection.id ? "connected" : ""}`} style={{ width: 4.92, height: 4.92 }} />
                       {db}
                     </div>
                   ))}

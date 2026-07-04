@@ -457,7 +457,7 @@ export default function SettingsDrawer({
                   <span>{t("settings_timeouts_hint") || "Configure request durations for large databases."}</span>
                 </div>
 
-                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div className="settings-field-row" style={{ display: "flex", flexDirection: "column", gap: 9.84 }}>
                   <SecretField
                     label={t("settings_query_timeout") || "Query Timeout (s)"}
                     value={settingsForm.query_timeout_secs}

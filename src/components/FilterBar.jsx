@@ -34,7 +34,7 @@ function FilterModal({ columns, onAdd, onClose }) {
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{ "--modal-width": "420px", "--modal-min-width": "420px" }}>
+      <div className="modal" style={{ "--modal-width": "344.4px", "--modal-min-width": "344.4px" }}>
         <div className="modal-title">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
@@ -79,7 +79,7 @@ function FilterModal({ columns, onAdd, onClose }) {
             )}
 
             {colInfo && (
-              <div style={{ fontSize:11, color:"var(--text-lo)" }}>
+              <div style={{ fontSize:9.02, color:"var(--text-lo)" }}>
                 {t("filter_type")}: <span style={{ color:"var(--text-mid)", fontFamily:"var(--font-mono)" }}>{colInfo.data_type}</span>
                 {" · "}{colInfo.is_nullable ? t("filter_nullable") : t("filter_notnull")}
                 {colInfo.is_primary_key ? " · " + t("filter_pk") : ""}
@@ -129,7 +129,7 @@ export default function FilterBar({ filters, columns, onFiltersChange }) {
           </svg>
 
           {filters.length === 0
-            ? <span style={{ fontSize:11.5, color:"var(--text-lo)" }}>{t("filter_none")}</span>
+            ? <span style={{ fontSize:9.43, color:"var(--text-lo)" }}>{t("filter_none")}</span>
             : filters.map((f, i) => renderChip(f, i))
           }
 

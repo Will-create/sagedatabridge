@@ -327,10 +327,10 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
   const detectionBanner = detectionResult ? (
     <div
       style={{
-        marginTop: 8,
-        padding: "8px 12px",
+        marginTop: 6.56,
+        padding: "6.56px 9.84px",
         borderRadius: "var(--r-md)",
-        fontSize: 12,
+        fontSize: 9.84,
         background: detectionResult.edition !== "generic"
           ? "rgba(56,189,140,0.1)"
           : "rgba(234,179,8,0.1)",
@@ -342,13 +342,13 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
         ? t("conn_sage_detected", editionLabels[detectionResult.edition] ?? detectionResult.edition, detectionResult.confidence)
         : t("conn_sage_not_detected")}
       {detectionResult.evidence.length > 0 && (
-        <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4 }}>
+        <div style={{ marginTop: 4.92, display: "flex", flexWrap: "wrap", gap: 3.28 }}>
           {detectionResult.evidence.map((tbl) => (
             <span
               key={tbl}
               style={{
-                fontSize: 10.5,
-                padding: "1px 6px",
+                fontSize: 8.61,
+                padding: "1px 4.92px",
                 borderRadius: 4,
                 background: "rgba(255,255,255,0.06)",
                 fontFamily: "var(--font-mono)",
@@ -365,7 +365,7 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
   return (
     <div className="modal-overlay" onClick={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal" style={{ "--modal-width": "800px", "--modal-min-width": "560px" }}>
+      <div className="modal" style={{ "--modal-width": "656px", "--modal-min-width": "459.2px" }}>
         <div className="modal-title">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <ellipse cx="12" cy="5" rx="9" ry="3" />
@@ -388,17 +388,17 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
               <div className="form-row">
                 <div className="form-group" style={{ position: "relative" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 3.28 }}>
                     <label style={{ marginBottom: 0 }}>{t("conn_host")}</label>
                     <button
                       type="button"
                       className="btn"
                       onClick={handleScan}
                       disabled={scanningNetwork || saving}
-                      style={{ fontSize: 10, padding: "2px 8px", height: 20, display: "flex", alignItems: "center", gap: 4 }}
+                      style={{ fontSize: 8.2, padding: "2px 6.56px", height: 16.4, display: "flex", alignItems: "center", gap: 3.28 }}
                     >
                       {scanningNetwork ? (
-                        <><span className="spinner" style={{ width: 10, height: 10 }} /> {t("scan_scanning")}</>
+                        <><span className="spinner" style={{ width: 8.2, height: 8.2 }} /> {t("scan_scanning")}</>
                       ) : (
                         <>
                           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -417,7 +417,7 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                     placeholder={t("conn_host_ph")}
                     autoFocus
                   />
-                  
+
                   {scanResults && (
                     <div
                       style={{
@@ -425,24 +425,24 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                         top: "100%",
                         left: 0,
                         width: "180%",
-                        minWidth: "500px",
+                        minWidth: "410px",
                         zIndex: 210,
                         background: "var(--bg-modal)",
                         border: "1px solid var(--border-mid)",
                         borderRadius: "var(--r-md)",
-                        boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
-                        marginTop: 4,
+                        boxShadow: "0 6.56px 26.24px rgba(0,0,0,0.6)",
+                        marginTop: 3.28,
                         overflow: "hidden",
                       }}
                     >
-                      <div style={{ 
-                        padding: "4px 10px", 
-                        fontSize: 9, 
+                      <div style={{
+                        padding: "3.28px 8.2px",
+                        fontSize: 7.38,
                         fontWeight: 700,
                         textTransform: "uppercase",
                         letterSpacing: "0.05em",
-                        color: "var(--text-lo)", 
-                        borderBottom: "1px solid var(--border-mid)", 
+                        color: "var(--text-lo)",
+                        borderBottom: "1px solid var(--border-mid)",
                         background: "rgba(255,255,255,0.03)",
                         display: "flex",
                         justifyContent: "space-between"
@@ -450,11 +450,11 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                         <span>{scanResults.length > 0 ? t("scan_found", scanResults.length) : t("scan_no_results")}</span>
                         <span onClick={() => setScanResults(null)} style={{ cursor: "pointer", opacity: 0.6 }}>×</span>
                       </div>
-                      
-                      <div style={{ 
-                        display: "grid", 
-                        gridTemplateColumns: "repeat(3, 1fr)", 
-                        maxHeight: 280,
+
+                      <div style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(3, 1fr)",
+                        maxHeight: 229.6,
                         overflowY: "auto",
                         background: "var(--bg-modal)"
                       }}>
@@ -468,8 +468,8 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                               setScanResults(null);
                             }}
                             style={{
-                              padding: "6px 10px",
-                              fontSize: "11px",
+                              padding: "4.92px 8.2px",
+                              fontSize: "9.02px",
                               cursor: "pointer",
                               borderRight: (idx + 1) % 3 === 0 ? "none" : "1px solid rgba(255,255,255,0.04)",
                               borderBottom: "1px solid rgba(255,255,255,0.04)",
@@ -486,8 +486,8 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                             <div style={{ fontWeight: 600, color: "var(--text-hi)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                               {inst.host}{inst.instance_name ? `\\${inst.instance_name}` : ""}
                             </div>
-                            <div style={{ fontSize: 9, opacity: 0.5, marginTop: 1, display: "flex", justifyContent: "space-between" }}>
-                              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginRight: 4 }}>{inst.version.replace("SQL Server ", "")}</span>
+                            <div style={{ fontSize: 7.38, opacity: 0.5, marginTop: 1, display: "flex", justifyContent: "space-between" }}>
+                              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginRight: 3.28 }}>{inst.version.replace("SQL Server ", "")}</span>
                               <span style={{ flexShrink: 0 }}>:{inst.port}</span>
                             </div>
                           </div>
@@ -642,7 +642,7 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
               <div className="connection-step-actions">
                 <button type="button" className="btn" onClick={handleTest} disabled={testing || saving || loadingDatabases}>
-                  {testing ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {t("conn_testing")}</> : t("conn_test")}
+                  {testing ? <><span className="spinner" style={{ width: 9.84, height: 9.84 }} /> {t("conn_testing")}</> : t("conn_test")}
                 </button>
                 <button type="button" className="btn btn-accent" onClick={handleLoadDatabases} disabled={saving || loadingDatabases}>
                   {loadingDatabases ? t("conn_discovering") : t("conn_discover")}
@@ -653,7 +653,7 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
             {/* ─── Sage Compatibility ─────────────────────────────────── */}
             <div className="connection-step-card">
               <div className="connection-step-header">
-                <span className="connection-step-index" style={{ fontSize: 10, letterSpacing: 0 }}>S</span>
+                <span className="connection-step-index" style={{ fontSize: 8.2, letterSpacing: 0 }}>S</span>
                 <div className="connection-step-copy">
                   <strong>{t("conn_sage_section")}</strong>
                   <span>{t("conn_sage_section_hint")}</span>
@@ -662,16 +662,16 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
               {/* Edition segmented selector */}
               <div className="form-group">
-                <label style={{ marginBottom: 6 }}>{t("conn_sage_edition")}</label>
-                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                <label style={{ marginBottom: 4.92 }}>{t("conn_sage_edition")}</label>
+                <div style={{ display: "flex", gap: 3.28, flexWrap: "wrap" }}>
                   {EDITION_OPTIONS.map((opt) => (
                     <button
                       key={opt}
                       type="button"
                       onClick={() => set("sage_edition", opt)}
                       style={{
-                        padding: "5px 12px",
-                        fontSize: 12,
+                        padding: "4.1px 9.84px",
+                        fontSize: 9.84,
                         borderRadius: "var(--r-md)",
                         border: `1px solid ${form.sage_edition === opt ? "var(--accent)" : "var(--border-mid)"}`,
                         background: form.sage_edition === opt ? "var(--accent-mute)" : "var(--bg-input)",
@@ -691,11 +691,11 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
 
               {/* Custom mapping — shown only when sage_edition = "custom" */}
               {form.sage_edition === "custom" && (
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-lo)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>
+                <div style={{ marginTop: 9.84 }}>
+                  <div style={{ fontSize: 9.02, fontWeight: 600, color: "var(--text-lo)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8.2 }}>
                     {t("conn_sage_mapping_title")}
                   </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6.56px 13.12px" }}>
                     {[
                       ["table_ecritures", "conn_sage_table_ecritures"],
                       ["table_comptes", "conn_sage_table_comptes"],
@@ -711,25 +711,25 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                       ["col_credit", "conn_sage_col_credit"],
                     ].map(([field, labelKey]) => (
                       <div key={field} className="form-group" style={{ marginBottom: 0 }}>
-                        <label style={{ fontSize: 11 }}>{t(labelKey)}</label>
+                        <label style={{ fontSize: 9.02 }}>{t(labelKey)}</label>
                         <input
                           type="text"
                           value={customSchema[field] || ""}
                           onChange={(e) => setCustomSchema((s) => ({ ...s, [field]: e.target.value }))}
                           placeholder={field}
-                          style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}
+                          style={{ fontSize: 9.84, fontFamily: "var(--font-mono)" }}
                         />
                       </div>
                     ))}
                   </div>
 
-                  <div style={{ marginTop: 16 }}>
+                  <div style={{ marginTop: 13.12 }}>
                     <button
                       type="button"
                       className="btn"
                       onClick={handleTestMapping}
                       disabled={testingMapping || saving}
-                      style={{ fontSize: 11, padding: "4px 10px" }}
+                      style={{ fontSize: 9.02, padding: "3.28px 8.2px" }}
                     >
                       {testingMapping ? t("loading") : t("conn_sage_test_mapping")}
                     </button>
@@ -738,19 +738,19 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                   {mappingPreview && (
                     <div
                       style={{
-                        marginTop: 12,
-                        maxHeight: 180,
+                        marginTop: 9.84,
+                        maxHeight: 147.6,
                         overflow: "auto",
                         border: "1px solid var(--border-mid)",
                         borderRadius: "var(--r-sm)",
                         background: "rgba(0,0,0,0.1)",
                       }}
                     >
-                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5, fontFamily: "var(--font-mono)" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 8.61, fontFamily: "var(--font-mono)" }}>
                         <thead>
                           <tr style={{ textAlign: "left", background: "rgba(255,255,255,0.03)" }}>
                             {mappingPreview.columns.map((c) => (
-                              <th key={c.name} style={{ padding: "4px 8px", borderBottom: "1px solid var(--border-mid)", fontWeight: 600 }}>
+                              <th key={c.name} style={{ padding: "3.28px 6.56px", borderBottom: "1px solid var(--border-mid)", fontWeight: 600 }}>
                                 {c.name}
                               </th>
                             ))}
@@ -760,7 +760,7 @@ export default function ConnectionModal({ existing, onSave, onClose }) {
                           {mappingPreview.rows.map((row, i) => (
                             <tr key={i}>
                               {row.map((val, j) => (
-                                <td key={j} style={{ padding: "3px 8px", borderBottom: "1px solid rgba(255,255,255,0.02)", whiteSpace: "nowrap" }}>
+                                <td key={j} style={{ padding: "2.46px 6.56px", borderBottom: "1px solid rgba(255,255,255,0.02)", whiteSpace: "nowrap" }}>
                                   {val === null ? <span style={{ opacity: 0.3 }}>NULL</span> : String(val)}
                                 </td>
                               ))}

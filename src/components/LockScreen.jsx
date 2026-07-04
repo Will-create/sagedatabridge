@@ -76,10 +76,10 @@ export default function LockScreen({ onUnlock }) {
           <button
             type="submit"
             className="btn btn-accent"
-            style={{ width: "100%", justifyContent: "center", marginTop: 12, padding: "10px" }}
+            style={{ width: "100%", justifyContent: "center", marginTop: 9.84, padding: "8.2px" }}
             disabled={loading}
           >
-            {loading ? <span className="spinner" style={{ width: 14, height: 14 }} /> : t("lock_unlock")}
+            {loading ? <span className="spinner" style={{ width: 11.48, height: 11.48 }} /> : t("lock_unlock")}
           </button>
         </form>
       </div>

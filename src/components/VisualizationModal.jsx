@@ -115,7 +115,7 @@ function DonutChart({ items, formatValue, totalLabel }) {
 
   return (
     <div className="viz-chart-canvas viz-donut-layout">
-      <svg viewBox="0 0 320 260" className="viz-svg" style={{ maxWidth: 320 }}>
+      <svg viewBox="0 0 320 260" className="viz-svg" style={{ maxWidth: 262.4 }}>
         <circle cx="130" cy="130" r="92" fill="var(--donut-track)" />
         {items.map((item, index) => {
           const angle = (item.value / total) * Math.PI * 2;

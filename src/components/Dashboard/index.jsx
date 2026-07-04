@@ -33,6 +33,7 @@ import {
   DASHBOARD_PREVIEW_ROW_LIMIT,
   streamGrandLivreAuxiliaire,
 } from "../../hooks/useTauri";
+
 import {
   formatAmount,
   getAmountTextStyle,
@@ -42,6 +43,25 @@ import {
 import { useExportJobs } from "../../exportJobs";
 import CompteExploitationTab from "./CompteExploitation";
 import { EXPLOITATION_MONTHS } from "./exploitationModel";
+
+function useCollapse() {
+  return useState(false);
+}
+
+function CollapseHandle({ collapsed, onToggle, t }) {
+  return (
+    <button
+      type="button"
+      className={`dashboard-collapse-handle ${collapsed ? "collapsed" : ""}`}
+      onClick={onToggle}
+      title={t(collapsed ? "dashboard_expand_section" : "dashboard_collapse_section")}
+      aria-label={t(collapsed ? "dashboard_expand_section" : "dashboard_collapse_section")}
+      aria-expanded={!collapsed}
+    >
+      <span />
+    </button>
+  );
+}
 
 const TAB_IDS = {
   OVERVIEW: "overview",
@@ -53,8 +73,8 @@ const TAB_IDS = {
   TIERS: "tiers",
 };
 
-const GRAND_LIVRE_GRID = "110px 110px 120px minmax(240px, 1.4fr) 140px 110px 110px 110px 130px";
-const AUX_GRID = "110px 92px minmax(260px, 1.5fr) 140px 92px 110px 110px 130px";
+const GRAND_LIVRE_GRID = "90.2px 90.2px 98.4px minmax(196.8px, 1.4fr) 114.8px 90.2px 90.2px 90.2px 106.6px";
+const AUX_GRID = "90.2px 75.44px minmax(213.2px, 1.5fr) 114.8px 75.44px 90.2px 90.2px 106.6px";
 const LEDGER_PAGE_SIZE = 500;
 const LEDGER_CACHE_PAGES = 40;
 
@@ -893,7 +913,7 @@ function DashboardRefreshing({ active, label, progress = null }) {
   if (!active) return null;
   return (
     <div className="dashboard-refreshing">
-      <span className="spinner" style={{ width: 12, height: 12 }} />
+      <span className="spinner" style={{ width: 9.84, height: 9.84 }} />
       <span>{label}</span>
       {progress ? <DashboardProgress {...progress} /> : null}
     </div>
@@ -1339,12 +1359,13 @@ function SectionExportButton({ onClick, disabled, busy, label }) {
   const { canStartExport } = useExportJobs();
   return (
     <button className="btn btn-accent" onClick={onClick} disabled={disabled || busy || !canStartExport}>
-      {busy ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {label}</> : label}
+      {busy ? <><span className="spinner" style={{ width: 9.84, height: 9.84 }} /> {label}</> : label}
     </button>
   );
 }
 
 function OverviewTab({ state, t, lang, onExport, exporting }) {
+  const [kpisCollapsed, setKpisCollapsed] = useCollapse();
   if (state.loading && !state.data) {
     return <DashboardLoader label={t("dashboard_loading_kpis")} />;
   }
@@ -1402,7 +1423,8 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
         />
       </div>
 
-      <div className="dashboard-kpi-grid">
+      <div className={`dashboard-collapse-region dashboard-kpi-region ${kpisCollapsed ? "collapsed" : ""}`}>
+      {!kpisCollapsed ? <div className="dashboard-kpi-grid">
         <DashboardCard
           label={t("dashboard_kpi_revenue")}
           value={data.total_ventes}
@@ -1429,6 +1451,8 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
           lang={lang}
           accent="var(--orange)"
         />
+      </div> : null}
+      <CollapseHandle collapsed={kpisCollapsed} onToggle={() => setKpisCollapsed((value) => !value)} t={t} />
       </div>
 
       <div className="dashboard-chart-grid">
@@ -1450,7 +1474,7 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
                   contentStyle={{
                     background: "var(--bg-elevated)",
                     border: "1px solid var(--border-mid)",
-                    borderRadius: "10px",
+                    borderRadius: "8.2px",
                     color: "var(--text-hi)",
                   }}
                 />
@@ -1480,7 +1504,7 @@ function OverviewTab({ state, t, lang, onExport, exporting }) {
                   contentStyle={{
                     background: "var(--bg-elevated)",
                     border: "1px solid var(--border-mid)",
-                    borderRadius: "10px",
+                    borderRadius: "8.2px",
                     color: "var(--text-hi)",
                   }}
                 />
@@ -2038,6 +2062,7 @@ export default function Dashboard({
   const [grandLivreExportProgress, setGrandLivreExportProgress] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [exploitationExportData, setExploitationExportData] = useState(null);
+  const [headerCollapsed, setHeaderCollapsed] = useCollapse();
   const deferredGrandLivreSearch = useDeferredValue(grandLivreSearch);
   const deferredTiersSearch = useDeferredValue(tiersSearch);
   const tabExportIsActive = useCallback((tabId) => activeJobs.some(
@@ -2414,7 +2439,8 @@ export default function Dashboard({
 
   return (
     <div className="dashboard-view">
-      <div className="dashboard-header">
+      <div className={`dashboard-collapse-region dashboard-header-region ${headerCollapsed ? "collapsed" : ""}`}>
+      {!headerCollapsed ? <div className="dashboard-header">
         <div className="dashboard-header-start">
           {adminMode ? (
             <button className="dashboard-back-btn" onClick={onBackToTables}>
@@ -2473,7 +2499,7 @@ export default function Dashboard({
           </button>
           <button className="btn btn-ghost dashboard-refresh-btn" onClick={handleRefresh} title={t("toolbar_refresh")} disabled={activeTabLoading}>
             {activeTabLoading ? (
-              <span className="spinner" style={{ width: 12, height: 12 }} />
+              <span className="spinner" style={{ width: 9.84, height: 9.84 }} />
             ) : (
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M21 12a9 9 0 1 1-2.64-6.36" />
@@ -2483,9 +2509,11 @@ export default function Dashboard({
             {activeTabLoading ? t("loading") : t("refresh")}
           </button>
           <button className="btn btn-accent dashboard-export-btn" onClick={exportDashboardWorkbook} disabled={exportingWorkbook || globalExportIsActive || exportsAtCapacity || activeTabLoading}>
-            {exportingWorkbook || globalExportIsActive ? <><span className="spinner" style={{ width: 12, height: 12 }} /> {t("dashboard_exporting")}</> : t("dashboard_export_dashboard")}
+            {exportingWorkbook || globalExportIsActive ? <><span className="spinner" style={{ width: 9.84, height: 9.84 }} /> {t("dashboard_exporting")}</> : t("dashboard_export_dashboard")}
           </button>
         </div>
+      </div> : null}
+      <CollapseHandle collapsed={headerCollapsed} onToggle={() => setHeaderCollapsed((value) => !value)} t={t} />
       </div>
 
       {exportError ? (

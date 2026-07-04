@@ -1,6 +1,6 @@
 [package]
 name = "sage-data-bridge"
-version = "0.1.0"
+version = "6.1.0"
 description = "Sage Data Bridge - SQL Server data extraction tool"
 authors = []
 license = ""
@@ -14,7 +14,7 @@ rust-version = "1.70"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [ "fs-all", "dialog-all",
+tauri = { version = "1", features = [ "updater", "fs-all", "dialog-all",
   "path-all", "shell-open"
 ] }
 

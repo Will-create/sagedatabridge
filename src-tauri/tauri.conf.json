@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "Sage Data Bridge",
-    "version": "0.1.0"
+    "version": "6.1.0"
   },
   "tauri": {
     "allowlist": {
@@ -24,7 +24,12 @@
         "writeFile": true,
         "readDir": true,
         "createDir": true,
-        "scope": ["$APPDATA/**", "$HOME/**", "$DESKTOP/**", "$DOWNLOAD/**"]
+        "scope": [
+          "$APPDATA/**",
+          "$HOME/**",
+          "$DESKTOP/**",
+          "$DOWNLOAD/**"
+        ]
       },
       "path": {
         "all": true
@@ -45,6 +50,17 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ]
+    },
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://release.zapwize.com/sage-data-bridge/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDRjFGOEFGRDhEMkEwNTIKUldSU29OTFlyL2p4UEk2VDB1eXdhamVRSGZYRWYvd2s5WnNHMWZpZFdQWE9qZzhlY3RORThPV2oK",
+      "windows": {
+        "installMode": "passive"
+      }
     },
     "security": {
       "csp": null

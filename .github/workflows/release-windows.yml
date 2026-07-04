@@ -1,0 +1,48 @@
+name: Build and upload Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, matching package.json/src-tauri version
+        required: true
+      notes:
+        description: Release notes for latest.json
+        required: false
+        default: ""
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        shell: pwsh
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      - name: Upload updater artifacts to release server
+        shell: pwsh
+        env:
+          RELEASE_UPLOAD_URL: ${{ secrets.RELEASE_UPLOAD_URL }}
+          RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: npm run release:upload

@@ -30,8 +30,8 @@ export default function DataGrid({
     return (
       <div className="data-grid-wrap" style={{ display:"flex", alignItems:"center", justifyContent:"center" }}>
         <div style={{ textAlign:"center" }}>
-          <div className="spinner" style={{ margin:"0 auto 12px" }} />
-          <div style={{ fontSize:12, color:"var(--text-lo)" }}>{t("grid_loading")}</div>
+          <div className="spinner" style={{ margin:"0 auto 9.84px" }} />
+          <div style={{ fontSize:9.84, color:"var(--text-lo)" }}>{t("grid_loading")}</div>
         </div>
       </div>
     );
@@ -101,7 +101,7 @@ export default function DataGrid({
         <table className="data-grid">
           <thead>
             <tr>
-              <th style={{ width:46, cursor:"default" }} className="row-num">#</th>
+              <th style={{ width:37.72, cursor:"default" }} className="row-num">#</th>
               {columns.map((col, ci) => (
                 <th key={ci} className={col.is_primary_key ? "pk" : ""} onClick={() => handleSort(ci)}>
                   <div className="th-inner">
@@ -114,7 +114,7 @@ export default function DataGrid({
                     {col.name}
                     <span className="type-badge">{col.data_type}</span>
                     {sortCol === ci && (
-                      <span style={{ marginLeft:"auto", color:"var(--accent)", fontSize:10 }}>
+                      <span style={{ marginLeft:"auto", color:"var(--accent)", fontSize:8.2 }}>
                         {sortDir === "asc" ? "↑" : "↓"}
                       </span>
                     )}
@@ -157,13 +157,13 @@ export default function DataGrid({
           )}
         </span>
         <div style={{ flex:1 }} />
-        <span style={{ color:"var(--text-lo)", fontSize:11 }}>{t("grid_page_size")}</span>
+        <span style={{ color:"var(--text-lo)", fontSize:9.02 }}>{t("grid_page_size")}</span>
         <select className="page-size-select" value={pageSize} onChange={(e) => onPageSizeChange(Number(e.target.value))}>
           {pageSizeOptions.map((size) => <option key={size} value={size}>{size === 0 ? t("all") : size.toLocaleString(locale)}</option>)}
         </select>
         <button className="btn btn-sm" onClick={() => onPageChange(0)} disabled={page === 0}>«</button>
         <button className="btn btn-sm" onClick={() => onPageChange(page - 1)} disabled={page === 0}>‹</button>
-        <span style={{ fontSize:12, color:"var(--text-mid)", minWidth:80, textAlign:"center" }}>
+        <span style={{ fontSize:9.84, color:"var(--text-mid)", minWidth:65.6, textAlign:"center" }}>
           {page + 1} / {totalPages}
         </span>
         <button className="btn btn-sm" onClick={() => onPageChange(page + 1)} disabled={page >= totalPages - 1}>›</button>
@@ -173,11 +173,11 @@ export default function DataGrid({
       {/* Expanded cell */}
       {expandedCell && (
         <div className="modal-overlay" onClick={() => setExpandedCell(null)}>
-          <div className="modal" style={{ "--modal-width": "600px", "--modal-min-width": "600px" }}>
-            <div className="modal-title" style={{ marginBottom:12 }}>{t("grid_cell_title")}</div>
+          <div className="modal" style={{ "--modal-width": "492px", "--modal-min-width": "492px" }}>
+            <div className="modal-title" style={{ marginBottom:9.84 }}>{t("grid_cell_title")}</div>
             <div className="modal-body">
               <textarea readOnly value={expandedCell.value} rows={10}
-                style={{ width:"100%", fontFamily:"var(--font-mono)", fontSize:12, resize:"vertical" }} />
+                style={{ width:"100%", fontFamily:"var(--font-mono)", fontSize:9.84, resize:"vertical" }} />
             </div>
             <div className="modal-actions">
               <button className="btn" onClick={() => navigator.clipboard.writeText(expandedCell.value)}>{t("copy")}</button>

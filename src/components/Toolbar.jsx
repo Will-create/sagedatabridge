@@ -43,7 +43,7 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{ "--modal-width": "460px", "--modal-min-width": "460px" }}>
+      <div className="modal" style={{ "--modal-width": "377.2px", "--modal-min-width": "377.2px" }}>
         <div className="modal-title">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -53,34 +53,34 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
         </div>
 
         <div className="modal-body">
-          <div style={{ marginBottom:16 }}>
-            <label style={{ marginBottom:8, display:"block" }}>{t("export_format")}</label>
+          <div style={{ marginBottom:13.12 }}>
+            <label style={{ marginBottom:6.56, display:"block" }}>{t("export_format")}</label>
             <div className="export-format-grid" style={{ gridTemplateColumns:"1fr 1fr" }}>
               {formats.map((f) => (
                 <button key={f.id} className={`export-format-btn ${format === f.id ? "selected" : ""}`}
                   onClick={() => setFormat(f.id)}>
                   <span className="format-icon">{f.icon}</span>
                   <strong>{f.label}</strong>
-                  <span style={{ fontSize:10, color:"inherit", opacity:0.7 }}>{f.desc}</span>
+                  <span style={{ fontSize:8.2, color:"inherit", opacity:0.7 }}>{f.desc}</span>
                 </button>
               ))}
             </div>
           </div>
 
           {format !== "sql" && columns.length > 0 && (
-            <div style={{ marginBottom:16 }}>
-              <label style={{ marginBottom:8, display:"flex", alignItems:"center", gap:8 }}>
+            <div style={{ marginBottom:13.12 }}>
+              <label style={{ marginBottom:6.56, display:"flex", alignItems:"center", gap:6.56 }}>
                 {t("export_columns")}
                 <button className="btn btn-ghost btn-sm" style={{ marginLeft:"auto", textTransform:"none", fontWeight:"normal" }}
                   onClick={() => setSelectedCols([])}>{t("all")}</button>
               </label>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:4, maxHeight:180,
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:3.28, maxHeight:147.6,
                 overflowY:"auto", background:"var(--bg-input)", border:"1px solid var(--border)",
-                borderRadius:"var(--r-sm)", padding:8 }}>
+                borderRadius:"var(--r-sm)", padding:6.56 }}>
                 {columns.map((col) => {
                   const checked = selectedCols.length === 0 || selectedCols.includes(col.name);
                   return (
-                    <label key={col.name} className="checkbox-group" style={{ fontSize:11.5, gap:6 }}>
+                    <label key={col.name} className="checkbox-group" style={{ fontSize:9.43, gap:4.92 }}>
                       <input type="checkbox" checked={checked} onChange={() => {
                         if (selectedCols.length === 0) setSelectedCols(columns.map((c) => c.name).filter((n) => n !== col.name));
                         else toggleCol(col.name);
@@ -93,14 +93,14 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
                 })}
               </div>
               {selectedCols.length > 0 && (
-                <div style={{ fontSize:11, color:"var(--text-lo)", marginTop:4 }}>
+                <div style={{ fontSize:9.02, color:"var(--text-lo)", marginTop:3.28 }}>
                   {t("export_n_of", selectedCols.length, columns.length)}
                 </div>
               )}
             </div>
           )}
 
-          <div style={{ fontSize:11, color:"var(--text-lo)", padding:"6px 10px",
+          <div style={{ fontSize:9.02, color:"var(--text-lo)", padding:"4.92px 8.2px",
             background:"var(--bg-input)", borderRadius:"var(--r-sm)", border:"1px solid var(--border)" }}>
             {t("export_note")}
           </div>
@@ -116,7 +116,7 @@ function ExportModal({ activeConn, activeTable, filters, columns, onClose, onToa
           <button className="btn btn-ghost" onClick={onClose}>{t("cancel")}</button>
           <button className="btn btn-accent" onClick={handleExport} disabled={exporting || !canStartExport || ["queued", "running"].includes(job?.status)}>
             {exporting
-              ? <><span className="spinner" style={{width:12,height:12}} /> {t("export_ing")}</>
+              ? <><span className="spinner" style={{width:9.84,height:9.84}} /> {t("export_ing")}</>
               : t("export_btn", format)}
           </button>
         </div>
@@ -159,7 +159,7 @@ export default function Toolbar({
           className="btn btn-ghost btn-icon"
           title={sidebarCollapsed ? t("panel_show_connections") : t("panel_hide_connections")}
           onClick={onToggleSidebar}
-          style={{ padding:"5px 7px" }}
+          style={{ padding:"4.1px 5.74px" }}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <rect x="3" y="4" width="6" height="16" rx="1" />
@@ -174,7 +174,7 @@ export default function Toolbar({
               title={tablePanelCollapsed ? t("panel_show_tables") : t("panel_hide_tables")}
               onClick={onToggleTables}
               disabled={!activeConn}
-              style={{ padding:"5px 7px" }}
+              style={{ padding:"4.1px 5.74px" }}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <rect x="4" y="4" width="8" height="16" rx="1" />
@@ -188,16 +188,16 @@ export default function Toolbar({
 
         {activeTable
           ? <div className="toolbar-label" title={activeTable.full_name}>{activeTable.schema}.{activeTable.name}</div>
-          : <div style={{ color:"var(--text-lo)", fontSize:12 }}>{t("toolbar_no_table")}</div>
+          : <div style={{ color:"var(--text-lo)", fontSize:9.84 }}>{t("toolbar_no_table")}</div>
         }
 
         {totalCount != null && (
-          <div style={{ fontSize:11.5, color:"var(--text-mid)" }}>
+          <div style={{ fontSize:9.43, color:"var(--text-mid)" }}>
             <span style={{ color:"var(--accent)", fontFamily:"var(--font-mono)", fontWeight:600 }}>
               {filters.length > 0 ? "~" : ""}{t("toolbar_rows", totalCount)}
             </span>
             {filters.length > 0 && (
-              <span style={{ color:"var(--yellow)", marginLeft:6 }}>({t("toolbar_filters", filters.length)})</span>
+              <span style={{ color:"var(--yellow)", marginLeft:4.92 }}>({t("toolbar_filters", filters.length)})</span>
             )}
           </div>
         )}
@@ -205,7 +205,7 @@ export default function Toolbar({
         <div className="toolbar-spacer" />
 
         <button className="btn btn-ghost btn-icon" title={t("toolbar_refresh")}
-          onClick={onRefresh} disabled={loading || !activeTable} style={{ padding:"5px 7px" }}>
+          onClick={onRefresh} disabled={loading || !activeTable} style={{ padding:"4.1px 5.74px" }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
             style={loading ? { animation:"spin 0.7s linear infinite" } : {}}>
             <polyline points="23 4 23 10 17 10" />

@@ -62,9 +62,11 @@ fn main() {
             // Settings
             commands::get_settings,
             commands::save_settings,
+            commands::list_exploitation_reports,
             commands::get_exploitation_report,
             commands::save_exploitation_report,
             commands::delete_exploitation_report,
+            commands::set_active_exploitation_report,
             commands::get_exploitation_mappings,
             commands::save_exploitation_mappings,
             commands::reset_exploitation_mappings,

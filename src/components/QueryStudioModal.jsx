@@ -341,7 +341,7 @@ export default function QueryStudioModal({ activeConn, activeTable, onClose, onT
               <div className="query-results-header">
                 <div>{t("sql_results")}</div>
                 <div className="query-results-actions">
-                  {running ? <span className="query-results-meta"><span className="spinner" style={{ width: 12, height: 12 }} /> {t("sql_running")}</span> : null}
+                  {running ? <span className="query-results-meta"><span className="spinner" style={{ width: 9.84, height: 9.84 }} /> {t("sql_running")}</span> : null}
                   {elapsed != null && <div className="query-results-meta">{t("sql_elapsed", elapsed)}</div>}
                   <button className="btn btn-ghost btn-sm" onClick={() => copyResults("page")} disabled={!pagedResults || running}>
                     {t("sql_copy_page")}

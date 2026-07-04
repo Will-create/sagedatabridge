@@ -24,6 +24,108 @@ fn exploitation_report_key(connection: &ConnectionConfig, year: i32) -> String {
     )
 }
 
+fn normalize_exploitation_report_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .collect::<String>()
+}
+
+fn exploitation_report_record_key(connection: &ConnectionConfig, year: i32, report_id: &str) -> String {
+    let base = exploitation_report_key(connection, year);
+    if report_id.is_empty() {
+        base
+    } else {
+        format!("{}|{}", base, report_id)
+    }
+}
+
+fn default_report_name(year: i32) -> String {
+    format!("Budget {}", year)
+}
+
+fn report_string_field(report: &Value, key: &str) -> String {
+    report
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn report_id_from_value(report: &Value) -> String {
+    normalize_exploitation_report_id(&report_string_field(report, "id"))
+}
+
+fn report_name_from_value(report: &Value, year: i32) -> String {
+    let name = report_string_field(report, "name");
+    if name.is_empty() {
+        let title = report_string_field(report, "title");
+        if title.is_empty() {
+            default_report_name(year)
+        } else {
+            title
+        }
+    } else {
+        name
+    }
+}
+
+fn normalize_exploitation_report_payload(
+    mut report: Value,
+    report_id: &str,
+    name: &str,
+    year: i32,
+) -> Result<Value, String> {
+    if !(2000..=2200).contains(&year) {
+        return Err("Budget year must be between 2000 and 2200".to_string());
+    }
+    if name.trim().is_empty() {
+        return Err("Budget scenario name is required".to_string());
+    }
+    let encoded = serde_json::to_string(&report).map_err(|error| error.to_string())?;
+    if encoded.len() > 2_000_000 {
+        return Err("Budget scenario is too large to save".to_string());
+    }
+    if let Some(lines) = report.get("budgetByLine").and_then(Value::as_object) {
+        for (line_code, months) in lines {
+            let values = months
+                .as_array()
+                .ok_or_else(|| format!("Budget line '{}' must contain monthly values", line_code))?;
+            if values.len() != 12 {
+                return Err(format!("Budget line '{}' must contain 12 monthly values", line_code));
+            }
+            for value in values {
+                if !(value.is_null() || value.as_f64().is_some() || value.as_i64().is_some() || value.as_u64().is_some()) {
+                    return Err(format!("Budget line '{}' contains a non-numeric value", line_code));
+                }
+            }
+        }
+    }
+    if let Some(object) = report.as_object_mut() {
+        object.insert("id".to_string(), Value::String(report_id.to_string()));
+        object.insert("name".to_string(), Value::String(name.trim().to_string()));
+        object.insert("year".to_string(), Value::Number(serde_json::Number::from(year)));
+        object
+            .entry("version".to_string())
+            .or_insert_with(|| Value::Number(serde_json::Number::from(2)));
+    }
+    Ok(report)
+}
+
+fn exploitation_report_summary(record: &ExploitationReportRecord) -> Value {
+    serde_json::json!({
+        "id": if record.report_id.is_empty() { "default" } else { record.report_id.as_str() },
+        "name": if record.name.is_empty() { default_report_name(record.year) } else { record.name.clone() },
+        "year": record.year,
+        "database": record.database,
+        "active": record.active,
+        "updatedAt": record.updated_at,
+        "report": record.report,
+    })
+}
+
 fn exploitation_mapping_key(connection: &ConnectionConfig) -> String {
     format!(
         "{}|{}",
@@ -186,18 +288,78 @@ pub fn reset_exploitation_mappings(state: State<AppState>, id: String) -> Result
 }
 
 #[tauri::command]
+pub fn list_exploitation_reports(
+    state: State<AppState>,
+    id: String,
+    year: i32,
+) -> Result<Vec<Value>, String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let key = exploitation_report_key(&connection, year);
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut records: Vec<Value> = config
+        .exploitation_reports
+        .iter()
+        .filter(|record| record.key == key || record.key.starts_with(&format!("{}|", key)))
+        .map(exploitation_report_summary)
+        .collect();
+    let has_active = records
+        .iter()
+        .any(|record| record.get("active").and_then(Value::as_bool).unwrap_or(false));
+    if !has_active && records.len() == 1 {
+        if let Some(object) = records[0].as_object_mut() {
+            object.insert("active".to_string(), Value::Bool(true));
+        }
+    }
+    records.sort_by(|left, right| {
+        let left_active = left.get("active").and_then(Value::as_bool).unwrap_or(false);
+        let right_active = right.get("active").and_then(Value::as_bool).unwrap_or(false);
+        right_active.cmp(&left_active).then_with(|| {
+            right
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .cmp(left.get("updatedAt").and_then(Value::as_str).unwrap_or(""))
+        })
+    });
+    Ok(records)
+}
+
+#[tauri::command]
 pub fn get_exploitation_report(
     state: State<AppState>,
     id: String,
     year: i32,
+    report_id: Option<String>,
 ) -> Result<Option<Value>, String> {
     let connection = state.resolve_connection_config(&id)?;
     let key = exploitation_report_key(&connection, year);
+    let normalized_id = report_id
+        .as_deref()
+        .map(normalize_exploitation_report_id)
+        .unwrap_or_default();
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    Ok(config
+    let candidates: Vec<&ExploitationReportRecord> = config
         .exploitation_reports
         .iter()
-        .find(|record| record.key == key)
+        .filter(|record| record.key == key || record.key.starts_with(&format!("{}|", key)))
+        .collect();
+    if !normalized_id.is_empty() {
+        return Ok(candidates
+            .iter()
+            .find(|record| {
+                let candidate_id = if record.report_id.is_empty() {
+                    "default"
+                } else {
+                    record.report_id.as_str()
+                };
+                candidate_id == normalized_id
+            })
+            .map(|record| record.report.clone()));
+    }
+    Ok(candidates
+        .iter()
+        .find(|record| record.active)
+        .or_else(|| candidates.first())
         .map(|record| record.report.clone()))
 }
 
@@ -207,29 +369,48 @@ pub fn save_exploitation_report(
     id: String,
     year: i32,
     report: Value,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let connection = state.resolve_connection_config(&id)?;
-    let key = exploitation_report_key(&connection, year);
+    let mut report_id = report_id_from_value(&report);
+    if report_id.is_empty() || report_id == "default" {
+        report_id = uuid::Uuid::new_v4().to_string();
+    }
+    let name = report_name_from_value(&report, year);
+    let normalized_report = normalize_exploitation_report_payload(report, &report_id, &name, year)?;
+    let base_key = exploitation_report_key(&connection, year);
+    let key = exploitation_report_record_key(&connection, year, &report_id);
+    let now = chrono::Utc::now().to_rfc3339();
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     let record = ExploitationReportRecord {
         key: key.clone(),
+        report_id: report_id.clone(),
         connection_id: id,
-        database: connection.database,
+        database: connection.database.clone(),
         year,
-        report,
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        name,
+        active: true,
+        report: normalized_report.clone(),
+        updated_at: now,
     };
+    for existing in config
+        .exploitation_reports
+        .iter_mut()
+        .filter(|existing| existing.key == base_key || existing.key.starts_with(&format!("{}|", base_key)))
+    {
+        existing.active = false;
+    }
     if let Some(existing) = config
         .exploitation_reports
         .iter_mut()
-        .find(|existing| existing.key == key)
+        .find(|existing| existing.key == key || (!existing.report_id.is_empty() && existing.report_id == report_id))
     {
         *existing = record;
     } else {
         config.exploitation_reports.push(record);
     }
     drop(config);
-    state.save_config()
+    state.save_config()?;
+    Ok(normalized_report)
 }
 
 #[tauri::command]
@@ -237,15 +418,82 @@ pub fn delete_exploitation_report(
     state: State<AppState>,
     id: String,
     year: i32,
+    report_id: Option<String>,
 ) -> Result<(), String> {
     let connection = state.resolve_connection_config(&id)?;
-    let key = exploitation_report_key(&connection, year);
+    let base_key = exploitation_report_key(&connection, year);
+    let normalized_id = report_id
+        .as_deref()
+        .map(normalize_exploitation_report_id)
+        .unwrap_or_default();
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config
-        .exploitation_reports
-        .retain(|record| record.key != key);
+    let deleted_was_active = config.exploitation_reports.iter().any(|record| {
+        let in_year = record.key == base_key || record.key.starts_with(&format!("{}|", base_key));
+        let candidate_id = if record.report_id.is_empty() {
+            "default"
+        } else {
+            record.report_id.as_str()
+        };
+        in_year && (normalized_id.is_empty() || candidate_id == normalized_id) && record.active
+    });
+    config.exploitation_reports.retain(|record| {
+        let in_year = record.key == base_key || record.key.starts_with(&format!("{}|", base_key));
+        let candidate_id = if record.report_id.is_empty() {
+            "default"
+        } else {
+            record.report_id.as_str()
+        };
+        !(in_year && (normalized_id.is_empty() || candidate_id == normalized_id))
+    });
+    if deleted_was_active {
+        if let Some(next) = config
+            .exploitation_reports
+            .iter_mut()
+            .find(|record| record.key == base_key || record.key.starts_with(&format!("{}|", base_key)))
+        {
+            next.active = true;
+        }
+    }
     drop(config);
     state.save_config()
+}
+
+#[tauri::command]
+pub fn set_active_exploitation_report(
+    state: State<AppState>,
+    id: String,
+    year: i32,
+    report_id: String,
+) -> Result<Option<Value>, String> {
+    let connection = state.resolve_connection_config(&id)?;
+    let base_key = exploitation_report_key(&connection, year);
+    let normalized_id = normalize_exploitation_report_id(&report_id);
+    let mut selected = None;
+    let mut found = false;
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    for record in config
+        .exploitation_reports
+        .iter_mut()
+        .filter(|record| record.key == base_key || record.key.starts_with(&format!("{}|", base_key)))
+    {
+        let candidate_id = if record.report_id.is_empty() {
+            "default"
+        } else {
+            record.report_id.as_str()
+        };
+        let is_selected = candidate_id == normalized_id;
+        record.active = is_selected;
+        if is_selected {
+            found = true;
+            selected = Some(record.report.clone());
+        }
+    }
+    if !found {
+        return Err(format!("Budget scenario '{}' not found", report_id));
+    }
+    drop(config);
+    state.save_config()?;
+    Ok(selected)
 }
 
 const MAX_QUERY_HISTORY: usize = 100;

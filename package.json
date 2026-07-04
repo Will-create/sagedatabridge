@@ -1,14 +1,16 @@
 {
   "name": "sage-data-bridge",
   "private": true,
-  "version": "0.1.0",
+  "version": "6.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "test": "node --test",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release:version": "node scripts/bump-version.mjs",
+    "release:upload": "node scripts/upload-tauri-release.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^1.6.0",
