@@ -1134,6 +1134,195 @@ async fn get_grand_livre_sage1000(
     })
 }
 
+/// Build the Sage 1000 balance from Sage-maintained exercise and period
+/// cumulatives. Summing TECRITURE over all history repeats annual carry-forward
+/// entries and produces incorrect opening balances.
+async fn get_balance_sage1000_cumulative(
+    client: &mut db::DbClient,
+    context: &Sage1000Context,
+    period: &BalancePeriod,
+    account_prefix: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Option<DashboardResponse<Vec<BalanceRow>>>, String> {
+    let Some(period_cumul) = detect_table(client, &["TCUMULPERIODECOMPTE"]).await else {
+        return Ok(None);
+    };
+    let Some(opening_cumul) = detect_table(client, &["TCUMULANOUVEAUCOMPTE"]).await else {
+        return Ok(None);
+    };
+    let Some(exercises) = detect_table(client, &["TEXERCICE"]).await else {
+        return Ok(None);
+    };
+    let Some(periods) = detect_table(client, &["TPERIODE"]).await else {
+        return Ok(None);
+    };
+
+    let account_no = text_or_empty(&qualify("cg", "codeCompte"), 64);
+    let account_filter_sql = account_prefix
+        .filter(|prefix| !prefix.trim().is_empty())
+        .map(|prefix| {
+            format!(
+                " AND {account_no} LIKE {}",
+                sql_literal(&format!("{}%", prefix.trim()))
+            )
+        })
+        .unwrap_or_default();
+
+    let sql = format!(
+        r#"
+        WITH target_exercise AS (
+            SELECT TOP (1) ex.oid, ex.dateDebut, ex.dateFin
+            FROM {exercises} ex
+            WHERE {date_from} BETWEEN CAST(ex.dateDebut AS date) AND CAST(ex.dateFin AS date)
+            ORDER BY ex.dateDebut DESC
+        ),
+        previous_exercise AS (
+            SELECT TOP (1) ex.oid
+            FROM {exercises} ex
+            CROSS JOIN target_exercise tx
+            WHERE CAST(ex.dateFin AS date) < CAST(tx.dateDebut AS date)
+            ORDER BY ex.dateFin DESC
+        ),
+        current_an_available AS (
+            SELECT has_values = CASE WHEN COALESCE(SUM(ABS(COALESCE(an.debit, 0)) + ABS(COALESCE(an.credit, 0))), 0) <> 0 THEN 1 ELSE 0 END
+            FROM {opening_cumul} an
+            JOIN target_exercise tx ON an.oidExercice = tx.oid
+            WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
+              AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+        ),
+        current_an AS (
+            SELECT an.oidcompteGeneral, SUM(COALESCE(an.debit, 0)) debit, SUM(COALESCE(an.credit, 0)) credit
+            FROM {opening_cumul} an
+            JOIN target_exercise tx ON an.oidExercice = tx.oid
+            WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
+              AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+            GROUP BY an.oidcompteGeneral
+        ),
+        previous_close AS (
+            SELECT source.oidcompteGeneral, SUM(source.debit) debit, SUM(source.credit) credit
+            FROM (
+                SELECT an.oidcompteGeneral, COALESCE(an.debit, 0) debit, COALESCE(an.credit, 0) credit
+                FROM {opening_cumul} an
+                JOIN previous_exercise px ON an.oidExercice = px.oid
+                WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
+                  AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+                UNION ALL
+                SELECT cp.oidcompteGeneral, COALESCE(cp.debit, 0), COALESCE(cp.credit, 0)
+                FROM {period_cumul} cp
+                JOIN {periods} per ON cp.oidPeriode = per.oid
+                JOIN previous_exercise px ON per.oidexercice = px.oid
+                WHERE COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
+                  AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
+                  AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+            ) source
+            GROUP BY source.oidcompteGeneral
+        ),
+        opening_periods AS (
+            SELECT cp.oidcompteGeneral, SUM(COALESCE(cp.debit, 0)) debit, SUM(COALESCE(cp.credit, 0)) credit
+            FROM {period_cumul} cp
+            JOIN {periods} per ON cp.oidPeriode = per.oid
+            JOIN target_exercise tx ON per.oidexercice = tx.oid
+            WHERE CAST(per.dateFin AS date) < {date_from}
+              AND COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
+              AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
+              AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+            GROUP BY cp.oidcompteGeneral
+        ),
+        movement_periods AS (
+            SELECT cp.oidcompteGeneral, SUM(COALESCE(cp.debit, 0)) debit, SUM(COALESCE(cp.credit, 0)) credit
+            FROM {period_cumul} cp
+            JOIN {periods} per ON cp.oidPeriode = per.oid
+            WHERE CAST(per.dateDebut AS date) >= {date_from}
+              AND CAST(per.dateFin AS date) <= {date_to}
+              AND COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
+              AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
+              AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+            GROUP BY cp.oidcompteGeneral
+        ),
+        partial_entries AS (
+            SELECT e.oidcompteGeneral,
+                   SUM(COALESCE(TRY_CAST(e.debit AS decimal(38, 6)), 0)) debit,
+                   SUM(COALESCE(TRY_CAST(e.credit AS decimal(38, 6)), 0)) credit
+            FROM {entries} e
+            WHERE TRY_CAST(e.eDate AS date) BETWEEN {date_from} AND {date_to}
+              AND NOT EXISTS (
+                  SELECT 1 FROM {periods} covered
+                  WHERE CAST(covered.dateDebut AS date) >= {date_from}
+                    AND CAST(covered.dateFin AS date) <= {date_to}
+                    AND TRY_CAST(e.eDate AS date) BETWEEN CAST(covered.dateDebut AS date) AND CAST(covered.dateFin AS date)
+              )
+            GROUP BY e.oidcompteGeneral
+        ),
+        account_base AS (
+            SELECT account_no = {account_no},
+                   account_label = {account_label},
+                   opening_net = CASE WHEN ({account_no} LIKE '6%' OR {account_no} LIKE '7%') THEN CAST(0 AS decimal(38, 6)) ELSE
+                       (CASE WHEN availability.has_values = 1
+                             THEN COALESCE(can.debit, 0) - COALESCE(can.credit, 0)
+                             ELSE COALESCE(pc.debit, 0) - COALESCE(pc.credit, 0) END)
+                       + COALESCE(op.debit, 0) - COALESCE(op.credit, 0) END,
+                   mvt_debit = COALESCE(mp.debit, 0) + COALESCE(pe.debit, 0),
+                   mvt_credit = COALESCE(mp.credit, 0) + COALESCE(pe.credit, 0)
+            FROM {accounts} cg
+            CROSS JOIN current_an_available availability
+            LEFT JOIN current_an can ON can.oidcompteGeneral = cg.oid
+            LEFT JOIN previous_close pc ON pc.oidcompteGeneral = cg.oid
+            LEFT JOIN opening_periods op ON op.oidcompteGeneral = cg.oid
+            LEFT JOIN movement_periods mp ON mp.oidcompteGeneral = cg.oid
+            LEFT JOIN partial_entries pe ON pe.oidcompteGeneral = cg.oid
+            WHERE COALESCE(TRY_CAST(cg.enActivite AS int), 1) = 1
+              AND {account_no} <> '' {account_filter_sql}
+        )
+        SELECT account_no, account_label,
+               ouverture_debit = CASE WHEN opening_net > 0 THEN opening_net ELSE CAST(0 AS decimal(38, 6)) END,
+               ouverture_credit = CASE WHEN opening_net < 0 THEN ABS(opening_net) ELSE CAST(0 AS decimal(38, 6)) END,
+               mvt_debit, mvt_credit,
+               cloture_debit = CASE WHEN opening_net + mvt_debit - mvt_credit > 0 THEN opening_net + mvt_debit - mvt_credit ELSE CAST(0 AS decimal(38, 6)) END,
+               cloture_credit = CASE WHEN opening_net + mvt_debit - mvt_credit < 0 THEN ABS(opening_net + mvt_debit - mvt_credit) ELSE CAST(0 AS decimal(38, 6)) END
+        FROM account_base
+        WHERE opening_net <> 0 OR mvt_debit <> 0 OR mvt_credit <> 0
+        ORDER BY account_no
+        "#,
+        exercises = exercises.sql_name(),
+        opening_cumul = opening_cumul.sql_name(),
+        period_cumul = period_cumul.sql_name(),
+        periods = periods.sql_name(),
+        entries = context.entries.sql_name(),
+        accounts = context.accounts.sql_name(),
+        date_from = sql_literal(&period.date_from),
+        date_to = sql_literal(&period.date_to),
+        account_no = account_no,
+        account_label = text_or_empty(&qualify("cg", "Caption"), 255),
+        account_filter_sql = account_filter_sql,
+    );
+
+    let data = db::execute_logged_query(
+        client,
+        &sql,
+        db::QueryExecutionContext::new("get_balance", "dashboard_balance_sage1000_cumulative")
+            .with_table(period_cumul.sql_name())
+            .with_timeout_secs(timeout_secs),
+    )
+    .await?;
+    let indexes = column_index_map(&data);
+    let rows = data
+        .rows
+        .iter()
+        .map(|row| BalanceRow {
+            account_no: row_string(row, &indexes, "account_no").unwrap_or_default(),
+            account_label: row_string(row, &indexes, "account_label").unwrap_or_default(),
+            ouverture_debit: row_decimal(row, &indexes, "ouverture_debit"),
+            ouverture_credit: row_decimal(row, &indexes, "ouverture_credit"),
+            mvt_debit: row_decimal(row, &indexes, "mvt_debit"),
+            mvt_credit: row_decimal(row, &indexes, "mvt_credit"),
+            cloture_debit: row_decimal(row, &indexes, "cloture_debit"),
+            cloture_credit: row_decimal(row, &indexes, "cloture_credit"),
+        })
+        .collect();
+
+    Ok(Some(DashboardResponse { data: rows, warning: None }))
+}
+
 async fn get_balance_sage1000(
     client: &mut db::DbClient,
     period: &BalancePeriod,
@@ -1145,6 +1334,13 @@ async fn get_balance_sage1000(
             "Sage 1000 tables TECRITURE and TCOMPTEGENERAL were not detected".to_string(),
         ]));
     };
+
+    if let Some(result) =
+        get_balance_sage1000_cumulative(client, &context, period, account_prefix, timeout_secs)
+            .await?
+    {
+        return Ok(result);
+    }
 
     let account_no_expr = text_or_empty(&qualify("cg", "codeCompte"), 64);
     let account_label_expr = text_or_empty(&qualify("cg", "Caption"), 255);
