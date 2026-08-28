@@ -43,6 +43,7 @@ import {
 import { useExportJobs } from "../../exportJobs";
 import CompteExploitationTab from "./CompteExploitation";
 import { EXPLOITATION_MONTHS } from "./exploitationModel";
+import { BALANCE_AMOUNT_FIELDS, buildBalanceTotals } from "./balanceModel";
 
 function useCollapse() {
   return useState(false);
@@ -727,24 +728,7 @@ function buildGrandLivreWorksheet(displayRows, t, lang, options = {}) {
 
 function buildBalanceWorksheet(rows, t, lang, options = {}) {
   const grouped = buildBalanceGroups(rows, "");
-  const grandTotal = grouped.filtered.reduce(
-    (totals, row) => ({
-      ouverture_debit: totals.ouverture_debit + toNumber(row.ouverture_debit),
-      ouverture_credit: totals.ouverture_credit + toNumber(row.ouverture_credit),
-      mvt_debit: totals.mvt_debit + toNumber(row.mvt_debit),
-      mvt_credit: totals.mvt_credit + toNumber(row.mvt_credit),
-      cloture_debit: totals.cloture_debit + toNumber(row.cloture_debit),
-      cloture_credit: totals.cloture_credit + toNumber(row.cloture_credit),
-    }),
-    {
-      ouverture_debit: 0,
-      ouverture_credit: 0,
-      mvt_debit: 0,
-      mvt_credit: 0,
-      cloture_debit: 0,
-      cloture_credit: 0,
-    },
-  );
+  const totals = buildBalanceTotals(grouped.filtered);
 
   const exportRows = [
     {
@@ -780,19 +764,14 @@ function buildBalanceWorksheet(rows, t, lang, options = {}) {
         ],
       })),
     ])),
-    {
+    ...[
+      [t("dashboard_assessment_total"), totals.assessment],
+      [t("dashboard_management_total"), totals.management],
+      [t("dashboard_grand_total"), totals.grand],
+    ].map(([label, total]) => ({
       kind: "total",
-      values: [
-        t("dashboard_grand_total"),
-        "",
-        grandTotal.ouverture_debit,
-        grandTotal.ouverture_credit,
-        grandTotal.mvt_debit,
-        grandTotal.mvt_credit,
-        grandTotal.cloture_debit,
-        grandTotal.cloture_credit,
-      ],
-    },
+      values: [label, "", ...BALANCE_AMOUNT_FIELDS.map((field) => total[field])],
+    })),
   ];
 
   return buildWorksheet(exportRows, ["text", "text", "debit", "credit", "debit", "credit", "debit", "credit"], lang, options);
@@ -1681,28 +1660,13 @@ function BalanceTab({
     [state.data, deferredSearch],
   );
 
-  const grandTotal = useMemo(
-    () =>
-      filtered.reduce(
-        (totals, row) => ({
-          ouverture_debit: totals.ouverture_debit + toNumber(row.ouverture_debit),
-          ouverture_credit: totals.ouverture_credit + toNumber(row.ouverture_credit),
-          mvt_debit: totals.mvt_debit + toNumber(row.mvt_debit),
-          mvt_credit: totals.mvt_credit + toNumber(row.mvt_credit),
-          cloture_debit: totals.cloture_debit + toNumber(row.cloture_debit),
-          cloture_credit: totals.cloture_credit + toNumber(row.cloture_credit),
-        }),
-        {
-          ouverture_debit: 0,
-          ouverture_credit: 0,
-          mvt_debit: 0,
-          mvt_credit: 0,
-          cloture_debit: 0,
-          cloture_credit: 0,
-        },
-      ),
-    [filtered],
-  );
+  const balanceTotals = useMemo(() => buildBalanceTotals(filtered), [filtered]);
+  const grandTotal = balanceTotals.grand;
+
+  const totalsUnbalanced =
+    Math.abs(grandTotal.ouverture_debit - grandTotal.ouverture_credit) > 0.01
+    || Math.abs(grandTotal.mvt_debit - grandTotal.mvt_credit) > 0.01
+    || Math.abs(grandTotal.cloture_debit - grandTotal.cloture_credit) > 0.01;
 
   if (state.loading && !state.data) {
     return <DashboardLoader label={t("dashboard_loading_balance")} />;
@@ -1797,16 +1761,21 @@ function BalanceTab({
             </table>
           </div>
 
-          <div className="dashboard-total-bar">
-            <strong>{t("dashboard_grand_total")}</strong>
-            <div className="dashboard-total-grid">
-              <Amount value={grandTotal.ouverture_debit} lang={lang} />
-              <Amount value={grandTotal.ouverture_credit} lang={lang} />
-              <Amount value={grandTotal.mvt_debit} lang={lang} />
-              <Amount value={grandTotal.mvt_credit} lang={lang} />
-              <Amount value={grandTotal.cloture_debit} lang={lang} />
-              <Amount value={grandTotal.cloture_credit} lang={lang} />
-            </div>
+          <div className={`dashboard-balance-totals${totalsUnbalanced ? " is-unbalanced" : ""}`}>
+            {[
+              [t("dashboard_assessment_total"), balanceTotals.assessment],
+              [t("dashboard_management_total"), balanceTotals.management],
+              [t("dashboard_grand_total"), balanceTotals.grand],
+            ].map(([label, total]) => (
+              <div className="dashboard-total-bar" key={label}>
+                <strong>{label}</strong>
+                <div className="dashboard-total-grid">
+                  {BALANCE_AMOUNT_FIELDS.map((field) => (
+                    <Amount key={field} value={total[field]} lang={lang} />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}

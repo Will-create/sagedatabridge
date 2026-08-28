@@ -60,15 +60,71 @@ fn resolve_balance_period(date_from: &str, date_to: &str) -> Result<BalancePerio
 }
 
 fn annual_account_condition(account_expr: &str) -> String {
-    format!("({account_expr} LIKE '6%' OR {account_expr} LIKE '7%')")
+    format!("({account_expr} LIKE '6%' OR {account_expr} LIKE '7%' OR {account_expr} LIKE '8%')")
 }
 
 fn non_opening_journal_condition(journal_expr: &str, journal_available: bool) -> String {
     if journal_available {
-        format!("UPPER(LTRIM(RTRIM({journal_expr}))) NOT IN ('RAN', 'AN', 'OUV')")
+        format!(
+            "UPPER(LTRIM(RTRIM({journal_expr}))) NOT IN ('RAN', 'AN', 'OUV', 'OA', 'ANOUVEAU', 'A-NOUVEAU')"
+        )
     } else {
         "1 = 1".to_string()
     }
+}
+
+/// Sage 1000 national-approach rows: national-only, dual national+IAS, or unspecified.
+/// Excludes IAS-only rows. Matches Sage desktop "Approche Nationale".
+fn sage1000_national_approach_predicate(alias: &str) -> String {
+    format!(
+        "(COALESCE(TRY_CAST({alias}.ApprocheNationale AS int), 0) = 1 OR (COALESCE(TRY_CAST({alias}.ApprocheNationale AS int), 0) = 0 AND COALESCE(TRY_CAST({alias}.ApprocheIAS AS int), 0) = 0))"
+    )
+}
+
+fn sage1000_lot_choice_cte(period_cumul_sql: &str) -> String {
+    let national = sage1000_national_approach_predicate("lot_src");
+    format!(
+        r#"lot_choice AS (
+            SELECT preferred_lot = (
+                SELECT TOP (1) COALESCE(TRY_CAST(lot_src.typeLot AS int), 0)
+                FROM {period_cumul_sql} lot_src
+                WHERE {national}
+                GROUP BY COALESCE(TRY_CAST(lot_src.typeLot AS int), 0)
+                ORDER BY CASE COALESCE(TRY_CAST(lot_src.typeLot AS int), 0)
+                    WHEN 0 THEN 0
+                    WHEN 1 THEN 1
+                    ELSE 2 END,
+                    COALESCE(TRY_CAST(lot_src.typeLot AS int), 0)
+            )
+        )"#
+    )
+}
+
+fn sage1000_matching_lot_predicate(alias: &str) -> String {
+    format!(
+        "((SELECT preferred_lot FROM lot_choice) IS NULL OR COALESCE(TRY_CAST({alias}.typeLot AS int), 0) = (SELECT preferred_lot FROM lot_choice))"
+    )
+}
+
+fn sage1000_posted_piece_predicate(
+    has_pieces: bool,
+    has_piece_modele: bool,
+    has_approche: bool,
+) -> String {
+    if !has_pieces {
+        return "1 = 1".to_string();
+    }
+    let mut piece_ok = Vec::new();
+    if has_piece_modele {
+        piece_ok.push("COALESCE(TRY_CAST(p.pieceModele AS int), 0) = 0".to_string());
+    }
+    if has_approche {
+        piece_ok.push(sage1000_national_approach_predicate("p"));
+    }
+    if piece_ok.is_empty() {
+        return "1 = 1".to_string();
+    }
+    format!("(p.oid IS NULL OR ({}))", piece_ok.join(" AND "))
 }
 
 fn balance_movement_condition(
@@ -81,7 +137,7 @@ fn balance_movement_condition(
     let annual = annual_account_condition(account_expr);
     let non_opening = non_opening_journal_condition(journal_expr, journal_available);
     format!(
-        "((NOT {annual} AND {date_expr} BETWEEN {from} AND {to}) OR ({annual} AND {date_expr} BETWEEN {annual_from} AND {annual_to} AND {non_opening}))",
+        "({date_expr} BETWEEN {from} AND {to} AND {non_opening} AND (NOT {annual} OR {date_expr} BETWEEN {annual_from} AND {annual_to}))",
         from = sql_literal(&period.date_from),
         to = sql_literal(&period.date_to),
         annual_from = sql_literal(&period.annual_from),
@@ -89,9 +145,68 @@ fn balance_movement_condition(
     )
 }
 
+fn trial_gap(debit: Decimal, credit: Decimal) -> Decimal {
+    (debit - credit).round_dp(2)
+}
+
+fn format_signed_decimal(value: Decimal) -> String {
+    let rounded = value.round_dp(2);
+    let raw = format!("{rounded}");
+    let text = match raw.split_once('.') {
+        Some((whole, frac)) => {
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                whole.to_string()
+            } else {
+                format!("{whole}.{frac}")
+            }
+        }
+        None => raw,
+    };
+    if rounded > Decimal::ZERO {
+        format!("+{text}")
+    } else {
+        text
+    }
+}
+
+fn balance_trial_imbalance_warning(rows: &[BalanceRow]) -> Option<String> {
+    let mut opening_d = Decimal::ZERO;
+    let mut opening_c = Decimal::ZERO;
+    let mut mvt_d = Decimal::ZERO;
+    let mut mvt_c = Decimal::ZERO;
+    let mut close_d = Decimal::ZERO;
+    let mut close_c = Decimal::ZERO;
+    for row in rows {
+        opening_d += row.ouverture_debit;
+        opening_c += row.ouverture_credit;
+        mvt_d += row.mvt_debit;
+        mvt_c += row.mvt_credit;
+        close_d += row.cloture_debit;
+        close_c += row.cloture_credit;
+    }
+    let opening_gap = trial_gap(opening_d, opening_c);
+    let mvt_gap = trial_gap(mvt_d, mvt_c);
+    let close_gap = trial_gap(close_d, close_c);
+    if opening_gap.is_zero() && mvt_gap.is_zero() && close_gap.is_zero() {
+        return None;
+    }
+    Some(format!(
+        "Balance D≠C: ouverture {opening}, mouvement {movement}, clôture {closing}",
+        opening = format_signed_decimal(opening_gap),
+        movement = format_signed_decimal(mvt_gap),
+        closing = format_signed_decimal(close_gap),
+    ))
+}
+
 #[cfg(test)]
 mod balance_period_tests {
-    use super::{balance_movement_condition, resolve_balance_period};
+    use super::{
+        balance_movement_condition, balance_trial_imbalance_warning, resolve_balance_period,
+        sage1000_lot_choice_cte, sage1000_national_approach_predicate,
+        sage1000_posted_piece_predicate, BalanceRow,
+    };
+    use rust_decimal::Decimal;
 
     #[test]
     fn balance_period_keeps_a_same_year_range() {
@@ -119,8 +234,55 @@ mod balance_period_tests {
         let sql = balance_movement_condition("account_no", "parsed_date", "journal", true, &period);
         assert!(sql.contains("account_no LIKE '6%'"));
         assert!(sql.contains("account_no LIKE '7%'"));
+        assert!(sql.contains("account_no LIKE '8%'"));
         assert!(sql.contains("'2025-12-31'"));
-        assert!(sql.contains("NOT IN ('RAN', 'AN', 'OUV')"));
+        assert!(sql.contains("NOT IN ('RAN', 'AN', 'OUV', 'OA', 'ANOUVEAU', 'A-NOUVEAU')"));
+        assert!(sql.contains("parsed_date BETWEEN '2025-01-01' AND '2026-03-31'"));
+        assert!(sql.contains("NOT (account_no LIKE '6%'"));
+    }
+
+    #[test]
+    fn national_approach_includes_dual_and_unspecified() {
+        let sql = sage1000_national_approach_predicate("cp");
+        assert!(sql.contains("cp.ApprocheNationale"));
+        assert!(sql.contains("cp.ApprocheIAS"));
+        assert!(sql.contains("= 1 OR"));
+        assert!(sql.contains("= 0 AND"));
+    }
+
+    #[test]
+    fn lot_choice_prefers_real_over_simulation() {
+        let sql = sage1000_lot_choice_cte("[dbo].[TCUMULPERIODECOMPTE]");
+        assert!(sql.contains("WHEN 0 THEN 0"));
+        assert!(sql.contains("WHEN 1 THEN 1"));
+        assert!(sql.contains("[dbo].[TCUMULPERIODECOMPTE]"));
+    }
+
+    #[test]
+    fn piece_predicate_requires_non_model_national_rows() {
+        let sql = sage1000_posted_piece_predicate(true, true, true);
+        assert!(sql.contains("p.oid IS NULL OR"));
+        assert!(sql.contains("pieceModele"));
+        assert!(sql.contains("p.ApprocheNationale"));
+        assert_eq!(sage1000_posted_piece_predicate(false, true, true), "1 = 1");
+    }
+
+    #[test]
+    fn trial_imbalance_warning_reports_each_stage() {
+        let rows = vec![BalanceRow {
+            account_no: "41100000".to_string(),
+            ouverture_debit: Decimal::from(100),
+            ouverture_credit: Decimal::from(90),
+            mvt_debit: Decimal::from(5),
+            mvt_credit: Decimal::from(5),
+            cloture_debit: Decimal::from(110),
+            cloture_credit: Decimal::ZERO,
+            ..BalanceRow::default()
+        }];
+        let warning = balance_trial_imbalance_warning(&rows).unwrap();
+        assert!(warning.contains("ouverture +10"));
+        assert!(warning.contains("mouvement 0"));
+        assert!(warning.contains("clôture +110"));
     }
 }
 
@@ -1167,6 +1329,30 @@ async fn get_balance_sage1000_cumulative(
             )
         })
         .unwrap_or_default();
+    let document_sql = sage1000_document_sql(context);
+    let journal_available = context.pieces.is_some() && context.journals.is_some();
+    let non_opening_journal =
+        non_opening_journal_condition(&document_sql.journal_expr, journal_available);
+    let piece_columns = match context.pieces.as_ref() {
+        Some(table) => detect_columns(client, table).await.ok(),
+        None => None,
+    };
+    let piece_predicate = sage1000_posted_piece_predicate(
+        context.pieces.is_some(),
+        piece_columns
+            .as_ref()
+            .map(|columns| columns.contains_key("piecemodele"))
+            .unwrap_or(false),
+        piece_columns
+            .as_ref()
+            .map(|columns| columns.contains_key("approchenationale"))
+            .unwrap_or(false),
+    );
+    let national_an = sage1000_national_approach_predicate("an");
+    let national_cp = sage1000_national_approach_predicate("cp");
+    let matching_lot = sage1000_matching_lot_predicate("cp");
+    let gestion_accounts = annual_account_condition(&account_no);
+    let lot_choice = sage1000_lot_choice_cte(&period_cumul.sql_name());
 
     let sql = format!(
         r#"
@@ -1183,19 +1369,18 @@ async fn get_balance_sage1000_cumulative(
             WHERE CAST(ex.dateFin AS date) < CAST(tx.dateDebut AS date)
             ORDER BY ex.dateFin DESC
         ),
+        {lot_choice},
         current_an_available AS (
             SELECT has_values = CASE WHEN COALESCE(SUM(ABS(COALESCE(an.debit, 0)) + ABS(COALESCE(an.credit, 0))), 0) <> 0 THEN 1 ELSE 0 END
             FROM {opening_cumul} an
             JOIN target_exercise tx ON an.oidExercice = tx.oid
-            WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
-              AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+            WHERE {national_an}
         ),
         current_an AS (
             SELECT an.oidcompteGeneral, SUM(COALESCE(an.debit, 0)) debit, SUM(COALESCE(an.credit, 0)) credit
             FROM {opening_cumul} an
             JOIN target_exercise tx ON an.oidExercice = tx.oid
-            WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
-              AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+            WHERE {national_an}
             GROUP BY an.oidcompteGeneral
         ),
         previous_close AS (
@@ -1204,16 +1389,14 @@ async fn get_balance_sage1000_cumulative(
                 SELECT an.oidcompteGeneral, COALESCE(an.debit, 0) debit, COALESCE(an.credit, 0) credit
                 FROM {opening_cumul} an
                 JOIN previous_exercise px ON an.oidExercice = px.oid
-                WHERE COALESCE(TRY_CAST(an.ApprocheNationale AS int), 0) = 1
-                  AND COALESCE(TRY_CAST(an.ApprocheIAS AS int), 0) = 0
+                WHERE {national_an}
                 UNION ALL
                 SELECT cp.oidcompteGeneral, COALESCE(cp.debit, 0), COALESCE(cp.credit, 0)
                 FROM {period_cumul} cp
                 JOIN {periods} per ON cp.oidPeriode = per.oid
                 JOIN previous_exercise px ON per.oidexercice = px.oid
-                WHERE COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
-                  AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
-                  AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+                WHERE {national_cp}
+                  AND {matching_lot}
             ) source
             GROUP BY source.oidcompteGeneral
         ),
@@ -1223,20 +1406,19 @@ async fn get_balance_sage1000_cumulative(
             JOIN {periods} per ON cp.oidPeriode = per.oid
             JOIN target_exercise tx ON per.oidexercice = tx.oid
             WHERE CAST(per.dateFin AS date) < {date_from}
-              AND COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
-              AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
-              AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+              AND {national_cp}
+              AND {matching_lot}
             GROUP BY cp.oidcompteGeneral
         ),
         movement_periods AS (
             SELECT cp.oidcompteGeneral, SUM(COALESCE(cp.debit, 0)) debit, SUM(COALESCE(cp.credit, 0)) credit
             FROM {period_cumul} cp
             JOIN {periods} per ON cp.oidPeriode = per.oid
+            JOIN target_exercise tx ON per.oidexercice = tx.oid
             WHERE CAST(per.dateDebut AS date) >= {date_from}
               AND CAST(per.dateFin AS date) <= {date_to}
-              AND COALESCE(TRY_CAST(cp.ApprocheNationale AS int), 0) = 1
-              AND COALESCE(TRY_CAST(cp.ApprocheIAS AS int), 0) = 0
-              AND COALESCE(TRY_CAST(cp.typeLot AS int), 1) = 1
+              AND {national_cp}
+              AND {matching_lot}
             GROUP BY cp.oidcompteGeneral
         ),
         partial_entries AS (
@@ -1244,9 +1426,13 @@ async fn get_balance_sage1000_cumulative(
                    SUM(COALESCE(TRY_CAST(e.debit AS decimal(38, 6)), 0)) debit,
                    SUM(COALESCE(TRY_CAST(e.credit AS decimal(38, 6)), 0)) credit
             FROM {entries} e
+            {document_join}
             WHERE TRY_CAST(e.eDate AS date) BETWEEN {date_from} AND {date_to}
+              AND {piece_predicate}
+              AND {non_opening_journal}
               AND NOT EXISTS (
                   SELECT 1 FROM {periods} covered
+                  JOIN target_exercise tx ON covered.oidexercice = tx.oid
                   WHERE CAST(covered.dateDebut AS date) >= {date_from}
                     AND CAST(covered.dateFin AS date) <= {date_to}
                     AND TRY_CAST(e.eDate AS date) BETWEEN CAST(covered.dateDebut AS date) AND CAST(covered.dateFin AS date)
@@ -1256,7 +1442,7 @@ async fn get_balance_sage1000_cumulative(
         account_base AS (
             SELECT account_no = {account_no},
                    account_label = {account_label},
-                   opening_net = CASE WHEN ({account_no} LIKE '6%' OR {account_no} LIKE '7%') THEN CAST(0 AS decimal(38, 6)) ELSE
+                   opening_net = CASE WHEN {gestion_accounts} THEN CAST(0 AS decimal(38, 6)) ELSE
                        (CASE WHEN availability.has_values = 1
                              THEN COALESCE(can.debit, 0) - COALESCE(can.credit, 0)
                              ELSE COALESCE(pc.debit, 0) - COALESCE(pc.credit, 0) END)
@@ -1270,8 +1456,7 @@ async fn get_balance_sage1000_cumulative(
             LEFT JOIN opening_periods op ON op.oidcompteGeneral = cg.oid
             LEFT JOIN movement_periods mp ON mp.oidcompteGeneral = cg.oid
             LEFT JOIN partial_entries pe ON pe.oidcompteGeneral = cg.oid
-            WHERE COALESCE(TRY_CAST(cg.enActivite AS int), 1) = 1
-              AND {account_no} <> '' {account_filter_sql}
+            WHERE {account_no} <> '' {account_filter_sql}
         )
         SELECT account_no, account_label,
                ouverture_debit = CASE WHEN opening_net > 0 THEN opening_net ELSE CAST(0 AS decimal(38, 6)) END,
@@ -1294,6 +1479,14 @@ async fn get_balance_sage1000_cumulative(
         account_no = account_no,
         account_label = text_or_empty(&qualify("cg", "Caption"), 255),
         account_filter_sql = account_filter_sql,
+        lot_choice = lot_choice,
+        national_an = national_an,
+        national_cp = national_cp,
+        matching_lot = matching_lot,
+        gestion_accounts = gestion_accounts,
+        document_join = document_sql.join_sql,
+        piece_predicate = piece_predicate,
+        non_opening_journal = non_opening_journal,
     );
 
     let data = db::execute_logged_query(
@@ -1318,9 +1511,13 @@ async fn get_balance_sage1000_cumulative(
             cloture_debit: row_decimal(row, &indexes, "cloture_debit"),
             cloture_credit: row_decimal(row, &indexes, "cloture_credit"),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let warning = balance_trial_imbalance_warning(&rows);
 
-    Ok(Some(DashboardResponse { data: rows, warning: None }))
+    Ok(Some(DashboardResponse {
+        data: rows,
+        warning,
+    }))
 }
 
 async fn get_balance_sage1000(
@@ -1347,11 +1544,29 @@ async fn get_balance_sage1000(
     let document_sql = sage1000_document_sql(&context);
     let parsed_date_expr = format!("TRY_CAST({} AS DATE)", qualify("e", "eDate"));
     let annual_account = annual_account_condition(&account_no_expr);
+    let journal_available = context.pieces.is_some() && context.journals.is_some();
+    let piece_columns = match context.pieces.as_ref() {
+        Some(table) => detect_columns(client, table).await.ok(),
+        None => None,
+    };
+    let piece_predicate = sage1000_posted_piece_predicate(
+        context.pieces.is_some(),
+        piece_columns
+            .as_ref()
+            .map(|columns| columns.contains_key("piecemodele"))
+            .unwrap_or(false),
+        piece_columns
+            .as_ref()
+            .map(|columns| columns.contains_key("approchenationale"))
+            .unwrap_or(false),
+    );
+    let non_opening_journal =
+        non_opening_journal_condition(&document_sql.journal_expr, journal_available);
     let movement_condition = balance_movement_condition(
         &account_no_expr,
         &parsed_date_expr,
         &document_sql.journal_expr,
-        context.pieces.is_some() && context.journals.is_some(),
+        journal_available,
         period,
     );
     let movement_debit_expr = format!(
@@ -1364,14 +1579,26 @@ async fn get_balance_sage1000(
         movement_condition,
         decimal_or_zero(&qualify("e", "credit"))
     );
-    let opening_net_expr = format!(
-        "COALESCE(SUM(CASE WHEN NOT {} AND {} < {} THEN {} - {} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
-        annual_account,
-        parsed_date_expr,
-        sql_literal(&period.date_from),
-        decimal_or_zero(&qualify("e", "debit")),
-        decimal_or_zero(&qualify("e", "credit"))
-    );
+    let opening_net_expr = if journal_available {
+        format!(
+            "COALESCE(SUM(CASE WHEN NOT {annual} AND ({date_expr} < {date_from} OR NOT ({non_opening})) THEN {debit} - {credit} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+            annual = annual_account,
+            date_expr = parsed_date_expr,
+            date_from = sql_literal(&period.date_from),
+            non_opening = non_opening_journal,
+            debit = decimal_or_zero(&qualify("e", "debit")),
+            credit = decimal_or_zero(&qualify("e", "credit")),
+        )
+    } else {
+        format!(
+            "COALESCE(SUM(CASE WHEN NOT {annual} AND {date_expr} < {date_from} THEN {debit} - {credit} ELSE CAST(0 AS DECIMAL(38, 6)) END), CAST(0 AS DECIMAL(38, 6)))",
+            annual = annual_account,
+            date_expr = parsed_date_expr,
+            date_from = sql_literal(&period.date_from),
+            debit = decimal_or_zero(&qualify("e", "debit")),
+            credit = decimal_or_zero(&qualify("e", "credit")),
+        )
+    };
     let movement_net_expr = format!("({movement_debit_expr} - {movement_credit_expr})");
     let account_filter_sql = account_prefix
         .filter(|prefix| !prefix.trim().is_empty())
@@ -1398,8 +1625,8 @@ async fn get_balance_sage1000(
              FROM {accounts_table} cg
              LEFT JOIN {entries_table} e ON {entry_account_fk} = {account_pk}
              {document_join}
-            WHERE COALESCE(TRY_CAST({is_active_col} AS INT), 1) = 1
-              AND {account_no_expr} <> ''
+            WHERE {account_no_expr} <> ''
+              AND {piece_predicate}
               {account_filter_sql}
             GROUP BY
                 {account_pk},
@@ -1432,7 +1659,7 @@ async fn get_balance_sage1000(
         entry_account_fk = qualify("e", "oidcompteGeneral"),
         document_join = document_sql.join_sql,
         account_pk = qualify("cg", "oid"),
-        is_active_col = qualify("cg", "enActivite"),
+        piece_predicate = piece_predicate,
         account_filter_sql = account_filter_sql,
         account_no_col = qualify("cg", "codeCompte"),
         account_label_col = qualify("cg", "Caption")
@@ -1460,11 +1687,12 @@ async fn get_balance_sage1000(
             cloture_debit: row_decimal(row, &indexes, "cloture_debit"),
             cloture_credit: row_decimal(row, &indexes, "cloture_credit"),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let warning = balance_trial_imbalance_warning(&rows);
 
     Ok(DashboardResponse {
         data: rows,
-        warning: None,
+        warning,
     })
 }
 
@@ -2580,7 +2808,11 @@ pub async fn get_balance(
             cloture_debit: row_decimal(row, &indexes, "cloture_debit"),
             cloture_credit: row_decimal(row, &indexes, "cloture_credit"),
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    if let Some(imbalance) = balance_trial_imbalance_warning(&rows) {
+        warnings.push(imbalance);
+    }
 
     Ok(DashboardResponse {
         data: rows,

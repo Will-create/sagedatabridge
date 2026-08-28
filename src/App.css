@@ -4158,6 +4158,14 @@ select { appearance: none; cursor: pointer; }
   border-top: 1px solid var(--border);
 }
 
+.dashboard-balance-totals.is-unbalanced {
+  color: var(--red, #9b1c1c);
+}
+
+.dashboard-balance-totals .dashboard-total-bar + .dashboard-total-bar {
+  border-top-style: dashed;
+}
+
 .dashboard-total-grid {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
