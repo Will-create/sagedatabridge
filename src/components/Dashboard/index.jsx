@@ -1661,12 +1661,6 @@ function BalanceTab({
   );
 
   const balanceTotals = useMemo(() => buildBalanceTotals(filtered), [filtered]);
-  const grandTotal = balanceTotals.grand;
-
-  const totalsUnbalanced =
-    Math.abs(grandTotal.ouverture_debit - grandTotal.ouverture_credit) > 0.01
-    || Math.abs(grandTotal.mvt_debit - grandTotal.mvt_credit) > 0.01
-    || Math.abs(grandTotal.cloture_debit - grandTotal.cloture_credit) > 0.01;
 
   if (state.loading && !state.data) {
     return <DashboardLoader label={t("dashboard_loading_balance")} />;
@@ -1761,7 +1755,7 @@ function BalanceTab({
             </table>
           </div>
 
-          <div className={`dashboard-balance-totals${totalsUnbalanced ? " is-unbalanced" : ""}`}>
+          <div className="dashboard-balance-totals">
             {[
               [t("dashboard_assessment_total"), balanceTotals.assessment],
               [t("dashboard_management_total"), balanceTotals.management],
