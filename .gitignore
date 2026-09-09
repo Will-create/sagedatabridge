@@ -43,6 +43,17 @@ Thumbs.db
 /[{]src-tauri/
 /[{]src-tauri*/
 
+# Local SQL backups used for restore/salvage tests
+*.bak
+
+# Local financial-analysis reference artifacts
+/BALANCE 01-01-2025 TO 31-12-2025 - FINAL.xlsx
+/Rapport-analyse-comparative-Balance-BRAVIA-2025.docx
+/balace 01-01-2025 au  31-12-2025.pdf
+/balance 01-0126 au 31-12-26.pdf
+/dashboard-BRAVIA-2025-01-01-2025-12-31.xlsx
+/sage-balance-diagnostic.sql
+
 # Misc generated files
 coverage/
 .cache/

@@ -8,7 +8,7 @@
   },
   "package": {
     "productName": "Sage Data Bridge",
-    "version": "6.1.5"
+    "version": "6.1.8"
   },
   "tauri": {
     "allowlist": {

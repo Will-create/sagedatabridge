@@ -294,6 +294,10 @@ pub struct AppConfig {
     pub invoice_extra_taxes: Vec<InvoiceExtraTaxSetting>,
     #[serde(default)]
     pub tax_types: Vec<TaxTypeSetting>,
+    #[serde(default)]
+    pub operation_templates: Vec<crate::operations::OperationTemplate>,
+    #[serde(default)]
+    pub operation_jobs: Vec<crate::operations::OperationJob>,
 }
 
 fn default_fiscal_year_start_month() -> u8 {
@@ -421,6 +425,7 @@ pub struct AppState {
     pub client_cache: Mutex<HashMap<String, Arc<crate::db::CachedClient>>>,
     pub export_jobs: Mutex<HashMap<String, ExportJob>>,
     pub export_slots: Arc<Semaphore>,
+    pub operation_slots: Arc<Semaphore>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
 }
@@ -434,7 +439,7 @@ impl AppState {
         let config_path = data_dir.join("config.json");
 
         // Load config from disk if it exists
-        let config = if config_path.exists() {
+        let mut config = if config_path.exists() {
             std::fs::read_to_string(&config_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
@@ -443,6 +448,24 @@ impl AppState {
             AppConfig::default()
         };
 
+        let mut should_save = false;
+        for connection in &mut config.connections {
+            if !connection.use_windows_auth && !connection.password.is_empty() {
+                if crate::credential_store::write(&connection.id, &connection.password).is_ok() {
+                    connection.password.clear();
+                    should_save = true;
+                }
+            }
+        }
+        crate::operations::recover_interrupted_jobs(&mut config);
+        should_save |= config.operation_jobs.iter().any(|job| job.status == "interrupted");
+        if should_save {
+            if let Ok(json) = serde_json::to_string_pretty(&config) {
+                let _ = std::fs::create_dir_all(&data_dir);
+                let _ = std::fs::write(&config_path, json);
+            }
+        }
+
         Self {
             config: Mutex::new(config),
             active_connections: Mutex::new(HashMap::new()),
@@ -450,6 +473,7 @@ impl AppState {
             client_cache: Mutex::new(HashMap::new()),
             export_jobs: Mutex::new(HashMap::new()),
             export_slots: Arc::new(Semaphore::new(2)),
+            operation_slots: Arc::new(Semaphore::new(1)),
             data_dir,
             config_path,
         }
@@ -472,12 +496,18 @@ impl AppState {
         }
 
         let config = self.config.lock().map_err(|e| e.to_string())?;
-        config
+        let mut connection = config
             .connections
             .iter()
             .find(|connection| connection.id == id)
             .cloned()
-            .ok_or_else(|| format!("Connection '{}' not found", id))
+            .ok_or_else(|| format!("Connection '{}' not found", id))?;
+        drop(config);
+        if !connection.use_windows_auth && connection.password.is_empty() {
+            connection.password = crate::credential_store::read(&connection.id)?
+                .ok_or_else(|| format!("No Windows Credential Manager password is available for connection '{}'. Edit the connection and enter its password again.", connection.name))?;
+        }
+        Ok(connection)
     }
 
     pub fn get_active_connection(&self, id: &str) -> Result<ConnectionConfig, String> {

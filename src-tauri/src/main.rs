@@ -4,11 +4,14 @@
 mod analytics;
 mod bridge;
 mod commands;
+mod credential_store;
 mod db;
 mod export_jobs;
 mod invoice_commands;
 mod invoice_compat;
+mod journals;
 mod network_scan;
+mod operations;
 mod pdf_engine;
 mod sage_compat;
 mod sage_entity_service;
@@ -100,6 +103,10 @@ fn main() {
             // Data
             commands::get_table_data,
             commands::execute_query,
+            journals::get_accounting_journals,
+            journals::get_accounting_journal_stats,
+            journals::stream_accounting_journal_entries,
+            journals::export_accounting_journals_xlsx,
             // Query library
             commands::list_saved_queries,
             commands::save_saved_query,
@@ -110,6 +117,29 @@ fn main() {
             export_jobs::start_table_export,
             export_jobs::list_export_jobs,
             export_jobs::cancel_export_job,
+            // Transfer, backup, and restore operations
+            operations::preflight_transfer,
+            operations::preflight_backup,
+            operations::preflight_restore,
+            operations::start_transfer,
+            operations::start_backup,
+            operations::start_restore,
+            operations::list_operation_jobs,
+            operations::get_operation_job,
+            operations::cancel_operation_job,
+            operations::resume_operation_job,
+            operations::list_operation_templates,
+            operations::save_operation_template,
+            operations::delete_operation_template,
+            operations::export_operation_diagnostic,
+            operations::operations_list_databases,
+            operations::operations_list_tables,
+            operations::preview_transfer_table,
+            operations::list_sql_server_paths,
+            operations::inspect_backup,
+            operations::preview_backup_stage,
+            operations::confirm_backup_stage,
+            operations::sql_host_is_local,
             // Network scan
             network_scan::scan_network_for_sql_servers,
             // Analytics

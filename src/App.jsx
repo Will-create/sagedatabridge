@@ -20,6 +20,8 @@ import AboutPage from "./components/AboutPage";
 import DataGrid from "./components/DataGrid";
 import FilterBar from "./components/FilterBar";
 import Invoicing from "./components/Invoicing";
+import JournalsView from "./components/Journals";
+import OperationsWorkspace from "./components/OperationsWorkspace";
 import TemplateDesigner from "./components/Invoicing/TemplateDesigner";
 import LockScreen from "./components/LockScreen";
 import SettingsDrawer from "./components/SettingsDrawer";
@@ -246,7 +248,7 @@ export default function App() {
       setTablePanelCollapsed(false);
       setInvoicingOpen(false);
       setTemplateDesignerOpen(false);
-      if (activeConnId && activeDatabase && mainView !== "about") {
+      if (activeConnId && activeDatabase && mainView === "tables") {
         setMainView("dashboard");
       }
     }
@@ -618,6 +620,11 @@ export default function App() {
   }, [mainView]);
 
   const returnFromAbout = useCallback(() => {
+    if (aboutReturnView === "operations") {
+      setMainView("operations");
+      return;
+    }
+
     if (!activeConnId) {
       setMainView("welcome");
       return;
@@ -630,6 +637,11 @@ export default function App() {
 
     if (aboutReturnView === "tables" && adminMode) {
       setMainView("tables");
+      return;
+    }
+
+    if (aboutReturnView === "journals") {
+      setMainView("journals");
       return;
     }
 
@@ -719,9 +731,22 @@ export default function App() {
               setTemplateDesignerOpen(false);
               setMainView("dashboard");
             }}
+            onOpenJournals={() => {
+              setInvoicingOpen(false);
+              setTemplateDesignerOpen(false);
+              setMainView("journals");
+            }}
             onOpenInvoicing={() => adminMode && activeConnId && activeDatabase && setInvoicingOpen(true)}
+            onOpenOperations={() => {
+              setInvoicingOpen(false);
+              setTemplateDesignerOpen(false);
+              setMainView("operations");
+            }}
             onOpenSettings={() => setSettingsOpen(true)}
             invoicingOpen={adminMode && invoicingOpen}
+            dashboardOpen={mainView === "dashboard" && !invoicingOpen}
+            journalsOpen={mainView === "journals" && !invoicingOpen}
+            operationsOpen={mainView === "operations" && !invoicingOpen}
             disabled={globalLoading}
           />
         )}
@@ -747,7 +772,7 @@ export default function App() {
           )
         ) : null}
 
-        <div className={`main-content ${mainView === "dashboard" ? "dashboard-main" : ""}`}>
+        <div className={`main-content ${mainView === "dashboard" ? "dashboard-main" : ""} ${mainView === "operations" ? "operations-main" : ""}`}>
           {workspaces.length ? (
             <WorkspaceTabs
               workspaces={workspaces}
@@ -759,6 +784,8 @@ export default function App() {
 
           {mainView === "about" ? (
             <AboutPage onBack={returnFromAbout} onOpenSettings={() => setSettingsOpen(true)} />
+          ) : mainView === "operations" ? (
+            <OperationsWorkspace connections={connections} />
           ) : adminMode && invoicingOpen && activeConnId && activeDatabase ? (
             <Invoicing
               connId={activeConnId}
@@ -774,6 +801,11 @@ export default function App() {
               databases={databases}
               connectionName={activeConnection?.name || activeConnection?.host || ""}
               onSelectDatabase={handleSelectDatabase}
+            />
+          ) : mainView === "journals" ? (
+            <JournalsView
+              connId={activeConnId}
+              databaseName={activeDatabase}
             />
           ) : mainView === "dashboard" ? (
             <Dashboard

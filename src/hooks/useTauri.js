@@ -154,6 +154,109 @@ export const getTableData = (id, schema, table, page, pageSize, filters) =>
     label: `Load rows for ${schema}.${table}`,
   });
 
+export const getAccountingJournals = (id) =>
+  invokeWithTimeout("get_accounting_journals", { id }, {
+    timeoutMs: TABLE_DATA_TIMEOUT_MS,
+    label: "Load accounting journals",
+  });
+
+export const getAccountingJournalStats = (
+  id,
+  dateFrom,
+  dateTo,
+  journalType,
+  journalCode,
+) => invokeWithTimeout(
+  "get_accounting_journal_stats",
+  { id, dateFrom, dateTo, journalType, journalCode },
+  { timeoutMs: getDashboardTimeoutMs(), label: "Load accounting journal statistics" },
+);
+
+export async function streamAccountingJournalEntries(
+  id,
+  requestId,
+  dateFrom,
+  dateTo,
+  journalType,
+  journalCode,
+  handlers = {},
+) {
+  let streamError = null;
+  const matches = (event) => event.payload?.request_id === requestId;
+  const unlisten = await Promise.all([
+    listen("journals_stream_total", (event) => {
+      if (matches(event)) handlers.onTotal?.(event.payload);
+    }),
+    listen("journals_stream_chunk", (event) => {
+      if (matches(event)) handlers.onChunk?.(event.payload?.rows ?? []);
+    }),
+    listen("journals_stream_complete", (event) => {
+      if (matches(event)) handlers.onComplete?.(event.payload);
+    }),
+    listen("journals_stream_error", (event) => {
+      if (!matches(event)) return;
+      streamError = String(event.payload?.error ?? "Journal stream failed");
+      handlers.onError?.(streamError);
+    }),
+  ]);
+  try {
+    await withTimeout(
+      invoke("stream_accounting_journal_entries", {
+        id,
+        requestId,
+        dateFrom,
+        dateTo,
+        journalType,
+        journalCode,
+      }),
+      LARGE_EXPORT_TIMEOUT_MS,
+      "Load accounting journal entries",
+    );
+    if (streamError) throw new Error(streamError);
+  } finally {
+    unlisten.forEach((stop) => stop());
+  }
+}
+
+export async function exportAccountingJournalsXlsx(
+  id,
+  requestId,
+  dateFrom,
+  dateTo,
+  journalType,
+  journalCode,
+  filePath,
+  locale,
+  handlers = {},
+) {
+  let exportError = null;
+  const matches = (event) => event.payload?.request_id === requestId;
+  const unlisten = await Promise.all([
+    listen("journals_export_progress", (event) => {
+      if (matches(event)) handlers.onProgress?.(event.payload);
+    }),
+    listen("journals_export_complete", (event) => {
+      if (matches(event)) handlers.onComplete?.(event.payload);
+    }),
+    listen("journals_export_error", (event) => {
+      if (!matches(event)) return;
+      exportError = String(event.payload?.error ?? "Journal Excel export failed");
+      handlers.onError?.(exportError);
+    }),
+  ]);
+  try {
+    const result = await invokeWithTimeout(
+      "export_accounting_journals_xlsx",
+      { id, requestId, dateFrom, dateTo, journalType, journalCode, filePath, locale },
+      { timeoutMs: LARGE_EXPORT_TIMEOUT_MS, label: "Accounting journals Excel export" },
+    );
+    if (exportError) throw new Error(exportError);
+    return result;
+  } finally {
+    unlisten.forEach((stop) => stop());
+  }
+}
+
 export const executeQuery = (id, sql) => invoke("execute_query", { id, sql });
 export const listSavedQueries = (connectionId = null) =>
   invoke("list_saved_queries", { connectionId });
@@ -492,6 +595,61 @@ export const exportToExcel = async (id, schema, table, filters, selectedColumns)
 export const startTableExport = (spec) => invoke("start_table_export", { spec });
 export const listExportJobs = () => invoke("list_export_jobs");
 export const cancelExportJob = (jobId) => invoke("cancel_export_job", { jobId });
+
+// ─── Transfer, backup, and restore operations ─────────────────────────────
+
+export const preflightTransfer = (spec) => invokeWithTimeout("preflight_transfer", { spec }, {
+  timeoutMs: LARGE_EXPORT_TIMEOUT_MS,
+  label: "Transfer preflight",
+});
+export const preflightBackup = (spec) => invokeWithTimeout("preflight_backup", { spec }, {
+  timeoutMs: LARGE_EXPORT_TIMEOUT_MS,
+  label: "Backup preflight",
+});
+export const preflightRestore = (spec) => invokeWithTimeout("preflight_restore", { spec }, {
+  timeoutMs: LARGE_EXPORT_TIMEOUT_MS,
+  label: "Restore preflight",
+});
+export const startTransfer = (spec) => invoke("start_transfer", { spec });
+export const startBackup = (spec) => invoke("start_backup", { spec });
+export const startRestore = (spec) => invoke("start_restore", { spec });
+export const listOperationJobs = () => invoke("list_operation_jobs");
+export const getOperationJob = (jobId) => invoke("get_operation_job", { jobId });
+export const cancelOperationJob = (jobId) => invoke("cancel_operation_job", { jobId });
+export const resumeOperationJob = (jobId) => invoke("resume_operation_job", { jobId });
+export const listOperationTemplates = () => invoke("list_operation_templates");
+export const saveOperationTemplate = (template) => invoke("save_operation_template", { template });
+export const deleteOperationTemplate = (templateId) => invoke("delete_operation_template", { templateId });
+export const exportOperationDiagnostic = (jobId, filePath) => invoke("export_operation_diagnostic", { jobId, filePath });
+export const operationsListDatabases = (connectionId) => invokeWithTimeout("operations_list_databases", { connectionId }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "List operation databases",
+});
+export const operationsListTables = (connectionId, database) => invokeWithTimeout("operations_list_tables", { connectionId, database }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "List operation tables",
+});
+export const previewTransferTable = (connectionId, database, schema, table) => invokeWithTimeout("preview_transfer_table", { connectionId, database, schema, table }, {
+  timeoutMs: TABLE_DATA_TIMEOUT_MS,
+  label: "Preview transfer table",
+});
+export const listSqlServerPaths = (connectionId, directory = null) => invokeWithTimeout("list_sql_server_paths", { connectionId, directory }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "List SQL Server paths",
+});
+export const inspectBackup = (connectionId, backupPath, extraPaths = []) => invokeWithTimeout("inspect_backup", { connectionId, backupPath, extraPaths }, {
+  timeoutMs: LARGE_EXPORT_TIMEOUT_MS,
+  label: "Inspect backup",
+});
+export const previewBackupStage = (connectionId, sourcePath) => invokeWithTimeout("preview_backup_stage", { connectionId, sourcePath }, {
+  timeoutMs: METADATA_TIMEOUT_MS,
+  label: "Preview backup staging",
+});
+export const confirmBackupStage = (connectionId, sourcePath) => invokeWithTimeout("confirm_backup_stage", { connectionId, sourcePath, confirmed: true }, {
+  timeoutMs: LARGE_EXPORT_TIMEOUT_MS,
+  label: "Copy backup for SQL Server",
+});
+export const sqlHostIsLocal = (connectionId) => invoke("sql_host_is_local", { connectionId });
 
 // ─── Invoicing ───────────────────────────────────────────────────────────────
 

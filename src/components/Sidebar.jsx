@@ -62,6 +62,9 @@ export default function Sidebar({
   activeDatabase,
   adminMode,
   invoicingOpen,
+  dashboardOpen,
+  journalsOpen,
+  operationsOpen,
   onSelectConnection,
   onRefreshConnection,
   onRunDiagnostics,
@@ -69,7 +72,9 @@ export default function Sidebar({
   onConnectionSaved,
   onCollapse,
   onOpenDashboard,
+  onOpenJournals,
   onOpenInvoicing,
+  onOpenOperations,
   onOpenSettings,
   disabled,
 }) {
@@ -185,8 +190,12 @@ export default function Sidebar({
         </div>
 
         <div className="sidebar-footer">
-          {adminMode && activeId && activeDatabase ? (
-            <button className="sidebar-dashboard-btn" onClick={onOpenDashboard} disabled={disabled}>
+          {activeId && activeDatabase ? (
+            <button
+              className={`sidebar-dashboard-btn ${dashboardOpen ? "active" : ""}`}
+              onClick={onOpenDashboard}
+              disabled={disabled}
+            >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M3 3v18h18" />
                 <path d="M7 14l3-3 3 2 4-6" />
@@ -194,6 +203,34 @@ export default function Sidebar({
               {t("sidebar_dashboard")}
             </button>
           ) : null}
+
+          {activeId && activeDatabase ? (
+            <button
+              className={`sidebar-dashboard-btn ${journalsOpen ? "active" : ""}`}
+              onClick={onOpenJournals}
+              disabled={disabled}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                <path d="M8 7h8M8 11h8M8 15h5" />
+              </svg>
+              {t("sidebar_journals")}
+            </button>
+          ) : null}
+
+          <button
+            className={`sidebar-dashboard-btn ${operationsOpen ? "active" : ""}`}
+            onClick={onOpenOperations}
+            disabled={disabled}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M8 17l-5-5 5-5" />
+              <path d="M16 7l5 5-5 5" />
+              <path d="M12 4v16" />
+            </svg>
+            {t("sidebar_operations")}
+          </button>
 
           {adminMode && activeId && activeDatabase ? (
             <button

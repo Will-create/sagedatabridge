@@ -498,6 +498,15 @@ pub fn set_active_exploitation_report(
 
 const MAX_QUERY_HISTORY: usize = 100;
 const MAX_FIELD_HISTORY: usize = 10;
+const MASKED_PASSWORD: &str = "••••••••";
+
+fn is_masked_password(value: &str) -> bool {
+    value == MASKED_PASSWORD || value == "\u{00e2}\u{20ac}\u{00a2}".repeat(8)
+}
+
+fn masked_password() -> String {
+    MASKED_PASSWORD.to_string()
+}
 
 fn load_connection_config(
     state: &State<'_, AppState>,
@@ -595,23 +604,29 @@ pub fn remove_pin(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn has_admin_password(_state: State<AppState>) -> bool {
-    true
+pub fn has_admin_password(state: State<AppState>) -> bool {
+    state.config.lock().map(|config| config.admin_password_hash.is_some()).unwrap_or(false)
 }
 
 #[tauri::command]
-pub fn set_admin_password(_state: State<AppState>, _password: String) -> Result<(), String> {
-    Ok(())
+pub fn set_admin_password(state: State<AppState>, password: String) -> Result<(), String> {
+    if password.len() < 4 {
+        return Err("Admin password must contain at least 4 characters".to_string());
+    }
+    state.config.lock().map_err(|error| error.to_string())?.admin_password_hash = Some(hash_secret(&password)?);
+    state.save_config()
 }
 
 #[tauri::command]
-pub fn verify_admin_password(_state: State<AppState>, password: String) -> Result<bool, String> {
-    Ok(password == "0033")
+pub fn verify_admin_password(state: State<AppState>, password: String) -> Result<bool, String> {
+    let config = state.config.lock().map_err(|error| error.to_string())?;
+    config.admin_password_hash.as_ref().map(|hash| verify_secret(&password, hash)).transpose().map(|result| result.unwrap_or(false))
 }
 
 #[tauri::command]
-pub fn remove_admin_password(_state: State<AppState>) -> Result<(), String> {
-    Ok(())
+pub fn remove_admin_password(state: State<AppState>) -> Result<(), String> {
+    state.config.lock().map_err(|error| error.to_string())?.admin_password_hash = None;
+    state.save_config()
 }
 
 // ─── Settings ───────────────────────────────────────────────────────────────────
@@ -793,7 +808,7 @@ pub fn list_connections(state: State<AppState>) -> Result<Vec<ConnectionConfig>,
         .iter()
         .map(|c| {
             let mut mc = c.clone();
-            if !mc.password.is_empty() {
+            if !mc.use_windows_auth && (crate::credential_store::read(&mc.id).ok().flatten().is_some() || !mc.password.is_empty()) {
                 mc.password = "••••••••".to_string();
             }
             mc
@@ -809,9 +824,7 @@ pub fn reveal_connection_password(
     unlock_password: String,
 ) -> Result<String, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let unlocked = if unlock_password == "0033" {
-        true
-    } else if let Some(hash_str) = &config.password_hash {
+    let unlocked = if let Some(hash_str) = &config.password_hash {
         verify_secret(&unlock_password, hash_str)?
     } else {
         false
@@ -831,11 +844,10 @@ pub fn reveal_connection_password(
         return Err("Windows authentication connections do not store a password".to_string());
     }
 
-    if connection.password.is_empty() {
-        return Err("No saved password is available for this connection".to_string());
-    }
-
-    Ok(connection.password.clone())
+    let stored_id = connection.id.clone();
+    drop(config);
+    crate::credential_store::read(&stored_id)?
+        .ok_or_else(|| "No saved password is available for this connection".to_string())
 }
 
 /// Save a new or updated connection
@@ -858,9 +870,19 @@ pub fn save_connection(
         } else {
             connection.password.clone()
         };
+        let password = if is_masked_password(&connection.password) {
+            crate::credential_store::read(&connection.id)?.unwrap_or(password)
+        } else {
+            password
+        };
+        if !connection.use_windows_auth && !password.is_empty() {
+            crate::credential_store::write(&connection.id, &password)?;
+        }
         *existing = connection.clone();
-        existing.password = password;
-        let updated = existing.clone();
+        existing.password = password.clone();
+        existing.password.clear();
+        let mut updated = existing.clone();
+        updated.password = password;
         drop(config);
         state.save_config()?;
 
@@ -894,11 +916,19 @@ pub fn save_connection(
         state.invalidate_client_cache(&updated.id)?;
         sync_active_schema_for_connection(&state, &updated.id, &updated)?;
 
-        Ok(updated)
+        let mut response = updated.clone();
+        if !response.use_windows_auth {
+            response.password = masked_password();
+        }
+        Ok(response)
     } else {
         // New connection
         let mut new_conn = connection;
         new_conn.id = uuid::Uuid::new_v4().to_string();
+        if !new_conn.use_windows_auth && !new_conn.password.is_empty() {
+            crate::credential_store::write(&new_conn.id, &new_conn.password)?;
+        }
+        new_conn.password.clear();
         config.connections.push(new_conn.clone());
         drop(config);
         state.save_config()?;
@@ -948,7 +978,7 @@ pub fn delete_connection(state: State<AppState>, id: String) -> Result<(), Strin
     schemas.remove(&id);
     drop(schemas);
     state.invalidate_client_cache(&id)?;
-
+    crate::credential_store::delete(&id)?;
     state.save_config()
 }
 
@@ -1302,7 +1332,7 @@ async fn probe_column(
     Ok(!data.rows.is_empty())
 }
 
-async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult, String> {
+pub(crate) async fn detect_sage_schema(client: &mut db::DbClient) -> Result<DetectionResult, String> {
     let sage100_candidates = ["F_ECRITUREC", "F_COMPTET", "F_TIERS", "F_JOURNAL"];
     let found100 = probe_tables(client, &sage100_candidates).await?;
 
