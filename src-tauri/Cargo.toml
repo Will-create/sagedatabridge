@@ -1,6 +1,6 @@
 [package]
 name = "sage-data-bridge"
-version = "6.1.8"
+version = "6.1.9"
 description = "Sage Data Bridge - SQL Server data extraction tool"
 authors = []
 license = ""

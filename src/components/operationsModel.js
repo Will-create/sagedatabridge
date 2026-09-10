@@ -92,6 +92,15 @@ export function isUserProfilePath(path) {
     || normalized.includes("\\onedrive");
 }
 
+export function sameBackupPath(left, right) {
+  const normalize = (value) => String(value || "").replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  return Boolean(left) && Boolean(right) && normalize(left) === normalize(right);
+}
+
+export function needsSqlBackupStage(path) {
+  return isUserProfilePath(path);
+}
+
 export function defaultBackupFileName(database, directory = "") {
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
   const file = `${(database || "database").replace(/[^\w.-]+/g, "_")}-${stamp}.bak`;

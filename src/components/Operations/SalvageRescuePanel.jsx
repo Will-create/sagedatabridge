@@ -27,7 +27,6 @@ export default function SalvageRescuePanel({
   stagePlan,
   staging,
   onPickLocal,
-  onPreviewStage,
   onStagePath,
   onConfirmStage,
   onAddStripe,
@@ -37,16 +36,18 @@ export default function SalvageRescuePanel({
 }) {
   const { t } = useT();
   const [siblings, setSiblings] = useState([]);
-  const classification = inspection?.classification || (inspecting ? "scanning" : "idle");
+  const classification = staging && (!stagePlan || stagePlan.needsStage)
+    ? "copying"
+    : inspection?.classification || (inspecting ? "scanning" : "idle");
   const tone = useMemo(() => {
-    if (inspecting || classification === "scanning") return "scanning";
+    if (staging || inspecting || classification === "scanning" || classification === "copying") return "scanning";
     if (classification === "healthy") return "healthy";
     if (classification === "checksum_damage") return "salvage";
     if (classification === "missing_media_family") return "stripe";
     if (classification === "access_denied") return "denied";
     if (classification === "incomplete" || classification === "header_destroyed") return "lost";
     return "idle";
-  }, [classification, inspecting]);
+  }, [classification, inspecting, staging]);
 
   const pickBak = async (handler) => {
     const path = await open({
@@ -59,7 +60,8 @@ export default function SalvageRescuePanel({
   const familyCount = Number(inspection?.familyCount || 0);
   const provided = inspection?.providedFamilies || [];
   const missing = inspection?.missingFamilies || [];
-  const showGuide = Boolean(inspection) && classification !== "scanning" && classification !== "idle";
+  const showGuide = Boolean(inspection) && classification !== "scanning" && classification !== "idle" && classification !== "copying";
+  const remoteHost = stagePlan && stagePlan.localHost === false;
   const hints = stripeNameHints(restore.backupPath);
   const nextMissing = missing[0] || (familyCount > 1 ? familyCount : 1);
   const attachedFiles = [restore.backupPath, ...(restore.extraBackupPaths || [])].filter(Boolean);
@@ -146,9 +148,13 @@ export default function SalvageRescuePanel({
                 ) : null}
                 {classification === "access_denied" ? (
                   <>
-                    <button type="button" className="btn btn-accent btn-sm" disabled={staging || !restore.connectionId} onClick={onPreviewStage}>
-                      {t("operations_stage_preview")}
-                    </button>
+                    {remoteHost ? (
+                      <p>{t("operations_stage_remote")}</p>
+                    ) : (
+                      <button type="button" className="btn btn-accent btn-sm" disabled={staging || !restore.connectionId} onClick={onConfirmStage}>
+                        {staging ? t("operations_stage_copying") : t("operations_stage_retry")}
+                      </button>
+                    )}
                     <button type="button" className="btn btn-ghost btn-sm" disabled={!restore.connectionId} onClick={onBrowseSql}>
                       {t("operations_browse_sql_bak")}
                     </button>
@@ -236,7 +242,7 @@ export default function SalvageRescuePanel({
                   ) : null}
                   {isUserProfilePath(path) ? (
                     <button type="button" className="btn btn-ghost btn-sm" disabled={staging || !restore.connectionId} onClick={() => onStagePath?.(path)}>
-                      {t("operations_stage_this_file")}
+                      {staging ? t("operations_stage_copying") : t("operations_stage_this_file")}
                     </button>
                   ) : null}
                 </li>
@@ -256,34 +262,44 @@ export default function SalvageRescuePanel({
 
         <div className="salvage-actions">
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => pickBak(onPickLocal)}>{t("operations_pick_local_bak")}</button>
-          {restore.backupPath && isUserProfilePath(restore.backupPath) ? (
-            <button type="button" className="btn btn-ghost btn-sm" disabled={staging || !restore.connectionId} onClick={onPreviewStage}>
-              {t("operations_stage_preview")}
-            </button>
-          ) : null}
         </div>
 
-        {stagePlan ? (
+        {classification === "copying" ? (
           <div className="salvage-stage-card">
             <strong>{t("operations_stage_title")}</strong>
-            <p>{t("operations_stage_body", formatBytes(stagePlan.bytes), stagePlan.sqlAccount || "SQL Server")}</p>
-            <code>{stagePlan.sourcePath}</code>
-            <span className="salvage-arrow">↓</span>
-            <code>{stagePlan.destinationPath}</code>
-            {stagePlan.warnings?.map((warning) => <div className="operations-warning" key={warning}>{warning}</div>)}
-            {stagePlan.needsStage ? (
-              <button type="button" className="btn btn-accent" disabled={staging} onClick={onConfirmStage}>
-                {staging ? t("operations_working") : t("operations_stage_confirm")}
-              </button>
-            ) : (
-              <div className="operations-warning">{t("operations_stage_done")}</div>
-            )}
+            <p>{t("operations_stage_copying")}</p>
           </div>
         ) : null}
 
-        {inspection?.messages?.map((message) => (
+        {stagePlan && classification !== "copying" ? (
+          <div className="salvage-stage-card">
+            <strong>{t("operations_stage_title")}</strong>
+            {remoteHost ? (
+              <p>{t("operations_stage_remote")}</p>
+            ) : stagePlan.needsStage ? (
+              <p>{t("operations_stage_body", formatBytes(stagePlan.bytes), stagePlan.sqlAccount || "SQL Server")}</p>
+            ) : (
+              <p>{t("operations_stage_done")}</p>
+            )}
+            {stagePlan.sourcePath ? <code>{stagePlan.sourcePath}</code> : null}
+            {stagePlan.destinationPath ? (
+              <>
+                <span className="salvage-arrow">↓</span>
+                <code>{stagePlan.destinationPath}</code>
+              </>
+            ) : null}
+            {stagePlan.warnings?.map((warning) => <div className="operations-warning" key={warning}>{warning}</div>)}
+            {stagePlan.needsStage && !remoteHost ? (
+              <button type="button" className="btn btn-accent" disabled={staging} onClick={onConfirmStage}>
+                {staging ? t("operations_stage_copying") : t("operations_stage_retry")}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {classification !== "copying" && classification !== "access_denied" ? inspection?.messages?.map((message) => (
           <div className={inspection.unrecoverable ? "operations-error" : "operations-warning"} key={message}>{message}</div>
-        ))}
+        )) : null}
 
         {inspection?.salvageable ? (
           <>

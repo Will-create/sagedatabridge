@@ -13,6 +13,7 @@ const MAX_OPERATION_LOGS: usize = 200;
 const DEFAULT_BATCH_SIZE: u32 = 500;
 const MAX_BATCH_SIZE: u32 = 500;
 const OPERATION_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+const FALLBACK_BACKUP_DIRECTORY: &str = r"C:\Temp\SageDataBridgeBackups";
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -967,7 +968,7 @@ async fn inspect_backup_inner(state: &AppState, connection_id: &str, backup_path
         "incomplete" => messages.insert(0, "This backup was interrupted while it was being written (*** INCOMPLETE ***). SQL Server cannot salvage it. Use another .bak.".to_string()),
         "header_destroyed" => messages.insert(0, "The backup header is unreadable. Microsoft does not reconstruct a destroyed media family. Find another .bak.".to_string()),
         "checksum_damage" => messages.insert(0, "The header is readable but VERIFYONLY failed. A salvage restore can copy what is still readable into a separate *_repaired database.".to_string()),
-        "access_denied" => messages.insert(0, "SQL Server cannot open this path. Use a folder the service account can read.".to_string()),
+        "access_denied" => messages.insert(0, "This file is in a folder SQL Server cannot open. The app will copy it into the SQL backup folder automatically.".to_string()),
         "missing_media_family" => messages.insert(0, format!("This is stripe {family_sequence} of a {family_count}-file striped backup. Provide the missing family file(s) {missing}. CONTINUE_AFTER_ERROR cannot invent them.", missing = missing_families.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(", "))),
         _ => {}
     }
@@ -1034,7 +1035,7 @@ async fn preflight_restore_inner(state: &AppState, spec: &RestoreSpec) -> Result
             warnings.extend(inspection.messages.clone());
         }
         "access_denied" => {
-            errors.push("SQL Server cannot open this path. Use Prepare copy for SQL Server, or browse a folder the service account can read.".to_string());
+            errors.push("This backup is still in a folder SQL Server cannot open. Pick the file again — the app copies it into the SQL backup folder for you.".to_string());
             warnings.extend(inspection.messages.clone());
         }
         _ if !inspection.verify_ok && !spec.salvage => {
@@ -1068,7 +1069,7 @@ async fn preflight_restore_inner(state: &AppState, spec: &RestoreSpec) -> Result
         summary: format!("Restore {} to {} ({}).", spec.backup_path, spec.target_database.trim(), inspection.classification),
         required_confirmation: spec.target_database.trim().to_string(), warnings, errors, tables: Vec::new(), ordered_tables: Vec::new(),
         source_edition: String::new(), target_edition: String::new(),
-        path_host: config.host.clone(), backup_header: inspection.header.clone(), suggested_path: inspection.suggested_target.clone(),
+        path_host: config.host.clone(), backup_header: inspection.header.clone(), suggested_path: String::new(),
     })
 }
 
@@ -1698,8 +1699,16 @@ async fn sql_service_account(client: &mut db::DbClient, instance: &str) -> Strin
 fn grant_sql_read_acl(path: &str, account: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
+        if account.trim().is_empty() {
+            return Ok(());
+        }
+        let permission = if Path::new(path).is_dir() {
+            format!("{account}:(OI)(CI)RX")
+        } else {
+            format!("{account}:(R)")
+        };
         let output = std::process::Command::new("icacls")
-            .args([path, "/grant", &format!("{}:(R)", account)])
+            .args([path, "/grant", &permission])
             .output()
             .map_err(|error| format!("Unable to update NTFS permissions: {error}"))?;
         if !output.status.success() {
@@ -1708,6 +1717,60 @@ fn grant_sql_read_acl(path: &str, account: &str) -> Result<(), String> {
     }
     let _ = (path, account);
     Ok(())
+}
+
+fn same_sql_path(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| value.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    if normalize(left) == normalize(right) {
+        return true;
+    }
+    match (Path::new(left).canonicalize(), Path::new(right).canonicalize()) {
+        (Ok(source), Ok(destination)) => source == destination,
+        _ => false,
+    }
+}
+
+fn unique_stage_destination(directory: &str, file_name: &str, source: &Path) -> String {
+    let destination = join_sql_path(directory, file_name);
+    let dest_path = Path::new(&destination);
+    if !dest_path.exists() {
+        return destination;
+    }
+    if same_sql_path(&source.to_string_lossy(), &destination) {
+        return destination;
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("backup");
+    let ext = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bak");
+    for index in 1..100 {
+        let candidate = join_sql_path(directory, &format!("{stem}-sdb{index}.{ext}"));
+        if !Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    destination
+}
+
+fn copy_bak_into_directory(source: &Path, directory: &str, account: &str) -> Result<String, String> {
+    fs::create_dir_all(directory).map_err(|error| format!("Unable to create the SQL backup folder: {error}"))?;
+    let _ = grant_sql_read_acl(directory, account);
+    let file_name = source.file_name().and_then(|name| name.to_str()).unwrap_or("staged.bak");
+    let destination = unique_stage_destination(directory, file_name, source);
+    if same_sql_path(&source.to_string_lossy(), &destination) {
+        let _ = grant_sql_read_acl(&destination, account);
+        return Ok(destination);
+    }
+    fs::copy(source, &destination).map_err(|error| format!("Unable to copy the backup file: {error}"))?;
+    if let Err(error) = grant_sql_read_acl(&destination, account) {
+        // Copy succeeded; SQL may still read the file if the folder grant worked.
+        let _ = error;
+    }
+    Ok(destination)
 }
 
 async fn backup_stage_plan_inner(state: &AppState, connection_id: &str, source_path: &str) -> Result<BackupStagePlan, String> {
@@ -1722,7 +1785,7 @@ async fn backup_stage_plan_inner(state: &AppState, connection_id: &str, source_p
     let local_host = is_local_sql_host(&config.host);
     let mut warnings = Vec::new();
     if !local_host {
-        warnings.push("This SQL Server is not on this PC. The file cannot be copied onto the server disk from here. Put it on a UNC share the service account can read.".to_string());
+        warnings.push("This SQL Server is on another computer, so the file cannot be copied onto that machine from here. Put the .bak on a shared folder that computer can open, then pick it again.".to_string());
         return Ok(BackupStagePlan {
             source_path: source_path.to_string(),
             destination_path: String::new(),
@@ -1736,14 +1799,14 @@ async fn backup_stage_plan_inner(state: &AppState, connection_id: &str, source_p
     let mut client = db::connect(&config).await?;
     let mut destination_dir = default_backup_directory(&mut client).await;
     if destination_dir.trim().is_empty() {
-        destination_dir = "C:\\Temp\\SageDataBridgeBackups".to_string();
-        warnings.push("SQL Server did not report a default backup folder. Files will be copied to C:\\Temp\\SageDataBridgeBackups.".to_string());
+        destination_dir = FALLBACK_BACKUP_DIRECTORY.to_string();
+        warnings.push(format!("SQL Server did not report a default backup folder. The file will be copied to {FALLBACK_BACKUP_DIRECTORY}."));
     }
     let file_name = source.file_name().and_then(|name| name.to_str()).unwrap_or("staged.bak");
-    let destination_path = join_sql_path(&destination_dir, file_name);
-    let needs_stage = is_user_profile_path(source_path) || source_path.to_ascii_lowercase() != destination_path.to_ascii_lowercase();
-    if is_user_profile_path(source_path) {
-        warnings.push("Desktop, Documents and Downloads are not writable by the SQL Server service account. Confirm to copy the file into the instance backup folder.".to_string());
+    let destination_path = unique_stage_destination(&destination_dir, file_name, source);
+    let needs_stage = !same_sql_path(source_path, &destination_path);
+    if needs_stage {
+        warnings.push("This file is in a folder SQL Server cannot open. It will be copied into the SQL backup folder automatically. Your original file is left in place.".to_string());
     }
     Ok(BackupStagePlan {
         source_path: source_path.to_string(),
@@ -1773,17 +1836,29 @@ pub async fn confirm_backup_stage(state: State<'_, AppState>, connection_id: Str
     }
     let mut plan = backup_stage_plan_inner(&state, &connection_id, &source_path).await?;
     if !plan.local_host {
-        return Err(plan.warnings.first().cloned().unwrap_or_else(|| "The SQL Server disk is not on this PC.".to_string()));
+        return Ok(plan);
     }
-    if let Some(parent) = Path::new(&plan.destination_path).parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("Unable to create the SQL backup folder: {error}"))?;
+    if !plan.needs_stage && same_sql_path(&plan.source_path, &plan.destination_path) {
+        plan.needs_stage = false;
+        return Ok(plan);
     }
-    std::fs::copy(&plan.source_path, &plan.destination_path).map_err(|error| format!("Unable to copy the backup file: {error}"))?;
-    if let Err(error) = grant_sql_read_acl(&plan.destination_path, &plan.sql_account) {
-        plan.warnings.push(format!("Copied, but NTFS grant for {} failed: {error}", plan.sql_account));
-    }
+    let source = Path::new(&plan.source_path);
+    let preferred_dir = Path::new(&plan.destination_path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| FALLBACK_BACKUP_DIRECTORY.to_string());
+    let copied = match copy_bak_into_directory(source, &preferred_dir, &plan.sql_account) {
+        Ok(destination) => destination,
+        Err(error) if !same_sql_path(&preferred_dir, FALLBACK_BACKUP_DIRECTORY) => {
+            plan.warnings.push(format!("Could not copy into the SQL backup folder ({error}). Trying {FALLBACK_BACKUP_DIRECTORY} instead."));
+            copy_bak_into_directory(source, FALLBACK_BACKUP_DIRECTORY, &plan.sql_account)?
+        }
+        Err(error) => return Err(error),
+    };
+    plan.destination_path = copied;
     plan.needs_stage = false;
-    plan.warnings.insert(0, format!("Copied to {} for the SQL Server service account.", plan.destination_path));
+    plan.warnings.insert(0, format!("Copied to {}. SQL Server can now open this backup. Your original file is unchanged.", plan.destination_path));
     Ok(plan)
 }
 
@@ -1859,8 +1934,8 @@ mod tests {
     use super::{
         classify_backup, friendly_sql_path_error, is_backup_file_path, is_local_sql_host, parse_media_family_counts,
         is_user_profile_path, parent_sql_path, quote_identifier, repaired_database_name,
-        salvage_target_allowed, table_order, transfer_same_database, would_lose_precision,
-        would_truncate, TransferSpec, TransferTableSpec,
+        same_sql_path, salvage_target_allowed, table_order, transfer_same_database, unique_stage_destination,
+        would_lose_precision, would_truncate, TransferSpec, TransferTableSpec,
     };
     use crate::state::{ColumnInfo, RelationshipInfo};
 
@@ -1937,6 +2012,22 @@ mod tests {
             parse_media_family_counts("The media set has 2 media families but only 1 are provided. All members must be provided."),
             Some((2, 1))
         );
+        assert!(same_sql_path(r"C:\SQL\Backup\BF.bak", r"C:/SQL/Backup/BF.bak"));
+        assert!(!same_sql_path(r"C:\SQL\Backup\BF.bak", r"C:\SQL\Backup\NTIT.bak"));
+        let temp = std::env::temp_dir().join(format!("sdb-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("NTIT.bak");
+        std::fs::write(&source, b"one").unwrap();
+        let existing = temp.join("NTIT.bak");
+        assert_eq!(
+            unique_stage_destination(&temp.to_string_lossy(), "NTIT.bak", &source),
+            existing.to_string_lossy()
+        );
+        let other = temp.join("other.bak");
+        std::fs::write(&other, b"two").unwrap();
+        let uniqued = unique_stage_destination(&temp.to_string_lossy(), "NTIT.bak", &other);
+        assert!(uniqued.to_ascii_lowercase().ends_with("ntit-sdb1.bak"));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

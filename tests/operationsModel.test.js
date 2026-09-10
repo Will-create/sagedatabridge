@@ -5,6 +5,8 @@ import {
   confirmationMatches,
   defaultBackupFileName,
   isUserProfilePath,
+  needsSqlBackupStage,
+  sameBackupPath,
   likelyStripeMatch,
   parentBackupDirectory,
   repairedDatabaseName,
@@ -86,6 +88,10 @@ test("empty tables can be hidden and backup names stay on the server path", () =
   assert.ok(defaultBackupFileName("BRAVIA", "D:\\SQLBackups").startsWith("D:\\SQLBackups\\BRAVIA-"));
   assert.equal(isUserProfilePath("C:\\Users\\USER\\Desktop\\cool\\BF.bak"), true);
   assert.equal(isUserProfilePath("C:\\Program Files\\Microsoft SQL Server\\Backup\\BF.bak"), false);
+  assert.equal(needsSqlBackupStage("C:\\Users\\USER\\Downloads\\NTIT.bak"), true);
+  assert.equal(needsSqlBackupStage("C:\\Program Files\\Microsoft SQL Server\\Backup\\NTIT.bak"), false);
+  assert.equal(sameBackupPath("C:\\SQL\\Backup\\BF.bak", "C:/SQL/Backup/BF.bak"), true);
+  assert.equal(sameBackupPath("C:\\SQL\\Backup\\BF.bak", "C:\\SQL\\Backup\\NTIT.bak"), false);
   assert.equal(repairedDatabaseName("BF"), "BF_repaired");
   assert.equal(parentBackupDirectory("C:\\Temp\\NTIT.bak"), "C:\\Temp");
   assert.deepEqual(stripeNameHints("C:\\Temp\\NTIT.bak").slice(0, 2), ["NTIT_1.bak", "NTIT1.bak"]);

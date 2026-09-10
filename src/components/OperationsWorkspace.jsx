@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/api/dialog";
 import {
@@ -9,7 +9,6 @@ import {
   listOperationTemplates,
   confirmBackupStage,
   inspectBackup,
-  previewBackupStage,
   operationsListDatabases,
   listSqlServerPaths,
   operationsListTables,
@@ -33,6 +32,8 @@ import {
   groupTablesBySchema,
   isUserProfilePath,
   isTerminalJob,
+  needsSqlBackupStage,
+  sameBackupPath,
   salvageTargetAllowed,
   jobPercent,
   latestLogMessage,
@@ -79,6 +80,10 @@ const EMPTY_RESTORE = {
 
 function connectionLabel(connection) {
   return connection?.name?.trim() || `${connection?.host || "SQL Server"}${connection?.database ? ` / ${connection.database}` : ""}`;
+}
+
+function pathKey(path) {
+  return String(path || "").replace(/\//g, "\\").toLowerCase();
 }
 
 function kindLabel(t, kind) {
@@ -193,6 +198,7 @@ export default function OperationsWorkspace({ connections }) {
   const [inspecting, setInspecting] = useState(false);
   const [stagePlan, setStagePlan] = useState(null);
   const [staging, setStaging] = useState(false);
+  const stagedPathsRef = useRef(new Map());
 
   const refresh = useCallback(async () => {
     const [nextJobs, nextTemplates] = await Promise.all([listOperationJobs(), listOperationTemplates()]);
@@ -235,31 +241,144 @@ export default function OperationsWorkspace({ connections }) {
   useEffect(() => { loadDatabases(transfer.targetConnectionId, setTargetDatabases); }, [loadDatabases, transfer.targetConnectionId]);
   useEffect(() => { loadDatabases(backup.connectionId, setBackupDatabases); }, [backup.connectionId, loadDatabases]);
 
+  const copyBakIntoSqlFolder = useCallback(async (connectionId, path) => {
+    const key = pathKey(path);
+    if (!connectionId || !path) return null;
+    const known = stagedPathsRef.current.get(key);
+    if (known) return known;
+    setStaging(true);
+    try {
+      const next = await confirmBackupStage(connectionId, path);
+      stagedPathsRef.current.set(key, next);
+      if (next?.destinationPath) {
+        stagedPathsRef.current.set(pathKey(next.destinationPath), next);
+      }
+      setStagePlan(next);
+      return next;
+    } catch (reason) {
+      stagedPathsRef.current.delete(key);
+      throw reason;
+    } finally {
+      setStaging(false);
+    }
+  }, []);
+
+  const applyStagedPath = useCallback((sourcePath, destinationPath) => {
+    if (!destinationPath || sameBackupPath(sourcePath, destinationPath)) return false;
+    setRestore((current) => {
+      if (sameBackupPath(current.backupPath, sourcePath)) {
+        return { ...current, backupPath: destinationPath, confirmationText: "" };
+      }
+      const extras = current.extraBackupPaths || [];
+      if (extras.some((item) => sameBackupPath(item, sourcePath))) {
+        return {
+          ...current,
+          extraBackupPaths: extras.map((item) => sameBackupPath(item, sourcePath) ? destinationPath : item),
+          confirmationText: "",
+        };
+      }
+      return current;
+    });
+    setInspection(null);
+    setReport(null);
+    return true;
+  }, []);
+
   useEffect(() => {
     if (!restore.connectionId || !restore.backupPath.toLowerCase().endsWith(".bak")) {
       setInspection(null);
       setInspecting(false);
       return;
     }
-    setInspecting(true);
-    inspectBackup(restore.connectionId, restore.backupPath, restore.extraBackupPaths)
-      .then((next) => {
+    let cancelled = false;
+    const connectionId = restore.connectionId;
+    const primary = restore.backupPath;
+    const extras = restore.extraBackupPaths || [];
+
+    const stageIfNeeded = async (path, force = false) => {
+      if (!path) return path;
+      const known = stagedPathsRef.current.get(pathKey(path));
+      if (known?.destinationPath && known.localHost !== false) {
+        return known.destinationPath;
+      }
+      if (known && !force) return known.destinationPath || path;
+      if (!force && !needsSqlBackupStage(path)) return path;
+      try {
+        const next = await copyBakIntoSqlFolder(connectionId, path);
+        if (cancelled || !next) return path;
+        if (!next.localHost) return path;
+        if (next.destinationPath) return next.destinationPath;
+      } catch (reason) {
+        if (!cancelled) setError(String(reason));
+      }
+      return path;
+    };
+
+    (async () => {
+      setError("");
+      setInspecting(true);
+      const nextPrimary = await stageIfNeeded(primary);
+      const nextExtras = [];
+      for (const extra of extras) {
+        nextExtras.push(await stageIfNeeded(extra));
+      }
+      if (cancelled) return;
+      if (!sameBackupPath(nextPrimary, primary) || nextExtras.some((path, index) => !sameBackupPath(path, extras[index]))) {
+        setRestore((current) => ({
+          ...current,
+          backupPath: nextPrimary,
+          extraBackupPaths: nextExtras,
+          confirmationText: "",
+        }));
+        setInspection(null);
+        setReport(null);
+        setInspecting(false);
+        return;
+      }
+
+      try {
+        const next = await inspectBackup(connectionId, primary, extras);
+        if (cancelled) return;
         setInspection(next);
         setRestore((current) => {
           if (current.targetDatabase && salvageTargetAllowed(current.targetDatabase)) return current;
           if (next.suggestedTarget) return { ...current, targetDatabase: next.suggestedTarget, salvage: next.salvageable || current.salvage };
           return current;
         });
-        if (next.classification === "access_denied" || isUserProfilePath(restore.backupPath)) {
-          previewBackupStage(restore.connectionId, restore.backupPath).then(setStagePlan).catch(() => {});
+        if (next.classification === "access_denied") {
+          const staged = await stageIfNeeded(primary, true);
+          if (cancelled) return;
+          if (staged && !sameBackupPath(staged, primary)) {
+            applyStagedPath(primary, staged);
+            return;
+          }
+          const extraUpdates = [];
+          for (const extra of extras) {
+            extraUpdates.push(await stageIfNeeded(extra, true));
+          }
+          if (cancelled) return;
+          if (extraUpdates.some((path, index) => !sameBackupPath(path, extras[index]))) {
+            setRestore((current) => ({
+              ...current,
+              extraBackupPaths: extraUpdates,
+              confirmationText: "",
+            }));
+            setReport(null);
+          }
         }
-      })
-      .catch((reason) => {
+      } catch (reason) {
+        if (cancelled) return;
         setInspection(null);
         setError(String(reason));
-      })
-      .finally(() => setInspecting(false));
-  }, [restore.backupPath, restore.connectionId, restore.extraBackupPaths]);
+      } finally {
+        if (!cancelled) setInspecting(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyStagedPath, copyBakIntoSqlFolder, restore.backupPath, restore.connectionId, restore.extraBackupPaths]);
 
   useEffect(() => {
     if (!backup.connectionId || !backup.database) return;
@@ -570,9 +689,6 @@ export default function OperationsWorkspace({ connections }) {
                   return { ...current, extraBackupPaths: [...extras, path], confirmationText: "" };
                 });
                 setReport(null);
-                if (restore.connectionId && isUserProfilePath(path)) {
-                  previewBackupStage(restore.connectionId, path).then(setStagePlan).catch((reason) => setError(String(reason)));
-                }
               }}
               onRemoveStripe={(path) => {
                 setRestore((current) => ({
@@ -588,54 +704,26 @@ export default function OperationsWorkspace({ connections }) {
                 setRestore((current) => ({ ...current, backupPath: path, extraBackupPaths: [], confirmationText: "" }));
                 setStagePlan(null);
                 setReport(null);
-                if (restore.connectionId && isUserProfilePath(path)) {
-                  previewBackupStage(restore.connectionId, path).then(setStagePlan).catch((reason) => setError(String(reason)));
-                }
-              }}
-              onPreviewStage={async () => {
-                if (!restore.connectionId || !restore.backupPath) return;
-                setStaging(true);
-                try {
-                  setStagePlan(await previewBackupStage(restore.connectionId, restore.backupPath));
-                } catch (reason) {
-                  setError(String(reason));
-                } finally {
-                  setStaging(false);
-                }
+                setError("");
               }}
               onStagePath={async (path) => {
                 if (!restore.connectionId || !path) return;
-                setStaging(true);
                 try {
-                  setStagePlan(await previewBackupStage(restore.connectionId, path));
+                  const next = await copyBakIntoSqlFolder(restore.connectionId, path);
+                  if (next?.destinationPath) applyStagedPath(path, next.destinationPath);
                 } catch (reason) {
                   setError(String(reason));
-                } finally {
-                  setStaging(false);
                 }
               }}
               onConfirmStage={async () => {
                 const sourcePath = stagePlan?.sourcePath || restore.backupPath;
                 if (!restore.connectionId || !sourcePath) return;
-                setStaging(true);
                 try {
-                  const next = await confirmBackupStage(restore.connectionId, sourcePath);
-                  setStagePlan(next);
-                  setRestore((current) => {
-                    if (current.backupPath === next.sourcePath) {
-                      return { ...current, backupPath: next.destinationPath, confirmationText: "" };
-                    }
-                    return {
-                      ...current,
-                      extraBackupPaths: current.extraBackupPaths.map((path) => path === next.sourcePath ? next.destinationPath : path),
-                      confirmationText: "",
-                    };
-                  });
-                  setReport(null);
+                  stagedPathsRef.current.delete(pathKey(sourcePath));
+                  const next = await copyBakIntoSqlFolder(restore.connectionId, sourcePath);
+                  if (next?.destinationPath) applyStagedPath(sourcePath, next.destinationPath);
                 } catch (reason) {
                   setError(String(reason));
-                } finally {
-                  setStaging(false);
                 }
               }}
             />
@@ -643,7 +731,7 @@ export default function OperationsWorkspace({ connections }) {
         )}
 
         <div className="operations-actions">
-          <button type="button" className="btn btn-accent" disabled={busy} onClick={preflight}>
+          <button type="button" className="btn btn-accent" disabled={busy || staging} onClick={preflight}>
             {busy ? t("operations_working") : t("operations_preflight")}
           </button>
           <input aria-label={t("operations_template_ph")} placeholder={t("operations_template_ph")} value={templateName} onChange={(event) => setTemplateName(event.target.value)} />
@@ -671,10 +759,9 @@ export default function OperationsWorkspace({ connections }) {
             {report.backupHeader?.databaseName ? <p>{t("operations_backup_header", report.backupHeader.databaseName, report.backupHeader.backupFinishDate || "")}</p> : null}
             {report.warnings?.map((warning) => <div className="operations-warning" key={warning}>{warning}</div>)}
             {report.errors?.map((item) => <div className="operations-error" key={item}>{item}</div>)}
-            {report.suggestedPath ? (
+            {kind === "backup" && report.suggestedPath ? (
               <button type="button" className="btn btn-accent btn-sm" onClick={() => {
-                if (kind === "backup") setBackup((current) => ({ ...current, backupPath: report.suggestedPath, confirmationText: "" }));
-                if (kind === "restore") setRestore((current) => ({ ...current, backupPath: report.suggestedPath, confirmationText: "" }));
+                setBackup((current) => ({ ...current, backupPath: report.suggestedPath, confirmationText: "" }));
                 setReport(null);
               }}>{t("operations_use_suggested_path")}</button>
             ) : null}
